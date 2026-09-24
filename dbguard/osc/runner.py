@@ -391,6 +391,10 @@ class Runner:
         self.progress: Progress | None = None
 
     # -- helpers
+    def _mark(self, what: str) -> None:
+        """Offsets from the start of run(), so a caller can line up its own measurements."""
+        self.result["timeline"].append((what, round(self.clock() - self._t0, 3)))
+
     def _server_facts(self) -> tuple[bool, str | None]:
         r = self.ex.query("SELECT @@GLOBAL.super_read_only AS sro, @@GLOBAL.read_only AS ro, "
                           "@@GLOBAL.datadir AS datadir")[0]
@@ -401,7 +405,8 @@ class Runner:
 
     # -- entry point
     def run(self) -> dict[str, Any]:
-        t0 = self.clock()
+        t0 = self._t0 = self.clock()
+        self.result["timeline"] = []
         self.ex = self.connect()
         try:
             self._run()
@@ -512,6 +517,7 @@ class Runner:
         self.result["phases_s"] = phases
 
         t = self.clock()
+        self._mark("shadow_start")
         self._make_shadow()
         sh = self._t(self.shadow)
         chk = validate_shadow(src, sh, o.allow_type_change)
@@ -524,6 +530,7 @@ class Runner:
             self.created_triggers.append(name)
             _retry(lambda s=sql: ex.execute(s), sleep=self.sleep)
         phases["shadow_triggers"] = round(self.clock() - t, 3)
+        self._mark("copy_start")
         self.log(f"shadow {self.shadow} created and altered, triggers "
                  f"{', '.join(self.created_triggers)} in place")
 
@@ -531,6 +538,7 @@ class Runner:
         boundaries, copied = self._copy(src, chk.copy_cols)
         copy_s = self.clock() - t
         phases["copy"] = round(copy_s, 3)
+        self._mark("checksum_start")
         mb = (src.data_bytes + 0.0) / 2**20
         self.result.update(rows_copied=copied, chunks=len(boundaries),
                            copy_mb_est=round(mb, 1),
@@ -542,6 +550,7 @@ class Runner:
         sums = self._checksum(src.pk, chk.checksum_cols, chunk_ranges(boundaries))
         bad = compare_checksums(sums)
         phases["checksum"] = round(self.clock() - t, 3)
+        self._mark("swap_start")
         self.result.update(checksum_chunks=len(sums), checksum_mismatches=len(bad))
         if bad:
             for s in bad[:5]:
@@ -555,10 +564,13 @@ class Runner:
         self.progress.update(phase="swap")
         self._swap()
         phases["swap"] = round(self.clock() - t, 3)
+        self._mark("drop_triggers_start")
         self._drop_triggers_after_swap()
+        self._mark("drop_triggers_end")
         old = old_name(o.table)
         if o.drop_old:
             ex.execute(f"DROP TABLE {qt(o.db, old)}")
+            self._mark("drop_old_end")
             self.result["old_table"] = None
             self.log(f"dropped {old}")
         else:

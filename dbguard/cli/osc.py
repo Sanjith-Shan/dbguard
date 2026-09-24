@@ -175,15 +175,19 @@ def cleanup(host, port, user, password, tls, db, table, drop_old) -> None:
 @click.option("--threads", default=8, show_default=True, help="foreground writer threads")
 @click.option("--phase-s", default=15.0, show_default=True,
               help="seconds of foreground load before and after each change")
-@click.option("--modes", default="osc,inplace,instant,osc-instant", show_default=True,
-              help="comma list of osc, inplace, instant, osc-instant")
+@click.option("--modes", default="osc,osc-throttled,inplace,instant,osc-instant",
+              show_default=True,
+              help="comma list of osc, osc-throttled, inplace, instant, osc-instant")
+@click.option("--repeat", default=1, show_default=True, help="run every mode this many times")
+@click.option("--throttle-threads", default=4, show_default=True,
+              help="--max-load-threads for the osc-throttled mode")
 @click.option("--alter", "alter_text",
               default="ADD COLUMN note VARCHAR(32) NULL, ADD INDEX idx_ts (ts)",
               show_default=True, help="alter for the osc and inplace modes")
 @click.option("--instant-alter", default="ADD COLUMN note VARCHAR(32) NULL", show_default=True)
 @click.option("--out", default=None, help="write the JSON results here")
-def bench(host, port, user, password, tls, rows, threads, phase_s, modes, alter_text,
-          instant_alter, out) -> None:
+def bench(host, port, user, password, tls, rows, threads, phase_s, modes, repeat,
+          throttle_threads, alter_text, instant_alter, out) -> None:
     """Foreground QPS and p99 before, during and after each way of running an ALTER.
     Loads its own table in schema osc_bench. For a throwaway server only."""
     from dbguard.osc.bench import run_bench
@@ -191,7 +195,8 @@ def bench(host, port, user, password, tls, rows, threads, phase_s, modes, alter_
     res = run_bench(connector(host, port, user, password, tls=tls), rows=rows,
                     threads=threads, phase_s=phase_s,
                     modes=[m.strip() for m in modes.split(",") if m.strip()],
-                    alter=alter_text, instant_alter=instant_alter, log=_err)
+                    alter=alter_text, instant_alter=instant_alter, log=_err, repeat=repeat,
+                    throttle_threads=throttle_threads)
     text = json.dumps(res, indent=2, default=str)
     if out:
         with open(out, "w") as f:
