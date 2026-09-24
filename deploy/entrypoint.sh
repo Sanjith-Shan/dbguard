@@ -23,11 +23,19 @@ report_host=${DBGUARD_NODE}
 report_port=3306
 # DBGUARD_SEMISYNC=${DBGUARD_SEMISYNC} (the agent enables semi-sync per role only when 1)
 CNF
-log "rendered dbguard-node.cnf server_id=${DBGUARD_SERVER_ID} semisync=${DBGUARD_SEMISYNC}"
 
-# Binlog dir (tmpfs in compose, a plain dir otherwise). mysqld runs as user mysql.
-mkdir -p /var/lib/mysql-binlog
-chown mysql:mysql /var/lib/mysql-binlog
+# Optional binlog location (disk-full scenario, deploy/compose.diskfull.yml). Unset means
+# the datadir, as in my.cnf. conf.d files are read in order, so this one overrides base.
+if [ -n "${DBGUARD_BINLOG_DIR:-}" ]; then
+    mkdir -p "${DBGUARD_BINLOG_DIR}"
+    chown mysql:mysql "${DBGUARD_BINLOG_DIR}"
+    cat >> /etc/mysql/conf.d/dbguard-node.cnf <<CNF
+log_bin=${DBGUARD_BINLOG_DIR}/binlog
+log_bin_index=${DBGUARD_BINLOG_DIR}/binlog.index
+CNF
+    log "binlog in ${DBGUARD_BINLOG_DIR}"
+fi
+log "rendered dbguard-node.cnf server_id=${DBGUARD_SERVER_ID} semisync=${DBGUARD_SEMISYNC}"
 
 if [ ! -d /var/lib/mysql/mysql ]; then
     log "datadir empty, initialising"

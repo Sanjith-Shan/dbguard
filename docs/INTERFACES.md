@@ -105,7 +105,6 @@ Fleet deviations from the block above, all in `deploy/mysql/my.cnf`.
 | `loose_rpl_semi_sync_source_*` | `mysqld --initialize` ignores `plugin_load_add`, so without `loose_` the first boot aborts on an unknown variable. `bin/bootstrap` checks the plugins are ACTIVE instead |
 | one `plugin_load_add` line per plugin | same effect as the `;` list, easier to read |
 | `replica_parallel_workers=16`, `replica_preserve_commit_order=ON` | with 4 workers the replicas fell 44 s behind in five minutes of 8-client load (BUGS.md) |
-| `log_bin=/var/lib/mysql-binlog/binlog` on a per-node `tmpfs` of 256 MB | the disk-full scenario fills the binlog, not the datadir. The tmpfs is emptied by a container stop or recreate (not by the agent restarting mysqld), so a node that was stopped and started again comes back with no binlog files. Its GTID state survives in `mysql.gtid_executed`, so it can still be repointed, but it can no longer serve as a source for GTIDs only its old binlog had, and XA crash recovery of prepared transactions has no binlog to consult |
 | `relay_log_recovery=ON` | crash-safe replica. A replica that crashed refetches its relay log from the source by GTID auto-position |
 | `binlog_expire_logs_seconds=3600` | the laptop disk is small |
 | `innodb_buffer_pool_size=128M`, `innodb_redo_log_capacity=128M`, `mem_limit: 700m` | eight nodes fit in Docker Desktop's 8 GB |
@@ -369,11 +368,29 @@ Harness additions to the row. Extra keys only, nothing removed.
 
 ### disk-full (not implemented yet)
 
-Filling a node's datadir would fill the Docker VM disk that every container shares. The
-scenario needs a small per-node tmpfs for the binary logs, for example
-`tmpfs: /var/lib/mysql-binlog:size=256m` on every node in deploy/docker-compose.yml and
-`log_bin=/var/lib/mysql-binlog/binlog` in deploy/mysql/my.cnf. Both files belong to the
-fleet. Until they carry it, `bin/chaos --scenario disk-full` raises NotImplementedError.
+Filling a node's datadir would fill the Docker VM disk that every container shares, so the
+scenario fills a small binlog tmpfs on one node instead. It is opt-in and never on by
+default, because a tmpfs is wiped by any container stop. A `docker kill` and `docker start`
+of a primary with its binlog on tmpfs would lose the binlog and roll back prepared
+transactions in crash recovery, which would change what the kill and rejoin experiments
+measure.
+
+- `/entrypoint.sh` reads env `DBGUARD_BINLOG_DIR`. Unset (the default) keeps `log_bin=binlog`
+  in the datadir. Set, it creates and chowns the directory and renders
+  `log_bin=$DIR/binlog` and `log_bin_index=$DIR/binlog.index` into
+  `/etc/mysql/conf.d/dbguard-node.cnf`, which overrides my.cnf.
+- `deploy/compose.diskfull.yml` is an overlay that gives mysql-a1 only
+  `DBGUARD_BINLOG_DIR=/var/lib/mysql-binlog` and a 256 MB tmpfs there.
+- Harness procedure. With a1 a caught-up replica, recreate it with
+  `docker compose -f deploy/docker-compose.yml -f deploy/compose.diskfull.yml up -d --no-deps --force-recreate mysql-a1`,
+  wait for it to replicate again, switch the primary to it (`dbgctl failover rs1 --to
+  mysql-a1`), then fill `/var/lib/mysql-binlog`. Afterwards recreate a1 without the overlay.
+- The recreated a1 starts a new, empty binlog. Its `gtid_executed` survives in
+  `mysql.gtid_executed`, but GTIDs from before the recreate exist only in the old binlog in
+  the datadir, which the new index does not list. So switch to a1 only after the other
+  replicas have caught up, or they will fail with error 1236 asking a1 for purged GTIDs.
+
+Until `bin/chaos --scenario disk-full` implements this, it raises NotImplementedError.
 
 ### Orchestrator baseline
 

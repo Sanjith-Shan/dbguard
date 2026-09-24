@@ -1,0 +1,12 @@
+# Disk-full overlay: mysql-a1 only, binlog on a 256 MB tmpfs so the harness can fill it.
+#   docker compose -f deploy/docker-compose.yml -f deploy/compose.diskfull.yml \
+#       up -d --no-deps --force-recreate mysql-a1
+# Recreate a1 while it is a caught-up replica, then switch the primary to it. The tmpfs
+# starts empty and is wiped by any container stop, so never use this for kill or rejoin runs.
+# Recreate a1 without this overlay to go back to the binlog in the datadir.
+services:
+  mysql-a1:
+    environment:
+      DBGUARD_BINLOG_DIR: /var/lib/mysql-binlog
+    tmpfs:
+      - /var/lib/mysql-binlog:size=256m,mode=0770,uid=999,gid=999
