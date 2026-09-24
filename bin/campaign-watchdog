@@ -196,6 +196,10 @@ def main() -> int:
                 main._disk_logged = True
             time.sleep(60)
             continue
+        if (RESULTS / "campaign.pause").exists():
+            # an operator is changing the fleet between entries; do not touch it
+            time.sleep(10)
+            continue
         if not pid_alive(PIDFILE) and fleet_down():
             log(f"campaign not running and containers down: {fleet_down()}")
             if not bring_up():

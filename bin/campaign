@@ -289,6 +289,12 @@ def main() -> int:
             if free < a.min_free_gib:
                 log(f"STOP free disk {free:.1f} GiB < {a.min_free_gib} GiB")
                 return 3
+            pause = RESULTS / "campaign.pause"
+            if pause.exists():
+                log("PAUSED at entry boundary (results/campaign.pause exists)")
+                while pause.exists():
+                    time.sleep(5)
+                log("RESUMED")
             if not docker_alive():
                 # never recreate the fleet into a dead engine; a human restarts Docker Desktop
                 log("STOP docker engine unreachable (docker info failed)")
