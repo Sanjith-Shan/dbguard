@@ -40,8 +40,12 @@ class SetController:
     def __init__(self, rs: str, cfg: FleetConfig, scfg: SetConfig, agents: AgentClient,
                  prober: Prober | None, events: EventLog, metrics: Metrics | None = None,
                  provisioner: Provisioner | None = None, mode: str | None = None,
-                 rejoin: str | None = None):
+                 rejoin: str | None = None, quiesce_interval_s: float | None = None):
+        from dbguard.manager.rejoin import QUIESCE_INTERVAL_S
         self.rs = rs
+        # Rejoin's quiescence and errant-GTID watch cadence. 1 s in production; tests pass
+        # a smaller value so the simulation runs the same logic faster.
+        self.quiesce_interval_s = quiesce_interval_s or QUIESCE_INTERVAL_S
         self.cfg = cfg
         self.scfg = scfg
         self.mode = mode or cfg.mode

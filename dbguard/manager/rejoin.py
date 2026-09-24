@@ -109,8 +109,8 @@ async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> Non
 
 
 QUIESCE_DEADLINE_S = 20.0    # longer than this and the node is rebuilt, not trusted
-QUIESCE_INTERVAL_S = 1.0     # two equal gtid_executed reads this far apart
-VERIFY_WINDOW_S = 10.0       # after a repoint, watch for errant GTIDs this long
+QUIESCE_INTERVAL_S = 1.0     # default: two equal gtid_executed reads this far apart
+VERIFY_READS = 10            # after a repoint, watch for errant GTIDs this many intervals
 
 
 async def quiesce(ctl: SetController, n: str) -> tuple[NodeView | None, str]:
@@ -121,7 +121,8 @@ async def quiesce(ctl: SetController, n: str) -> tuple[NodeView | None, str]:
     reachable, as unacknowledged phantoms. A gtid_executed read before that is too small, the
     subset check passes, and the node is repointed with GTIDs the primary never had: silent
     divergence (hang-container, 2 of 2 runs, docs/BUGS.md). So: fresh /status only, no
-    semi-sync waiters, no committing threads, and two equal reads QUIESCE_INTERVAL_S apart.
+    semi-sync waiters, no committing threads, and two equal reads ctl.quiesce_interval_s apart
+    (QUIESCE_INTERVAL_S, 1 s, in production).
     Returns the last view and "ok", or None and why it never settled.
     """
     end = time.monotonic() + QUIESCE_DEADLINE_S
@@ -143,7 +144,7 @@ async def quiesce(ctl: SetController, n: str) -> tuple[NodeView | None, str]:
                 return nv, "ok"
             else:
                 why, prev = f"{n} gtid_executed still changing", nv
-        await asyncio.sleep(QUIESCE_INTERVAL_S)
+        await asyncio.sleep(ctl.quiesce_interval_s)
     return None, why
 
 
@@ -156,7 +157,8 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
     primary (semi-sync source side on, or waiters), then must be quiescent, then the subset
     check runs on fresh reads of both sets. ``nv`` and ``pv`` are ignored beyond logging;
     they stay in the signature for callers. A rebuild runs in the background unless ``wait``
-    is set. After a repoint a watcher checks for errant GTIDs for VERIFY_WINDOW_S."""
+    is set. After a repoint a watcher checks for errant GTIDs for VERIFY_READS intervals
+    (10 s in production)."""
     primary = ctl.primary
     fresh = await ctl.agents.status(n)
     if fresh.usable and (fresh.semisync.source_enabled or
@@ -223,10 +225,10 @@ async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None
     Read the node first, then the primary (which only grows), so a transaction the node got
     by replication is always in the primary's later read. Errant twice in a row means stop
     trusting it: rebuild, branch rebuild_after_errant."""
-    end = time.monotonic() + VERIFY_WINDOW_S
+    end = time.monotonic() + VERIFY_READS * ctl.quiesce_interval_s
     seen = 0
     while time.monotonic() < end:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(ctl.quiesce_interval_s)
         if ctl.primary != primary:
             return
         nv = await ctl.agents.status(n)

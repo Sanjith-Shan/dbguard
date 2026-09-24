@@ -81,7 +81,8 @@ async def sim_factory(tmp_path):
         mgr = Manager(cfg, addressing=Addressing(overrides=fleet.overrides()),
                       prober=FakeProber(fleet, cfg.probe_timeout_s),
                       provisioner=FakeProvisioner(fleet) if provision else None,
-                      state_dir=str(tmp_path), rejoin=rejoin)
+                      state_dir=str(tmp_path), rejoin=rejoin,
+                      quiesce_interval_s=0.05)
         if start:
             await mgr.start()
         s = Sim(fleet, mgr, cfg)
@@ -912,7 +913,9 @@ async def test_errant_gtids_after_a_repoint_trigger_a_rebuild(sim_factory):
     a1.hide_waiting = True
     await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover")
     a1.frozen = False
-    a1.pending_until = time.time() + 3.5
+    # the hidden waiters commit only once the repoint has happened, inside the watch
+    await s.until(lambda: a1.source is not None, timeout=10, what="repoint of mysql-a1")
+    a1.pending_until = time.time()
     await s.until(lambda: any(e.rejoin and e.rejoin.branch == "rebuild_after_errant"
                               for e in s.events("rs1", "rejoin")),
                   timeout=20, what="rebuild_after_errant")

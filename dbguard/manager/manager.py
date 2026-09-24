@@ -29,7 +29,7 @@ class Manager:
                  state_dir: str | None = None, mode: str | None = None,
                  rejoin: str | None = None, prober: Prober | None = None,
                  agents: AgentClient | None = None, provisioner: Provisioner | None = None,
-                 events: EventLog | None = None):
+                 events: EventLog | None = None, quiesce_interval_s: float | None = None):
         self.cfg = cfg
         self.mode = mode or cfg.mode
         self.addr = addressing or Addressing(agent_port=cfg.agent_port,
@@ -43,7 +43,7 @@ class Manager:
         self.sets: dict[str, SetController] = {
             rs: SetController(rs, cfg, scfg, self.agents, self.prober, self.events,
                               metrics=self.metrics, provisioner=provisioner, mode=self.mode,
-                              rejoin=rejoin)
+                              rejoin=rejoin, quiesce_interval_s=quiesce_interval_s)
             for rs, scfg in cfg.sets.items()
         }
         self._tasks: list[asyncio.Task] = []
