@@ -54,14 +54,15 @@ docs/                     DESIGN, CAPACITY, RUNBOOK, BUGS, INTERFACES (this)
   `ALL PRIVILEGES` plus `BACKUP_ADMIN, CLONE_ADMIN, REPLICATION SLAVE, REPLICATION CLIENT,
   SYSTEM_VARIABLES_ADMIN, CONNECTION_ADMIN`, host `%`. `repl` / `repl` with
   `REPLICATION SLAVE`. `chaos` / `chaos` on `chaos.*`.
-- Every account uses `caching_sha2_password` (8.4 default). Connections inside the
-  compose network are plain TCP, `ssl=False` explicitly in aiomysql (8.4 clients default to
-  requiring the server public key for caching_sha2 over insecure links, so pass
-  `server_public_key` or use `get_server_public_key=True`. aiomysql: use
-  `auth_plugin`-free connect and set `ssl=None`; if that fails with "public key", switch the
-  accounts to `caching_sha2_password` with TLS from the server's auto-generated certs,
-  `ssl=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=CERT_NONE`).
-  The fleet agent decides once and records it in BUGS.md if it bit.
+- Every account uses `caching_sha2_password` (8.4 default). Decision by the agent, verified
+  against mysql 8.4.11. Python clients connect with TLS and no certificate check,
+  `ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE`,
+  passed as `ssl=ctx` to aiomysql. mysqld auto-generates its certificates at first boot.
+  Plain TCP fails the first full authentication with "'cryptography' package is required"
+  because PyMySQL needs RSA for the password exchange, and it only appears to work after
+  some TLS login has warmed the server's auth cache, which a restart flushes. Replication
+  uses `SOURCE_SSL=1` for the same reason. `dbguard/agent/db.py` has the agent's copy
+  (`insecure_tls()`).
 - Schema `dbguard`:
   - `heartbeat(rs VARCHAR(16) PRIMARY KEY, ts TIMESTAMP(6), writer VARCHAR(64))` written by
     the primary's agent every 500 ms with `INSERT ... ON DUPLICATE KEY UPDATE`.
@@ -87,8 +88,8 @@ sync_binlog=1  innodb_flush_log_at_trx_commit=1
 report_host=<container name>
 ```
 Replication is always configured with `SOURCE_AUTO_POSITION=1, SOURCE_HEARTBEAT_PERIOD=0.5,
-SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=86400, SOURCE_SSL=0` (or SSL=1 if the auth decision
-above needs it), user `repl`.
+SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=86400, SOURCE_SSL=1` (the auth decision above),
+user `repl`.
 
 Naive mode (`DBGUARD_SEMISYNC=0`): semi-sync plugins loaded but never enabled. Everything
 else identical.
@@ -133,6 +134,40 @@ fails immediately, then `SET GLOBAL super_read_only=1` with a 2 s deadline, then
 non-system, non-replication thread. If the SET does not return in 2 s the agent SIGKILLs
 mysqld and reports `method:"kill"`. The agent restarts mysqld afterwards (it boots read-only
 by my.cnf). The flag is cleared only by `/promote` or `/unfence`.
+
+Agent additions to the shapes above. Extra keys only, nothing removed.
+
+- `/status` also carries `"role":"primary"|"replica"|"fenced"|"unknown"`,
+  `semisync.wait_sessions` (Rpl_semi_sync_source_wait_sessions), `semisync.mode` (the agent's
+  semi-sync setting, changed by `/configure`), `heartbeat.stalled_s` (how long the in-flight
+  heartbeat INSERT has been waiting, 0.0 when none is in flight, grows during a semi-sync
+  stall), and `error` when mysqld did not answer. In `--no-supervise` mode `mysqld_pid` is
+  null and `mysqld_alive` mirrors `mysqld_responsive`.
+- `/promote` enables semi-sync on the source side BEFORE it clears `super_read_only`, so no
+  write is ever accepted on the new primary without the ack requirement. The executed order is
+  `STOP REPLICA`, `RESET REPLICA ALL`, `SET GLOBAL rpl_semi_sync_replica_enabled=0`,
+  `SET GLOBAL rpl_semi_sync_source_enabled=1`, `SET GLOBAL super_read_only=0`,
+  `SET GLOBAL read_only=0`, then the fence flag is cleared.
+- `/fence` answers 500 with `"method":"failed"` when the SET missed its deadline and the agent
+  has no mysqld pid to kill (only possible with `--no-supervise`). The flag is still set.
+- `/configure` answers `{"ok":true,"semisync":bool,"role":str,"source_enabled":bool,
+  "replica_enabled":bool}`. It never switches the source side off while
+  `Rpl_semi_sync_source_wait_sessions > 0`, because that would release waiting sessions and
+  acknowledge writes no replica has. The agent also runs it after startup and after every
+  mysqld restart.
+- `/rebuild` also returns `gtid_executed` after the clone. `/kill-mysqld` and `/hang-mysqld`
+  answer `{"ok":true,"pid":n}` (plus `seconds`) and 409 without a supervised mysqld.
+- `/primary` answers 503 `unknown` until the startup guard has run, and a request that
+  arrives after a monotonic gap over 3 s waits (up to 2.5 s) for the wake guard first.
+- The agent passes `MYSQLD_PARENT_PID=<agent pid>` to mysqld, which makes mysqld treat the
+  agent as its monitoring process. `RESTART` and the restart after `CLONE INSTANCE` then exit
+  with code 16 and the agent restarts mysqld at once.
+- Extra agent env. `DBGUARD_MYSQLD_CMD` (default `docker-entrypoint.sh mysqld`),
+  `DBGUARD_MYSQL_HOST`/`DBGUARD_MYSQL_PORT` (default 127.0.0.1/3306),
+  `DBGUARD_MYSQL_USER`/`DBGUARD_MYSQL_PASSWORD` (default dbguard/dbguard, falls back to root
+  and `MYSQL_ROOT_PASSWORD` on access denied), `DBGUARD_REPL_USER`/`DBGUARD_REPL_PASSWORD`
+  (default repl/repl), `DBGUARD_AGENT_PORT` (8080), `DBGUARD_STATE_DIR` (/var/lib/dbguard).
+  Flag `--no-supervise` attaches to a mysqld the agent did not start.
 
 Startup and wake guard (woken-primary window): on agent start, and whenever the agent's
 monotonic loop observes a gap > 3 s (the container was frozen), the agent asks the manager
