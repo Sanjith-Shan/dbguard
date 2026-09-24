@@ -437,3 +437,25 @@ async def test_agent_status_timeout_never_stalls_loop(sim_factory):
     await s.until(lambda: s.ctl("rs2").st.state == State.DEGRADED, timeout=6,
                   what="rs2 DEGRADED")
     assert s.ctl("rs1").st.state == State.HEALTHY
+
+
+async def test_doctor_sentence_for_a_dead_primary(sim_factory):
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.2)
+    s.fleet.nodes["mysql-a2"].receive = False     # a3 will be ahead
+    await asyncio.sleep(0.2)
+    s.ctl().st.halt("operator wants to look first")
+    s.fleet.kill("mysql-a1")
+    await asyncio.sleep(1.0)
+    from dbguard.manager.doctor import doctor
+    d = doctor(s.ctl())
+    first = d["lines"][0]
+    assert first.startswith("rs1: primary mysql-a1 unreachable from manager for ")
+    assert "2 of 2 replicas report" in first
+    assert "would fence and promote mysql-a3 (retrieved set is" in first
+    assert "ahead of mysql-a2)" in first
+    assert d["verdict"] == "HALTED"
+    assert any("HALTED" in line and "operator wants to look first" in line
+               for line in d["lines"])
