@@ -37,6 +37,8 @@ class AgentSettings:
     heartbeat_interval_s: float = 0.5
     wake_gap_s: float = 3.0
     manager_timeout_s: float = 1.0
+    self_fence_after_s: float = 10.0
+    self_fence_interval_s: float = 1.0
     clone_timeout_s: float = 3600.0
     restart_wait_s: float = 600.0
 
@@ -62,5 +64,6 @@ class AgentSettings:
             repl_user=e.get("DBGUARD_REPL_USER", "repl"),
             repl_password=e.get("DBGUARD_REPL_PASSWORD", "repl"),
             source_port=int(e.get("DBGUARD_SOURCE_PORT", "3306")),
+            self_fence_after_s=float(e.get("DBGUARD_SELF_FENCE_AFTER_S", "10")),
             mysqld_cmd=shlex.split(e.get("DBGUARD_MYSQLD_CMD", "docker-entrypoint.sh mysqld")),
         )

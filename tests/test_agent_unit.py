@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -71,6 +72,7 @@ class FakeDB:
         self.src_enabled = 0
         self.rep_enabled = 0
         self.wait_sessions = 0
+        self.semisync_clients = 2
         self.replica: dict[str, Any] | None = None
         self.heartbeat: tuple[float, str] | None = None
         self.clients = [{"id": 101, "user": "app"}, {"id": 102, "user": "chaos"}]
@@ -102,15 +104,20 @@ class FakeDB:
                     {"Variable_name": "rpl_semi_sync_source_enabled",
                      "Value": "ON" if self.src_enabled else "OFF"}]
         elif s.startswith("SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync"):
-            return [{"Variable_name": "Rpl_semi_sync_source_status",
+            rows = [{"Variable_name": "Rpl_semi_sync_source_status",
                      "Value": "ON" if self.src_enabled else "OFF"},
                     {"Variable_name": "Rpl_semi_sync_replica_status", "Value": "OFF"},
-                    {"Variable_name": "Rpl_semi_sync_source_clients", "Value": "2"},
+                    {"Variable_name": "Rpl_semi_sync_source_clients",
+                     "Value": str(self.semisync_clients)},
                     {"Variable_name": "Rpl_semi_sync_source_tx_avg_wait_time", "Value": "310"},
                     {"Variable_name": "Rpl_semi_sync_source_no_tx", "Value": "0"},
                     {"Variable_name": "Rpl_semi_sync_source_yes_tx", "Value": "42"},
                     {"Variable_name": "Rpl_semi_sync_source_wait_sessions",
                      "Value": str(self.wait_sessions)}]
+            pattern = s.split("'")[1]
+            if "%" not in pattern:
+                rows = [r for r in rows if r["Variable_name"] == pattern]
+            return rows
         elif s == "SHOW REPLICA STATUS":
             return [self.replica] if self.replica else []
         elif "FROM dbguard.heartbeat" in s:
@@ -486,7 +493,8 @@ async def test_primary_unknown_before_startup_guard(settings, client_factory):
 
 STATUS_KEYS = {"node", "rs", "ts", "mysqld_alive", "mysqld_responsive", "mysqld_pid", "fenced",
                "super_read_only", "read_only", "gtid_executed", "replica", "semisync",
-               "source_reachable", "heartbeat", "agent_uptime_s", "agent_version"}
+               "source_reachable", "heartbeat", "agent_uptime_s", "agent_version",
+               "self_fence"}
 REPLICA_KEYS = {"configured", "source_host", "io_running", "sql_running",
                 "seconds_behind_source", "retrieved_gtid_set", "executed_gtid_set",
                 "last_io_error", "last_sql_error"}
@@ -503,7 +511,6 @@ def _check_shape(d: dict) -> None:
 
 
 async def test_status_shape_replica(settings, client_factory):
-    import time
     db = FakeDB()
     db.replica = {"Source_Host": "mysql-a2", "Replica_IO_Running": "Yes",
                   "Replica_SQL_Running": "Yes", "Seconds_Behind_Source": 0,
@@ -519,6 +526,8 @@ async def test_status_shape_replica(settings, client_factory):
     assert d["replica"]["configured"] is True and d["replica"]["io_running"] == "Yes"
     assert d["replica"]["last_io_error"] is None
     assert d["source_reachable"] is True
+    assert d["self_fence"] == {"enabled": True, "manager_unreachable_s": 0.0,
+                               "semisync_clients": None}
     assert d["semisync"]["yes_tx"] == 42 and d["semisync"]["avg_wait_time_us"] == 310
     assert d["heartbeat"]["writer"] == "mysql-a2" and 0.3 < d["heartbeat"]["age_s"] < 5
 
@@ -563,3 +572,61 @@ async def test_http_routes(settings, client_factory):
     assert r.status == 200 and sup.signals[-1] == signal.SIGKILL
     r = await c.post("/kill-mysqld")
     assert r.status == 409
+
+
+# --------------------------------------------------------------------------- self-fence lease
+
+def _lease_agent(settings, clients: int, manager_up: bool, **kw):
+    db = FakeDB()
+    db.sro = 0
+    db.semisync_clients = clients
+    settings.self_fence_after_s = kw.get("after", 10.0)
+    settings.semisync = kw.get("semisync", True)
+    return make_agent(settings, db, manager=FakeManager("mysql-a1", reachable=manager_up)), db
+
+
+async def test_self_fence_when_manager_and_all_semisync_replicas_are_gone(settings):
+    agent, db = _lease_agent(settings, clients=0, manager_up=False)
+    assert await agent.self_fence_tick() == "counting"
+    assert not agent.fenced
+    agent._mgr_unreachable_since -= 11  # 11 s of continuous manager silence
+    assert agent.self_fence_state()["manager_unreachable_s"] >= 10
+    assert await agent.self_fence_tick() == "self_fence"
+    assert agent.fenced and "SET GLOBAL super_read_only=1" in db.executed()
+    assert agent.m.self_fences._value.get() == 1
+    assert agent.self_fence_state()["manager_unreachable_s"] == 0.0
+
+
+async def test_self_fence_not_triggered_in_experiment4_manager_partition_clients_stay_2(settings):
+    agent, db = _lease_agent(settings, clients=2, manager_up=False)
+    for _ in range(3):
+        assert await agent.self_fence_tick() == "ok"
+    agent._mgr_unreachable_since = time.monotonic() - 60
+    assert await agent.self_fence_tick() == "ok"
+    assert not agent.fenced and "SET GLOBAL super_read_only=1" not in db.executed()
+    assert agent.self_fence_state() == {"enabled": True, "manager_unreachable_s": 0.0,
+                                        "semisync_clients": 2}
+
+
+async def test_self_fence_not_triggered_when_manager_reachable_and_no_replicas(settings):
+    agent, _db = _lease_agent(settings, clients=0, manager_up=True)
+    agent._mgr_unreachable_since = time.monotonic() - 60
+    assert await agent.self_fence_tick() == "ok"
+    assert not agent.fenced
+    assert agent.self_fence_state()["manager_unreachable_s"] == 0.0
+
+
+@pytest.mark.parametrize("semisync,after", [(False, 10.0), (True, 0.0)])
+async def test_self_fence_disabled_in_naive_mode_or_after_zero(settings, semisync, after):
+    agent, _db = _lease_agent(settings, clients=0, manager_up=False, semisync=semisync,
+                             after=after)
+    agent._mgr_unreachable_since = time.monotonic() - 60
+    assert await agent.self_fence_tick() == "disabled"
+    assert not agent.fenced and agent.self_fence_state()["enabled"] is False
+
+
+async def test_self_fence_ignores_replicas(settings):
+    agent, db = _lease_agent(settings, clients=0, manager_up=False)
+    db.sro = 1
+    assert await agent.self_fence_tick() == "not_primary"
+    assert not agent.fenced

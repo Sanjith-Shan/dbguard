@@ -126,6 +126,7 @@ else identical.
              "no_tx":int,"yes_tx":int},
  "source_reachable":bool|null,       (TCP connect to source_host:3306 within 500 ms)
  "heartbeat":{"ts":<unix float>|null,"age_s":float|null,"writer":str|null},
+ "self_fence":{"enabled":bool,"manager_unreachable_s":float,"semisync_clients":int|null},
  "agent_uptime_s":float,"agent_version":str}
 ```
 
@@ -168,6 +169,19 @@ Agent additions to the shapes above. Extra keys only, nothing removed.
   and `MYSQL_ROOT_PASSWORD` on access denied), `DBGUARD_REPL_USER`/`DBGUARD_REPL_PASSWORD`
   (default repl/repl), `DBGUARD_AGENT_PORT` (8080), `DBGUARD_STATE_DIR` (/var/lib/dbguard).
   Flag `--no-supervise` attaches to a mysqld the agent did not start.
+
+Self-fence lease. A primary cut off from BOTH the manager and every semi-sync replica, but
+still reachable by HAProxy and clients, would otherwise be protected only by the one hour
+semi-sync timeout, after which it falls back to async and acknowledges writes that exist
+nowhere else. Every second the primary's agent (super_read_only=0, not fenced) reads
+`Rpl_semi_sync_source_clients` and asks the manager `GET /v1/sets/<rs>/primary` (1 s timeout).
+When the client count is 0 AND the manager has been unreachable for
+`DBGUARD_SELF_FENCE_AFTER_S` continuous seconds (default 10, 0 disables), the agent fences
+itself through the same code path as `/fence` and logs event `self_fence` with both
+observations. A reachable manager or at least one semi-sync client resets the timer. It runs
+only while semi-sync mode is on and `DBGUARD_MANAGER_URL` is set. Experiment 4 (manager
+partitioned from the primary, replicas fine) never triggers it because the client count stays
+at 2. `/status` shows the timer under `self_fence`.
 
 Startup and wake guard (woken-primary window): on agent start, and whenever the agent's
 monotonic loop observes a gap > 3 s (the container was frozen), the agent asks the manager

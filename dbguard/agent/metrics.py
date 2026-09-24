@@ -24,6 +24,9 @@ class AgentMetrics:
                                         "Heartbeat write errors", registry=r)
         self.wake_guard = Counter("dbguard_agent_wake_guard_total", "Wake guard decisions",
                                   ["reason", "decision"], registry=r)
+        self.self_fences = Counter("dbguard_agent_self_fences_total",
+                                   "Self-fences by the lease (manager and replicas gone)",
+                                   registry=r)
         self.mysqld_restarts = Counter("dbguard_agent_mysqld_restarts_total",
                                        "mysqld restarts by the supervisor", registry=r)
         self.heartbeat_age = Gauge("dbguard_agent_heartbeat_age_seconds",

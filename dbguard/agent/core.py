@@ -135,6 +135,8 @@ class Agent:
         self._hb_inflight_since: float | None = None
         self._hb_session: Session | None = None
         self._role = "unknown"
+        self._mgr_unreachable_since: float | None = None
+        self._sf_clients: int | None = None
         self.m.fenced.set(1 if self.fenced else 0)
         self.m.set_role("fenced" if self.fenced else "unknown")
 
@@ -252,6 +254,7 @@ class Agent:
                           "stalled_s": self.heartbeat_stalled_s()},
             "agent_uptime_s": round(time.monotonic() - self.started_mono, 3),
             "agent_version": AGENT_VERSION,
+            "self_fence": self.self_fence_state(),
         }
 
         async def collect(sess: Session) -> None:
@@ -733,6 +736,88 @@ class Agent:
             finally:
                 self._hb_inflight_since = None
 
+    # ------------------------------------------------------------------ self-fence lease
+
+    def self_fence_enabled(self) -> bool:
+        return bool(self.semisync and self.s.self_fence_after_s > 0 and self.s.manager_url)
+
+    def manager_unreachable_s(self) -> float:
+        since = self._mgr_unreachable_since
+        return round(time.monotonic() - since, 3) if since is not None else 0.0
+
+    def self_fence_state(self) -> dict[str, Any]:
+        return {"enabled": self.self_fence_enabled(),
+                "manager_unreachable_s": self.manager_unreachable_s(),
+                "semisync_clients": self._sf_clients}
+
+    def _sf_reset(self) -> None:
+        self._mgr_unreachable_since = None
+
+    async def self_fence_tick(self) -> str:
+        """One lease check. A primary cut off from the manager AND from every semi-sync
+        replica fences itself after self_fence_after_s, before the one hour semi-sync
+        timeout can fall back to async and acknowledge writes that exist nowhere else.
+
+        Returns disabled | not_primary | unknown | ok | counting | self_fence."""
+        if not self.self_fence_enabled():
+            self._sf_reset()
+            return "disabled"
+        if self.fenced:
+            self._sf_reset()
+            return "not_primary"
+        try:
+            async def read(sess: Session) -> tuple[bool | None, int | None]:
+                r = await sess.query("SELECT @@GLOBAL.super_read_only AS sro")
+                rows = await sess.query(
+                    "SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_source_clients'")
+                return _b(r[0]["sro"]), (_i(rows[0]["Value"]) if rows else None)
+            sro, clients = await self._sql(read)
+        except DbError:
+            sro, clients = None, None
+        self._sf_clients = clients
+        if sro is True:
+            self._sf_reset()
+            return "not_primary"
+        url = f"{self.s.manager_url.rstrip('/')}/v1/sets/{self.s.rs}/primary"
+        err: str | None = None
+        try:
+            await self.manager_get(url, self.s.manager_timeout_s)
+            reachable = True
+        except Exception as e:  # noqa: BLE001  any failure means unreachable
+            reachable = False
+            err = f"{type(e).__name__}: {e}"
+        if reachable:
+            self._sf_reset()
+            return "ok"
+        if self._mgr_unreachable_since is None:
+            self._mgr_unreachable_since = time.monotonic()
+        if sro is None or clients is None:
+            return "unknown"  # mysqld did not answer; keep counting, decide on facts only
+        if clients > 0:
+            # Semi-sync replicas still ack, so the manager alone being gone (Experiment 4,
+            # manager partitioned from the primary) is no reason to stop taking writes.
+            self._sf_reset()
+            return "ok"
+        unreachable_s = self.manager_unreachable_s()
+        if unreachable_s < self.s.self_fence_after_s:
+            return "counting"
+        log.warning("self_fence", manager_unreachable_s=unreachable_s,
+                    semisync_clients=clients, manager_error=err,
+                    after_s=self.s.self_fence_after_s)
+        self.m.self_fences.inc()
+        await self.fence(reason="self_fence")
+        self._sf_reset()
+        return "self_fence"
+
+    async def _self_fence_loop(self) -> None:
+        await self.startup_done.wait()
+        while not self._stopping:
+            await asyncio.sleep(self.s.self_fence_interval_s)
+            try:
+                await self.self_fence_tick()
+            except Exception:
+                log.exception("self_fence_tick_failed")
+
     # ------------------------------------------------------------------ lifecycle
 
     async def _startup(self) -> None:
@@ -767,7 +852,8 @@ class Agent:
         await self.sup.start()
         self._tasks += [asyncio.create_task(self._startup(), name="startup"),
                         asyncio.create_task(self._ticker(), name="ticker"),
-                        asyncio.create_task(self._heartbeat(), name="heartbeat")]
+                        asyncio.create_task(self._heartbeat(), name="heartbeat"),
+                        asyncio.create_task(self._self_fence_loop(), name="self-fence")]
 
     async def stop(self) -> None:
         self._stopping = True
