@@ -660,3 +660,20 @@ def test_role_change_budget_exceeds_agent_budget():
     """REVIEW #17: the agent bounds a whole role change to 30 s, the manager waits longer."""
     from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
     assert ROLE_CHANGE_TIMEOUT_S > 30.0
+
+
+async def test_slow_fence_still_precedes_promote(sim_factory):
+    """The fence runs concurrently with choose/catch-up/repoint, but nothing is promoted
+    before it has finished."""
+    s = await sim_factory(sets={"rs1": A}, fence_deadline_s=2.0)
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.nodes["mysql-a1"].fence_delay = 0.8
+    s.fleet.partition("mysql-a1", "mysql-a2")
+    s.fleet.partition("mysql-a1", "mysql-a3")
+    s.fleet.writing = True
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    ev = s.events("rs1", "failover")[0]
+    order = [what for _, _, what in s.fleet.log]
+    assert order.index("fenced") < order.index("promoted")
+    assert ev.steps.fence.outcome == "sql" and ev.steps.fence.duration_s >= 0.8
+    lossless(s)

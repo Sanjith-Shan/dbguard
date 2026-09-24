@@ -161,20 +161,21 @@ async def failover(ctl: SetController, v: Verdict) -> None:
                     total_s=total)
         return ev
 
-    # 1. fence ---------------------------------------------------------------------
+    # 1. fence, 2. choose ----------------------------------------------------------
+    # The fence runs concurrently with stopping the candidates' IO threads, choosing,
+    # catching up and repointing. None of those can make a write acknowledged, and the
+    # promote step waits for the fence, so "fence before promote" still holds. Against a
+    # container that vanished the fence costs its whole deadline (3 s on the real fleet),
+    # which used to sit in front of every other step. If an IO thread could not be stopped,
+    # a replica might still take acked writes from a live old primary, so the fence is
+    # awaited before choosing.
     fence_resp = None
-    if mode == "dbguard":
-        steps.fence, fence_resp = await fence(ctl, old)
-        if steps.fence.outcome == "unreachable":
-            notes.append(f"{old} agent unreachable, not fenced, relying on semi-sync")
-    else:
-        steps.fence = FenceStep(duration_s=0.0, outcome="skipped")
-
-    # 2. choose --------------------------------------------------------------------
+    fence_task: asyncio.Task | None = None
     tc = time.monotonic()
     others = [n for n in ctl.members if n != old]
     io_stop: dict[str, str | None] = {}
     if mode == "dbguard":
+        fence_task = asyncio.create_task(fence(ctl, old))
         pre = ctl.last_obs.nodes if ctl.last_obs else {}
         io_stop = await stop_io_threads(
             ctl, [n for n in others if n in pre and pre[n].usable and
@@ -182,7 +183,18 @@ async def failover(ctl: SetController, v: Verdict) -> None:
         failed_stop = {n: e for n, e in io_stop.items() if e}
         if failed_stop:
             notes.append("STOP REPLICA IO_THREAD failed on " + "; ".join(
-                f"{n} ({e})" for n, e in failed_stop.items()))
+                f"{n} ({e})" for n, e in failed_stop.items()) + ", waited for the fence")
+            await asyncio.wait({fence_task})
+    else:
+        steps.fence = FenceStep(duration_s=0.0, outcome="skipped")
+
+    async def fence_done():
+        nonlocal fence_resp
+        if fence_task is not None and steps.fence is None:
+            steps.fence, fence_resp = await fence_task
+            if steps.fence.outcome == "unreachable":
+                notes.append(f"{old} agent unreachable, not fenced, relying on semi-sync")
+
     views = await ctl.fresh_views(others)
     choice = choose([views[n] for n in others], mode=mode, old_primary=old)
     steps.choose = ChooseStep(duration_s=round(time.monotonic() - tc, 3),
@@ -192,13 +204,8 @@ async def failover(ctl: SetController, v: Verdict) -> None:
     if choice.excluded:
         notes.append("not candidates: " + "; ".join(f"{n} {w}" for n, w in
                                                      choice.excluded.items()))
-    if fence_resp and fence_resp.get("gtid_executed") and choice.winner:
-        from dbguard.gtid import GtidSet
-        extra = GtidSet.parse(fence_resp["gtid_executed"]) - views[choice.winner].have
-        if extra:
-            notes.append(f"old primary holds {extra.count()} unacknowledged transactions "
-                         f"the winner lacks, they will be discarded at rejoin")
     if choice.halt_reason:
+        await fence_done()
         finish(None, "halted", halt_reason=choice.halt_reason)
         return
     winner = choice.winner
@@ -212,11 +219,37 @@ async def failover(ctl: SetController, v: Verdict) -> None:
         if ok and why != "ok":
             notes.append(why)
         if not ok:
+            await fence_done()
             finish(None, "halted", halt_reason=f"catch-up deadline "
                    f"{ctl.cfg.catchup_deadline_s:.0f} s passed, {why}")
             return
     else:
         steps.catchup = CatchupStep(duration_s=0.0, ok=True)
+
+    targets = [n for n in others if n != winner and views[n].usable]
+
+    async def do_repoint():
+        steps.repoint = await repoint_all(ctl, targets, winner)
+        failed = sorted(set(targets) - set(steps.repoint.nodes))
+        if failed:
+            notes.append(f"repoint failed on {', '.join(failed)}, will retry")
+
+    # 5 before 4 in dbguard mode. The winner is caught up and every other candidate's set
+    # is a subset of it, so the others can attach to it while it is still read-only. When it
+    # is promoted its semi-sync replicas are already connected. Promoting first left the new
+    # primary unable to acknowledge a commit until the first repoint finished (1.8 s on the
+    # real fleet, docs/BUGS.md). Naive mode keeps the spec's order.
+    if mode == "dbguard":
+        await do_repoint()
+
+    # the fence must be finished (or have given up) before anything becomes writable
+    await fence_done()
+    if fence_resp and fence_resp.get("gtid_executed") is not None:
+        from dbguard.gtid import GtidSet
+        extra = GtidSet.parse(fence_resp["gtid_executed"]) - views[winner].have
+        if extra:
+            notes.append(f"old primary holds {extra.count()} unacknowledged transactions "
+                         f"the winner lacks, they will be discarded at rejoin")
 
     # 4. promote -------------------------------------------------------------------
     tp = time.monotonic()
@@ -232,12 +265,9 @@ async def failover(ctl: SetController, v: Verdict) -> None:
     watermark = resp.get("gtid_executed") if isinstance(resp, dict) else None
     ctl.set_primary(winner)
 
-    # 5. repoint -------------------------------------------------------------------
-    targets = [n for n in others if n != winner and views[n].usable]
-    steps.repoint = await repoint_all(ctl, targets, winner)
-    failed = sorted(set(targets) - set(steps.repoint.nodes))
-    if failed:
-        notes.append(f"repoint failed on {', '.join(failed)}, will retry")
+    # 5. repoint (naive mode) --------------------------------------------------------
+    if mode != "dbguard":
+        await do_repoint()
 
     # 6. record --------------------------------------------------------------------
     ctl.st.failovers_total += 1

@@ -52,6 +52,7 @@ class FakeNode:
     io_stopped: bool = False    # STOP REPLICA IO_THREAD
     status_delay: float = 0.0   # a slow /status (loaded agent)
     repoint_delay: float = 0.0  # a slow /repoint (START REPLICA taking seconds)
+    fence_delay: float = 0.0    # a slow /fence
     fail_next: dict = field(default_factory=dict)  # path -> times to answer 500 lost link
     partial: GtidSet = field(default_factory=GtidSet)  # in the relay log, never appliable
     calls: list[str] = field(default_factory=list)
@@ -85,6 +86,7 @@ class FakeFleet:
         self.urls: dict[str, str] = {}
         self._task: asyncio.Task | None = None
         self.closing = False
+        self.log: list[tuple[float, str, str]] = []
 
     # ------------------------------------------------------------- topology helpers
     def setup_replication(self, rs: str, primary: str | None = None) -> None:
@@ -264,7 +266,10 @@ class FakeFleet:
             return web.json_response(fleet.status_body(node))
 
         async def fence(request):
+            if node.fence_delay:
+                await asyncio.sleep(node.fence_delay)
             node.fenced = True
+            fleet.log.append((time.time(), node.name, "fenced"))
             method = "sql"
             if node.hung or not node.mysqld_up:
                 await asyncio.sleep(0.05)
@@ -291,6 +296,7 @@ class FakeFleet:
             node.semisync_source = fleet.semisync
             node.super_read_only = False
             node.fenced = False
+            fleet.log.append((time.time(), node.name, "promoted"))
             return web.json_response({"gtid_executed": str(node.executed), "duration_ms": 1})
 
         async def repoint(request):

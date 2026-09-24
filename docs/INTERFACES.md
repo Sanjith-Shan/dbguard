@@ -330,6 +330,13 @@ Manager behaviour the harness and the agent rely on.
 - In dbguard mode, after the fence and before comparing candidates, the manager runs
   `STOP REPLICA IO_THREAD` on every candidate over SQL (account `dbguard`). `/repoint` and
   `/promote` restart or reset the threads.
+- Step order in dbguard mode. The fence is started first and runs concurrently with
+  stopping IO threads, choose, catch-up and repoint (none of which can acknowledge a write).
+  The others are repointed to the still read-only winner BEFORE it is promoted, so its
+  semi-sync replicas are attached when it becomes writable. Promote waits for the fence to
+  finish or give up. If any IO thread could not be stopped, the fence is awaited before
+  choosing. The event's `steps` keys and meaning are unchanged. Naive mode keeps the spec
+  order (no fence, promote, then repoint).
 - Catch-up is done when the winner's Retrieved_Gtid_Set is a subset of what it applied, or,
   with its IO thread stopped, when `Replica_SQL_Running_State` (read over SQL) is "Replica
   has read all relay log", in which case the unapplied GTIDs are a partial transaction and are
