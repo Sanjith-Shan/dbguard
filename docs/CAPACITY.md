@@ -79,7 +79,7 @@ The measured distribution follows.
 | planned switchover (client stall) | 1.44 s | 6.03 s | 10 |
 | naive, primary killed | 5.45 s | 5.85 s | 30 |
 | naive, primary killed, 2 ms delay, host death | 5.92 s | 7.50 s | 10 |
-| DBGuard, primary killed, 2 ms delay, host death | pending | | |
+| DBGuard, primary killed, 2 ms delay, host death | 6.36 s | 9.54 s | 10 |
 | Orchestrator, primary killed | not yet measured | | |
 
 ## 3. Picking detect_window and probe_timeout

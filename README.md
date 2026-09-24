@@ -48,7 +48,7 @@ under. The sentence under each table says the same.
 |---|---|
 | Primary kills, DBGuard | 30 runs |
 | Acknowledged writes lost by DBGuard across every measured injection | **0** |
-| Acknowledged writes lost by the asynchronous baseline | **0** of 30 kills at 0 ms, **1160** in 10 host-death kills with a 2 ms replication delay |
+| Acknowledged writes lost by the asynchronous baseline | **0** of 30 kills at 0 ms, **1,160** in 10 host-death kills with a 2 ms replication delay, where DBGuard lost **0** in 10 |
 | Failover after a primary kill, median | **8.83 s** |
 | False failovers with the manager partitioned from the primary | **0** of 30 |
 | Commit latency cost of semi-sync at the median, no added delay | +1.6 ms (5.9 ms on vs 4.2 ms off) |
@@ -82,9 +82,9 @@ has.
 | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss |
 |---|---|---|---|---|---|
 | naive | 10 | 5.92 | 7.50 | 1160 | 10 |
-| dbguard | pending | | | | |
+| dbguard | 10 | 6.36 | 9.54 | 0 | 0 |
 
-Under the host-death injection (2 ms replication delay on the primary, its packets to the replicas dropped at the instant of SIGKILL, as a power failure does to data in flight) the asynchronous baseline lost 1160 acknowledged writes in 10 of 10 kills. That is the async window the 0 ms runs hide, and it is why semi-sync AFTER_SYNC exists: the same injection turns those commits into blocked writes instead of acknowledged losses. The naive count depends on the window length (the iptables drop lands about 0.3 to 0.4 s before the SIGKILL and the async primary keeps acknowledging in that window), so read it as lost writes per crash under this injection, not a universal rate. The delay and the drop apply only to packets from the primary to its replicas, never to clients or the manager.
+Under the host-death injection (2 ms replication delay on the primary, its packets to the replicas dropped at the instant of SIGKILL, as a power failure does to data in flight) the asynchronous baseline lost 1160 acknowledged writes in 10 of 10 kills and DBGuard lost 0 in 10. That is the async window the 0 ms runs hide, and it is why semi-sync AFTER_SYNC exists: the same injection turns those commits into blocked writes instead of acknowledged losses. The naive count depends on the window length (the iptables drop lands about 0.3 to 0.4 s before the SIGKILL and the async primary keeps acknowledging in that window), so read it as lost writes per crash under this injection, not a universal rate. The delay and the drop apply only to packets from the primary to its replicas, never to clients or the manager.
 
 Rejoin of the killed primary once its container is back.
 
