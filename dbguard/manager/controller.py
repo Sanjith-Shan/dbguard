@@ -21,7 +21,8 @@ from dbguard.gtid import GtidSet
 from dbguard.manager.client import AgentClient
 from dbguard.manager.detector import DetectParams, Verdict, evaluate
 from dbguard.manager.model import NodeView, Observation, State
-from dbguard.manager.probe import Prober, observe
+from dbguard.manager.client import STATUS_TIMEOUT_S
+from dbguard.manager.probe import Prober, StatusCache, observe
 from dbguard.manager.state import SetState
 
 if TYPE_CHECKING:
@@ -66,6 +67,8 @@ class SetController:
         self.cooldown_logged = False
         self.last_discover_note: str | None = None
         self._stop = asyncio.Event()
+        self.cache = StatusCache(agents, cfg.poll_interval_s, STATUS_TIMEOUT_S)
+        self.node_tasks: dict[str, asyncio.Task] = {}   # rejoin repoints and fences
         if metrics:
             metrics.state(rs, self.st.state)
 
@@ -98,11 +101,13 @@ class SetController:
             self.metrics.state(rs, new)
 
     def set_primary(self, node: str | None) -> None:
+        self.cache.invalidate()
         self.st.primary = node
         self.history.clear()
         self.verdict = None
 
     def event(self, **kw) -> Event:
+        self.cache.invalidate()
         kw.setdefault("mode", self.mode)
         return self.events.append(Event(rs=self.rs, **kw))
 
@@ -129,9 +134,13 @@ class SetController:
         self._stop.set()
         if self.maint and not self.maint.done():
             self.maint.cancel()
+        for t in self.node_tasks.values():
+            t.cancel()
+        await self.cache.close()
 
     async def poll(self) -> Observation:
-        ob = await observe(self.rs, self.primary, self.all_nodes(), self.agents, self.prober)
+        ob = await observe(self.rs, self.primary, self.all_nodes(), self.agents, self.prober,
+                           cache=self.cache)
         self.last_obs = ob
         self.history.append(ob)
         keep = max(self.cfg.detect_window_s * 3, 10.0)
@@ -275,6 +284,28 @@ class SetController:
                 self.busy = set()
 
         self.maint = asyncio.create_task(wrapped(), name=f"maint-{self.rs}")
+        return True
+
+    def node_busy(self, node: str) -> bool:
+        t = self.node_tasks.get(node)
+        return node in self.busy or (t is not None and not t.done())
+
+    def spawn_node_task(self, node: str, coro) -> bool:
+        """Run a short per-node action (rejoin repoint, second-writer fence) in the
+        background so the poll tick never waits on an agent (REVIEW #10)."""
+        if self.node_busy(node):
+            coro.close()
+            return False
+
+        async def wrapped():
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.exception("node task failed", rs=self.rs, node=node, error=str(e))
+
+        self.node_tasks[node] = asyncio.create_task(wrapped(), name=f"node-{node}")
         return True
 
     def healthy_replicas(self, views: dict[str, NodeView], exclude=()) -> list[str]:

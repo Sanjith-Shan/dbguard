@@ -84,6 +84,16 @@ def published_ports(node: str) -> tuple[int, int] | None:
     return 13300 + 10 * s + i, 18000 + 10 * s + i
 
 
+# The agent's /status runs several queries and a TCP probe of its source. Under load or
+# behind an iptables DROP it can take well over 1 s, and a replica whose /status times out
+# is neither a witness nor a candidate (docs/REVIEW_2026-09-23.md #3).
+STATUS_TIMEOUT_S = 3.0
+
+# An agent answering 500 with one of these lost its pooled MySQL link, typically because a
+# fence killed it. Role changes are idempotent, so the manager retries them once.
+LOST_LINK_CODES = (2006, 2013)
+
+
 class AgentError(Exception):
     def __init__(self, node: str, path: str, msg: str, status: int | None = None,
                  body: Any = None, timeout: bool = False):
@@ -94,7 +104,7 @@ class AgentError(Exception):
 class AgentClient:
     """Every call is bounded. A hung agent costs at most its timeout, never the loop."""
 
-    def __init__(self, addressing: Addressing, status_timeout_s: float = 1.0):
+    def __init__(self, addressing: Addressing, status_timeout_s: float = STATUS_TIMEOUT_S):
         self.addr = addressing
         self.status_timeout_s = status_timeout_s
         self._session: aiohttp.ClientSession | None = None
@@ -143,5 +153,17 @@ class AgentClient:
         except (aiohttp.ClientError, OSError, ValueError) as e:
             raise AgentError(node, path, f"{type(e).__name__}: {e}") from e
 
-    async def post(self, node: str, path: str, body: Any = None, timeout: float = 10.0) -> Any:
+    async def post(self, node: str, path: str, body: Any = None, timeout: float = 10.0,
+                   retry_lost_link: bool | None = None) -> Any:
+        """POST to the agent. /promote, /repoint and /configure are retried once when the
+        agent reports a lost MySQL link (2006, 2013): a fence on that node kills pooled
+        connections, and every step of a role change is idempotent."""
+        if retry_lost_link is None:
+            retry_lost_link = path in ("/promote", "/repoint", "/configure")
+        try:
+            return await self.request("POST", node, path, body=body or {}, timeout=timeout)
+        except AgentError as e:
+            code = e.body.get("sql_code") if isinstance(e.body, dict) else None
+            if not (retry_lost_link and e.status == 500 and code in LOST_LINK_CODES):
+                raise
         return await self.request("POST", node, path, body=body or {}, timeout=timeout)
