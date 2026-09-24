@@ -85,7 +85,9 @@ async def maybe_replace(ctl: SetController, ob: Observation, healthy: list[str])
     if not spare or spare in ctl.members or ctl.provisioner is None:
         return
     if ctl.st.state != State.DEGRADED or ctl.unhealthy_since is None:
-        return
+        return      # never while FAILING_OVER, SUSPECT, HALTED or already REBUILDING
+    if ctl.st.in_cooldown():
+        return      # a failover just happened, give the old primary time to come back
     if ob.ts - ctl.unhealthy_since < ctl.cfg.rebuild_after_s:
         return
     if not healthy:

@@ -6,7 +6,8 @@ probe_timeout_s: 1
 probe_failures: 3
 fence_deadline_s: 3
 catchup_deadline_s: 30
-rebuild_after_s: 60
+rebuild_after_s: 120     # lab default. The hang injection lasts 90 s, so a replacement must not start
+                         # before the frozen node thaws. A real fleet picks this from host reboot time.
 cooldown_s: 20           # no second automatic failover of the same set within this window
 rejoin: auto             # or manual
 poll_interval_s: 0.5
