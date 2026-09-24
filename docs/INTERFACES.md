@@ -549,3 +549,33 @@ Until the manager exists, `bin/bootstrap` (harness) does the same with direct SQ
 
 structlog JSON to stdout everywhere. Every SQL statement the agent runs at role change is
 logged at INFO with `sql=` and `duration_ms=`.
+
+## Filling the numbers (bin/fill-docs, dbguard/harness/fill.py)
+
+README.md, docs/DESIGN.md, docs/CAPACITY.md, docs/INTERVIEW.md and docs/RUNBOOK.md mark each
+measured number with a tag `[[N: <what>, <source>]]` (the source is optional). `bin/fill-docs`
+finds every tag and resolves it by its `<what>` text through `MAP` in `fill.py`, which names
+the result files a value reads (a glob under `results/`) and how it is computed. The two tags
+that are literal examples of the syntax, `...` and `what, source file`, are skipped.
+
+- `bin/fill-docs` (or `--check`) prints location, tag, value and status and changes nothing.
+  `--write` replaces every resolved tag in place and leaves the rest. `--results DIR`
+  (default `results`), `--docs FILE...` (default the five files above), `--root` (repo root,
+  for `docs/BUGS.md`).
+- Rows are `results/*.jsonl` at the top level only. `results/pilot/`, `results/tmp/`,
+  `*.errors.jsonl` and rows with a `traceback` are ignored.
+- Values come from `results/summary.json` when it is at least as new as every row file and
+  counts the same rows, otherwise from `report.summarize` over the rows. Metrics `bin/report`
+  does not tabulate (step durations from the event, rejoin duration by branch, fence outcome,
+  post-clone restart, time to replace, dataset size, disk-full outcome, totals across files,
+  `### ` entries in docs/BUGS.md) are computed from the raw rows with the same nearest-rank
+  percentile.
+- Statuses. `ok`, `pending` (mapped, but no rows yet or the metric is null), `manual` (docker
+  stats, the agent's RSS, `Rpl_semi_sync_source_tx_avg_wait_time` per netem level, the client
+  reconnect gap, none of which a row carries) and `unmapped` (a tag text with no entry, add it
+  to `MAP`).
+- Format. Seconds 2 decimals, ms, MB and MB/s 1 decimal, counts as integers, converged runs
+  as `n/runs`. The unit is appended only when the context lacks it: a table column header
+  without the unit, or prose where the tag is not followed by one. Backticks around a tag are
+  dropped with it. `--write` removes the tags it fills, so a second run changes nothing, and
+  refilling after more runs means restoring the tags from git first.
