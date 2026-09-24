@@ -1,0 +1,222 @@
+# DBGuard fleet. Run from the repo root:
+#   docker compose -f deploy/docker-compose.yml up -d && bin/bootstrap        (make up)
+#   DBGUARD_SEMISYNC=0 DBGUARD_MODE=naive docker compose -f deploy/docker-compose.yml up -d
+#                                                                             (make up-naive)
+# Spares (mysql-a4, mysql-b4) are in profile "spare". Orchestrator is in profile
+# "orchestrator". Host ports follow docs/INTERFACES.md.
+name: dbguard
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 10m, max-file: "2"}
+
+x-node: &node
+  image: dbguard-node
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  cap_add: [NET_ADMIN, SYS_NICE]
+  mem_limit: 700m
+  logging: *logging
+  networks: [dbguard]
+  restart: "no"
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS -m 1 http://127.0.0.1:8080/health >/dev/null || mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"]
+    interval: 2s
+    timeout: 2s
+    retries: 3
+    start_period: 180s
+
+x-node-env: &node-env
+  MYSQL_ROOT_PASSWORD: root
+  DBGUARD_SEMISYNC: ${DBGUARD_SEMISYNC:-1}
+  DBGUARD_MODE: ${DBGUARD_MODE:-dbguard}
+  DBGUARD_MANAGER_URL: http://dbguard:9090
+
+services:
+  mysql-a1:
+    <<: *node
+    container_name: mysql-a1
+    hostname: mysql-a1
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-a1
+      DBGUARD_RS: rs1
+      DBGUARD_SERVER_ID: "11"
+    ports: ["13311:3306", "18011:8080"]
+    volumes:
+      - mysql-a1-data:/var/lib/mysql
+      - mysql-a1-state:/var/lib/dbguard
+
+  mysql-a2:
+    <<: *node
+    container_name: mysql-a2
+    hostname: mysql-a2
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-a2
+      DBGUARD_RS: rs1
+      DBGUARD_SERVER_ID: "12"
+    ports: ["13312:3306", "18012:8080"]
+    volumes:
+      - mysql-a2-data:/var/lib/mysql
+      - mysql-a2-state:/var/lib/dbguard
+
+  mysql-a3:
+    <<: *node
+    container_name: mysql-a3
+    hostname: mysql-a3
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-a3
+      DBGUARD_RS: rs1
+      DBGUARD_SERVER_ID: "13"
+    ports: ["13313:3306", "18013:8080"]
+    volumes:
+      - mysql-a3-data:/var/lib/mysql
+      - mysql-a3-state:/var/lib/dbguard
+
+  mysql-a4:
+    <<: *node
+    container_name: mysql-a4
+    hostname: mysql-a4
+    profiles: [spare]
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-a4
+      DBGUARD_RS: rs1
+      DBGUARD_SERVER_ID: "14"
+    ports: ["13314:3306", "18014:8080"]
+    volumes:
+      - mysql-a4-data:/var/lib/mysql
+      - mysql-a4-state:/var/lib/dbguard
+
+  mysql-b1:
+    <<: *node
+    container_name: mysql-b1
+    hostname: mysql-b1
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-b1
+      DBGUARD_RS: rs2
+      DBGUARD_SERVER_ID: "21"
+    ports: ["13321:3306", "18021:8080"]
+    volumes:
+      - mysql-b1-data:/var/lib/mysql
+      - mysql-b1-state:/var/lib/dbguard
+
+  mysql-b2:
+    <<: *node
+    container_name: mysql-b2
+    hostname: mysql-b2
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-b2
+      DBGUARD_RS: rs2
+      DBGUARD_SERVER_ID: "22"
+    ports: ["13322:3306", "18022:8080"]
+    volumes:
+      - mysql-b2-data:/var/lib/mysql
+      - mysql-b2-state:/var/lib/dbguard
+
+  mysql-b3:
+    <<: *node
+    container_name: mysql-b3
+    hostname: mysql-b3
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-b3
+      DBGUARD_RS: rs2
+      DBGUARD_SERVER_ID: "23"
+    ports: ["13323:3306", "18023:8080"]
+    volumes:
+      - mysql-b3-data:/var/lib/mysql
+      - mysql-b3-state:/var/lib/dbguard
+
+  mysql-b4:
+    <<: *node
+    container_name: mysql-b4
+    hostname: mysql-b4
+    profiles: [spare]
+    environment:
+      <<: *node-env
+      DBGUARD_NODE: mysql-b4
+      DBGUARD_RS: rs2
+      DBGUARD_SERVER_ID: "24"
+    ports: ["13324:3306", "18024:8080"]
+    volumes:
+      - mysql-b4-data:/var/lib/mysql
+      - mysql-b4-state:/var/lib/dbguard
+
+  haproxy:
+    image: haproxy:3.0
+    container_name: haproxy
+    hostname: haproxy
+    logging: *logging
+    networks: [dbguard]
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports: ["13306:3306", "13307:3307", "18404:8404"]
+    restart: unless-stopped
+
+  dbguard:
+    image: dbguard-manager
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.manager
+    container_name: dbguard
+    hostname: dbguard
+    logging: *logging
+    networks: [dbguard]
+    environment:
+      DBGUARD_MODE: ${DBGUARD_MODE:-dbguard}
+      DBGUARD_SEMISYNC: ${DBGUARD_SEMISYNC:-1}
+      DBGUARD_COMPOSE_FILE: /deploy/docker-compose.yml
+      DBGUARD_COMPOSE_PROJECT: dbguard
+    volumes:
+      - ./fleet.yaml:/etc/dbguard/fleet.yaml:ro
+      - ./docker-compose.yml:/deploy/docker-compose.yml:ro
+      - dbguard-state:/var/lib/dbguard
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports: ["19090:9090"]
+    # Until dbguard/manager/main.py exists this container exits immediately. Harmless.
+    restart: unless-stopped
+
+  orchestrator:
+    # Percona's maintained fork, native arm64, speaks MySQL 8.4 (upstream still issues
+    # SHOW SLAVE STATUS, which 8.4 removed). See docs/INTERFACES.md "Orchestrator baseline".
+    image: percona/percona-orchestrator:3.2.6-24
+    container_name: orchestrator
+    hostname: orchestrator
+    profiles: [orchestrator]
+    logging: *logging
+    networks: [dbguard]
+    volumes:
+      - ./orchestrator/orchestrator.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./orchestrator/hooks:/usr/local/orchestrator/hooks:ro
+    ports: ["13000:3000"]
+
+networks:
+  dbguard:
+    name: dbguard
+    driver: bridge
+
+volumes:
+  dbguard-state:
+  mysql-a1-data:
+  mysql-a1-state:
+  mysql-a2-data:
+  mysql-a2-state:
+  mysql-a3-data:
+  mysql-a3-state:
+  mysql-a4-data:
+  mysql-a4-state:
+  mysql-b1-data:
+  mysql-b1-state:
+  mysql-b2-data:
+  mysql-b2-state:
+  mysql-b3-data:
+  mysql-b3-state:
+  mysql-b4-data:
+  mysql-b4-state:
