@@ -1,13 +1,13 @@
 """Rejoin, the step after a failover, bringing the old primary and any straggler back.
 
-The choice is exact and made by GTID_SUBSET. A node whose gtid_executed is a subset of the
-primary's has nothing the primary lacks and is repointed with SOURCE_AUTO_POSITION=1, with no
-data copy. Otherwise the difference is phantoms, transactions crash recovery committed that no
-client was told about, and the node is rebuilt by clone and the count recorded. The donor is
-always a healthy replica, never the primary, because a clone reads the whole dataset and
-blocks DDL on the donor, and a clone from a primary stalled on semi-sync never finished.
-``rejoin: manual`` only records the need, but a node writable while it is not the primary is
-fenced in every mode except naive, which records the split brain instead.
+The choice is exact and made by GTID_SUBSET on fresh reads. A node is first fenced if it
+still looks like a primary and must be quiescent (no semi-sync waiters, two equal reads),
+because killed waiters on a woken primary commit seconds later as phantoms. A subset of the
+primary's set is repointed with SOURCE_AUTO_POSITION=1 and watched for errant GTIDs, anything
+else is rebuilt by clone and its phantom count recorded. The donor is always a healthy
+replica, never the primary, because a clone reads the whole dataset and blocks DDL on the
+donor, and a clone from a primary stalled on semi-sync never finished. ``rejoin: manual``
+only records the need, but a second writer is fenced in every mode except naive.
 """
 
 from __future__ import annotations
@@ -204,6 +204,7 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
 
 async def _rebuild(ctl: SetController, n: str, phantom: GtidSet, why: str, wait: bool,
                    branch: str) -> Event | None:
+    """Clone ``n`` from the first healthy replica, in the background unless ``wait``."""
     views = await ctl.fresh_views([m for m in ctl.members if m != n])
     donors = ctl.healthy_replicas(views, exclude=(n,))
     if not donors:
@@ -248,6 +249,7 @@ async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None
 
 
 async def _wait_maintenance_slot(ctl: SetController) -> None:
+    """Wait until no other maintenance task (clone, replacement) is running."""
     while ctl.maint is not None and not ctl.maint.done():
         await asyncio.sleep(0.5)
 

@@ -434,6 +434,7 @@ class FakeProber:
         return None
 
     async def committing_threads(self, node: str, timeout: float = 3.0) -> int | None:
+        """Simulated sessions still committing, None when the node is not responsive."""
         n = self.fleet.nodes[node]
         if not n.responsive:
             return None
