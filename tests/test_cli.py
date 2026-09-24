@@ -189,7 +189,9 @@ def test_failover_default_target(server):
 
 def test_events_filters(server):
     _, url = server
-    r = run(url, "events", "--rs", "rs1", "--since", "20s", "--json")
+    # An absolute --since, because NOW is taken at import and a full run reaches this test
+    # more than 10 s later, when "20s" would already exclude the rejoin at NOW - 10.
+    r = run(url, "events", "--rs", "rs1", "--since", str(NOW - 20), "--json")
     lines = [json.loads(x) for x in r.output.splitlines()]
     assert [e["type"] for e in lines] == ["rejoin"]
     r = run(url, "events")
