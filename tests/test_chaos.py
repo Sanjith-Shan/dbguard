@@ -200,3 +200,18 @@ def test_writer_sampler_counts_two_writers():
     res = s.stop()
     assert res["samples"] >= 4 and res["violations"] == 2
     assert res["examples"][0]["writable"] == ["mysql-a1", "mysql-a2"]
+
+
+def test_semisync_problems():
+    from dbguard.harness.chaos import semisync_problems
+    P = {"writable": True, "source_enabled": True, "replica_enabled": False}
+    R = {"writable": False, "source_enabled": False, "replica_enabled": True}
+    OFF = {"writable": False, "source_enabled": False, "replica_enabled": False}
+    POFF = {"writable": True, "source_enabled": False, "replica_enabled": False}
+    assert semisync_problems("dbguard", {"a": P, "b": R, "c": R}) == []
+    assert semisync_problems("dbguard", {"a": POFF, "b": R})
+    assert semisync_problems("dbguard", {"a": P, "b": OFF})
+    assert semisync_problems("naive", {"a": POFF, "b": OFF}) == []
+    bad = semisync_problems("naive", {"a": P, "b": OFF})
+    assert len(bad) == 1 and "naive" in bad[0]
+    assert semisync_problems("naive", {}) == ["no agent answered /status"]

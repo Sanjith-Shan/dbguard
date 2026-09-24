@@ -851,6 +851,7 @@ class Opts:
     stall_hold_s: float = 10.0
     heal_timeout: float = 120.0
     skip_heal_before: bool = False
+    naive_netem_ms: float = 0.0
 
 
 @dataclass
@@ -1081,6 +1082,16 @@ def _failover_common(run: Run, inject: Callable[[str], None], *, extra_s: float 
 
 
 def sc_kill(run: Run) -> None:
+    o, f = run.opts, run.fleet
+    run.row["naive_netem_ms"] = 0.0
+    if o.mode == "naive" and o.naive_netem_ms:
+        # Only used when the naive pilot lost nothing: async replication on one host can keep
+        # up so closely that a SIGKILL never lands between commit and replication.
+        p = f.primary()
+        for r in [n for n in f.members() if n != p]:
+            docker.netem_delay(r, o.naive_netem_ms)
+        run.row["naive_netem_ms"] = float(o.naive_netem_ms)
+        note(run, f"naive run with tc netem delay {o.naive_netem_ms} ms on the replicas")
     _failover_common(run, lambda p: docker.kill(p, "KILL"))
 
 
@@ -1266,7 +1277,7 @@ def sc_cost(run: Run) -> None:
                 docker.netem_delay(r, netem)
         time.sleep(2)
         st = agent(p).status() or {}
-        run.row["semisync_effective"] = (st.get("semisync") or {}).get("source_status")
+        run.row["semisync_source_status"] = (st.get("semisync") or {}).get("source_status")
         wl = start_workload(run, o.cost_seconds)
         wl.wait()
         apply_acks(run, wl, None)
@@ -1449,16 +1460,53 @@ def environment(rs: str) -> dict:
             "mysql_version": docker.mysql_version(port=mysql_port(p)), "knobs": load_knobs()}
 
 
-def verify_mode(mode: str) -> None:
-    if mode == "orchestrator":
-        return
-    try:
-        st = ManagerClient(timeout=3).status()
-    except ApiError as e:
-        raise SystemExit(f"manager unreachable: {e}")
-    if st.get("mode") != mode:
-        raise SystemExit(f"the fleet runs in mode {st.get('mode')!r}, not {mode!r}. Restart it in "
-                         f"{mode} mode first (fleet.yaml mode and DBGUARD_SEMISYNC on every node).")
+def semisync_snapshot(rs: str) -> dict[str, dict]:
+    """Each running node's semi-sync flags as its agent reports them."""
+    out = {}
+    for n, s in Fleet(rs, "dbguard").statuses().items():
+        if not s:
+            continue
+        ss = s.get("semisync") or {}
+        out[n] = {"role": s.get("role"), "writable": s.get("super_read_only") is False,
+                  "source_enabled": ss.get("source_enabled"),
+                  "replica_enabled": ss.get("replica_enabled"),
+                  "source_status": ss.get("source_status"), "mode": ss.get("mode")}
+    return out
+
+
+def semisync_problems(mode: str, snap: dict[str, dict]) -> list[str]:
+    """Why the set's semi-sync state does not match `mode` (empty list when it does).
+    naive: no node may have either side enabled (the baseline must really be async).
+    dbguard: the writable node must have the source side on, every other node the replica
+    side on. orchestrator runs on the dbguard fleet config, so it is held to dbguard's rule."""
+    bad = []
+    if not snap:
+        return ["no agent answered /status"]
+    for n, v in sorted(snap.items()):
+        if mode == "naive":
+            if v.get("source_enabled") or v.get("replica_enabled"):
+                bad.append(f"{n} has semi-sync enabled (source={v.get('source_enabled')}, "
+                           f"replica={v.get('replica_enabled')}) in naive mode")
+        elif v.get("writable"):
+            if not v.get("source_enabled"):
+                bad.append(f"primary {n} has rpl_semi_sync_source_enabled off")
+        elif not v.get("replica_enabled"):
+            bad.append(f"replica {n} has rpl_semi_sync_replica_enabled off")
+    return bad
+
+
+def verify_mode(mode: str, rs: str = "rs1") -> None:
+    if mode != "orchestrator":
+        try:
+            st = ManagerClient(timeout=3).status()
+        except ApiError as e:
+            raise SystemExit(f"manager unreachable: {e}")
+        if st.get("mode") != mode:
+            raise SystemExit(f"the fleet runs in mode {st.get('mode')!r}, not {mode!r}. Restart it "
+                             f"in {mode} mode first (make up-naive / make up).")
+    bad = semisync_problems(mode, semisync_snapshot(rs))
+    if bad:
+        raise SystemExit("semi-sync does not match mode " + mode + ": " + "; ".join(bad))
 
 
 def rs2_changes(f: Fleet, since: float, other: str) -> int:
@@ -1481,6 +1529,14 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
     run.row = base_row(run, env)
     other = "rs2" if opts.rs != "rs2" else "rs1"
     other_p = Fleet(other, opts.mode).primary()
+    snap = semisync_snapshot(opts.rs)
+    run.row["semisync_nodes"] = snap
+    problems = semisync_problems(opts.mode, snap)
+    run.row["semisync_effective"] = not all(
+        not (v.get("source_enabled") or v.get("replica_enabled")) for v in snap.values())
+    run.row["async_verified"] = (not problems) if opts.mode == "naive" else None
+    if problems:
+        note(run, "semi-sync state does not match the mode at run start: " + "; ".join(problems))
     rs2_wl = None
     t0 = time.time()
     log(f"=== run {i + 1}/{opts.runs} {run_id}")
@@ -1596,12 +1652,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--stall-hold", type=float, default=10.0)
     ap.add_argument("--heal-timeout", type=float, default=120.0)
     ap.add_argument("--no-heal-before", action="store_true")
+    ap.add_argument("--naive-netem-ms", type=float, default=0.0,
+                    help="naive kill runs only: tc netem delay on the replicas (use only if a "
+                         "5-run naive pilot lost zero writes, and say so)")
     return ap.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
-    verify_mode(a.mode)
+    verify_mode(a.mode, a.rs)
     log(f"compose env pinned to the running fleet: {docker.pin_compose_env(set_nodes(a.rs))}")
     scenarios = ALL_ORDER if a.all else [a.scenario]
     common = dict(runs=a.runs, mode=a.mode, rs=a.rs, clients=a.clients,
@@ -1610,7 +1669,8 @@ def main(argv: list[str] | None = None) -> int:
                   partition_hold_s=a.partition_hold, cost_seconds=a.cost_seconds,
                   semisync=a.semisync, netem=a.netem, cost_all=a.cost_all or a.all,
                   data_mb=a.data_mb, rs2_workload=a.rs2_workload, stall_hold_s=a.stall_hold,
-                  heal_timeout=a.heal_timeout, skip_heal_before=a.no_heal_before)
+                  heal_timeout=a.heal_timeout, skip_heal_before=a.no_heal_before,
+                  naive_netem_ms=a.naive_netem_ms)
     if a.mode == "orchestrator":
         orch_setup([a.rs])
     rc = 0
