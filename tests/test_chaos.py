@@ -327,3 +327,25 @@ def test_set_agent_guards_posts_both_toggles(monkeypatch):
     assert sorted(res) == ["mysql-a1", "mysql-a2", "mysql-a3"]
     assert all(p == "/configure" and b == {"self_fence": False, "wake_guard": False}
                for _, p, b in posted)
+
+
+def test_workload_handshake_is_bounded():
+    """A proxy that accepts TCP but never sends the MySQL greeting must not hang a client
+    (the first real kill pilot wrote nothing after the failover because of this)."""
+    import socket
+    import threading
+    import time
+
+    from dbguard.harness.workload import AckLog, Client, WorkloadOptions
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    held = []
+    threading.Thread(target=lambda: held.append(srv.accept()), daemon=True).start()
+    c = Client(1, WorkloadOptions(port=srv.getsockname()[1], connect_timeout=0.5), AckLog(None),
+               threading.Event())
+    t0 = time.time()
+    with pytest.raises(Exception):
+        c._connect()
+    assert time.time() - t0 < 3
+    srv.close()

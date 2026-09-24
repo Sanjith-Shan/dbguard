@@ -369,3 +369,22 @@ heredocs and cache mounts already).
   acknowledge a write, and the promote still waits for it (unit test with a slow fence). The
   switchover got the same reorder first. The failover reorder has not yet had a clean real run,
   because the only run with it hit the OOM kills above.
+
+### The workload hung forever in the MySQL handshake after a failover
+
+- Symptom. The first real kill pilot reported `failover_s: null`. Every one of the 8,980
+  acknowledged writes had landed before the kill, and each client logged exactly one error
+  and then went silent for the remaining 30 s. The checker still passed, so only the
+  missing failover time gave it away.
+- How found. The workload summary said 224 writes/s over 40 s while the pre-kill rate was
+  900/s. HAProxy's log showed the reconnect sessions of the first run still open when the
+  second run started (16 concurrent sessions for 8 clients).
+- Cause. PyMySQL applies `connect_timeout` to the TCP connect only, then reads the server
+  greeting with `read_timeout`. The workload leaves `read_timeout` unset on purpose, so a
+  semi-sync stall blocks a commit instead of failing it. During the failover HAProxy
+  accepted each reconnect while no server was UP and never sent a greeting, so every
+  client blocked in the handshake forever.
+- Fix. The workload connects with `read_timeout=connect_timeout` (2 s) so the whole
+  handshake is bounded, then clears the timeout for queries. A regression test uses a
+  socket that accepts and never greets. Cost: a reconnect that lands in the dead window can
+  wait up to 2 s before it retries, which bounds how much this can inflate `failover_s`.

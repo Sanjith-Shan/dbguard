@@ -137,10 +137,21 @@ class Client(threading.Thread):
         self.conn_no = 0
 
     def _connect(self):
+        """Connect with the whole handshake bounded by connect_timeout.
+
+        PyMySQL applies connect_timeout to the TCP connect only and then reads the server
+        greeting with read_timeout, which is None here so that a semi-sync stall can block a
+        commit for as long as it lasts. During a failover HAProxy accepts the TCP connection
+        while it has no server UP and may never send a greeting, so the client hung forever
+        and wrote nothing after the kill. The handshake now uses connect_timeout as its read
+        timeout, and the query timeout is restored once the session is up."""
         o = self.opts
-        return mysqlx_sync.connect(o.host, o.port, o.user, o.password, timeout=o.connect_timeout,
-                                   tls=o.tls, read_timeout=o.query_timeout,
-                                   write_timeout=o.query_timeout)
+        conn = mysqlx_sync.connect(o.host, o.port, o.user, o.password, timeout=o.connect_timeout,
+                                   tls=o.tls, read_timeout=o.connect_timeout,
+                                   write_timeout=o.connect_timeout)
+        conn._read_timeout = o.query_timeout
+        conn._write_timeout = o.query_timeout
+        return conn
 
     def _drop(self) -> None:
         if self.conn is not None:
