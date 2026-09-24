@@ -1555,12 +1555,125 @@ def sc_switchover(run: Run) -> None:
     check(run, wl)
 
 
+DISKFULL_OVERLAY = REPO / "deploy" / "compose.diskfull.yml"
+DISKFULL_NODE_IDX = 0          # the overlay covers mysql-a1 only
+BINLOG_TMPFS = "/var/lib/mysql-binlog"
+
+
+def _recreate(node: str, overlay: bool) -> None:
+    args = ["docker", "compose", "-f", str(docker.COMPOSE_FILE)]
+    if overlay:
+        args += ["-f", str(DISKFULL_OVERLAY)]
+    docker._run(args + ["up", "-d", "--no-deps", "--force-recreate", node], timeout=300)
+
+
+def _wait_caught_up(f: Fleet, node: str, timeout: float = 120.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        p = f.primary()
+        ss = f.statuses([n for n in (p, node) if n])
+        s, ps = ss.get(node), ss.get(p)
+        if p and s and ps and p != node:
+            r = s.get("replica") or {}
+            if r.get("source_host") == p and r.get("io_running") == "Yes" and \
+                    r.get("sql_running") == "Yes" and \
+                    gtid_equal(s.get("gtid_executed"), ps.get("gtid_executed")):
+                return True
+        time.sleep(1)
+    return False
+
+
+def _switch_to(f: Fleet, target: str, timeout: float = 60.0) -> bool:
+    if f.primary() == target:
+        return True
+    try:
+        f.mc.failover(f.rs, target, timeout=timeout)
+    except ApiError as e:
+        log(f"switchover to {target} failed: {e}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if f.primary() == target and agent(target).primary_code() == 200:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def sc_disk_full(run: Run) -> None:
-    # TODO(disk-full): needs a small per-node tmpfs for the binlog dir in
-    # deploy/docker-compose.yml (fleet-owned) and log_bin pointing into it in my.cnf.
-    # Filling the datadir volume would fill the Docker VM disk that every container shares.
-    raise NotImplementedError("disk-full needs a per-node binlog tmpfs in the fleet compose file; "
-                              "see docs/INTERFACES.md 'disk-full'")
+    """Fill the primary's binlog filesystem (a 256 MB tmpfs from deploy/compose.diskfull.yml,
+    never the datadir, which would fill the Docker VM disk every container shares).
+
+    Setup: make mysql-a1 a caught-up replica, recreate it with the overlay, wait until every
+    replica has caught up, switch the primary to it. Inject: fallocate the free space of the
+    tmpfs under load. Observe what mysqld does (binlog_error_action decides) and whether and
+    how fast DBGuard fails over. Restore: delete the fill file, let the node rejoin, recreate
+    it without the overlay once it is a caught-up replica again."""
+    o, f = run.opts, run.fleet
+    if o.mode == "orchestrator":
+        raise NotImplementedError("disk-full setup uses the manager's planned switchover")
+    node = f.nodes[DISKFULL_NODE_IDX]
+    dfull: dict[str, Any] = {"node": node}
+    run.row["disk_full"] = dfull
+    # 1. node must be a caught-up replica before the recreate (its new binlog starts empty)
+    if f.primary() == node:
+        other = next(n for n in f.nodes if n != node)
+        if not _switch_to(f, other):
+            raise RuntimeError(f"could not move the primary off {node}")
+    if not _wait_caught_up(f, node):
+        raise RuntimeError(f"{node} did not catch up before the recreate")
+    _recreate(node, overlay=True)
+    dfull["overlay"] = True
+    try:
+        if not _wait_caught_up(f, node, 180):
+            raise RuntimeError(f"{node} did not replicate again after the overlay recreate")
+        for n in f.nodes:
+            if n != node and n != f.primary():
+                _wait_caught_up(f, n)
+        if not _switch_to(f, node):
+            raise RuntimeError(f"switchover to {node} failed")
+        f.wait_state({"HEALTHY"}, 60)
+        time.sleep(2)
+
+        def inject(p: str) -> None:
+            cp = docker.exec_(p, ["df", "-B1", "--output=avail", BINLOG_TMPFS], check=False)
+            lines = cp.stdout.split()
+            avail = int(lines[-1]) if lines and lines[-1].isdigit() else 0
+            dfull["avail_before"] = avail
+            fill = f"{BINLOG_TMPFS}/fill.bin"
+            r = docker.exec_(p, ["fallocate", "-l", str(avail), fill], check=False)
+            if r.returncode != 0:   # tmpfs without fallocate: write zeros until ENOSPC
+                docker.exec_(p, f"dd if=/dev/zero of={fill} bs=1M 2>/dev/null; true", check=False)
+            dfull["fill_rc"] = r.returncode
+            cp = docker.exec_(p, ["df", "-B1", "--output=avail", BINLOG_TMPFS], check=False,
+                              mutate=False)
+            lines = cp.stdout.split()
+            dfull["avail_after"] = int(lines[-1]) if lines and lines[-1].isdigit() else None
+            note(run, f"filled {BINLOG_TMPFS} on {p} ({avail} bytes)")
+
+        def after(old: str, new: str | None) -> None:
+            # what happened to mysqld on the full node
+            st = agent(old).status() or {}
+            dfull["mysqld_alive_after"] = st.get("mysqld_alive")
+            dfull["mysqld_responsive_after"] = st.get("mysqld_responsive")
+            dfull["fenced_after"] = st.get("fenced")
+            logs = docker._run(["docker", "logs", "--since", f"{int(run.row['inject_ts']) - 2}",
+                                old], check=False, mutate=False)
+            text = (logs.stdout + logs.stderr).splitlines()
+            dfull["mysqld_log"] = [ln[:300] for ln in text if any(
+                k in ln for k in ("No space", "ENOSPC", "binlog", "ABORT", "Errcode: 28",
+                                  "error 28", "mysqld_exit", "mysqld_started"))][-12:]
+            docker.exec_(old, ["rm", "-f", f"{BINLOG_TMPFS}/fill.bin"], check=False)
+            run.row["heal_ts"] = time.time()
+
+        _failover_common(run, inject, after_failover=after, restart_old=False)
+        rejoin_after_restart(run, node, run.row.get("heal_ts") or time.time())
+    finally:
+        # 3. back to the normal binlog location, once the node is a caught-up replica again
+        docker.exec_(node, ["rm", "-f", f"{BINLOG_TMPFS}/fill.bin"], check=False)
+        if f.primary() == node:
+            _switch_to(f, next(n for n in f.nodes if n != node))
+        _wait_caught_up(f, node, 180)
+        _recreate(node, overlay=False)
+        dfull["restored"] = True
 
 
 SCENARIO_FN: dict[str, Callable[[Run], None]] = {
@@ -1804,7 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     try:
         for sc in scenarios:
-            if a.mode == "orchestrator" and sc in ("cost", "replica-loss"):
+            if a.mode == "orchestrator" and sc in ("cost", "replica-loss", "disk-full"):
                 log(f"skip {sc} in orchestrator mode (no manager, nothing to compare)")
                 continue
             o = Opts(scenario=sc, out=a.out if not a.all else None, **common)

@@ -313,6 +313,30 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   `new_primary:null`, the steps done so far, and `note` starting with the halt reason. A
   `halt` event follows.
 
+Manager behaviour the harness and the agent rely on.
+
+- `GET /v1/sets/{rs}/primary` answers 503 `{"primary":"unknown","state":...}` while the
+  manager has not yet found the set's primary (just started, discovering), `{"primary":null}`
+  while the set is FAILING_OVER (the old primary must not believe it is still primary), and
+  the primary's name otherwise.
+- The manager's `/status` timeout per agent is 3 s. Each node is polled by its own task so a
+  slow or dead agent never stretches the poll tick. An answer older than 3 s plus two poll
+  intervals counts as unreachable.
+- Role change budget. The agent bounds a whole `/promote` or `/repoint` to 30 s in total
+  (not per statement), and the manager waits 35 s for the answer, so it never declares a
+  promote failed while the agent is still finishing it. `/promote`, `/repoint` and
+  `/configure` are retried once when the agent answers 500 with `sql_code` 2006 or 2013 (a
+  link the fence killed). All three are idempotent.
+- In dbguard mode, after the fence and before comparing candidates, the manager runs
+  `STOP REPLICA IO_THREAD` on every candidate over SQL (account `dbguard`). `/repoint` and
+  `/promote` restart or reset the threads.
+- Catch-up is done when the winner's Retrieved_Gtid_Set is a subset of what it applied, or,
+  with its IO thread stopped, when `Replica_SQL_Running_State` (read over SQL) is "Replica
+  has read all relay log", in which case the unapplied GTIDs are a partial transaction and are
+  named in the event note.
+- No replacement is provisioned while the set is FAILING_OVER, SUSPECT or HALTED, nor within
+  `cooldown_s` of a failover.
+
 Manager additions to the HTTP API. `POST /v1/sets/{rs}/halt` accepts an optional body
 `{"reason":str}`. `POST /v1/sets/{rs}/failover` answers 409 `{"error":str,"state":str}` when
 the switchover is refused or aborted (the old primary is made writable again on abort).
@@ -375,6 +399,19 @@ Harness additions to the row. Extra keys only, nothing removed.
 - `rejoin` also carries `since_restart_s`, and `rejoin_event` holds the manager's event. In
   orchestrator mode the branch is `harness-repoint` or `harness-rebuild`, because Orchestrator
   does not rejoin a dead primary and the harness does it through the agents.
+- Review fixes, 2026-09-24. Ack rows carry `t_start` and `conn`, and failover ends at the
+  first ok whose request started after the first error. `single_writer` holds the checker's
+  count, the in-run samples (`{"samples","violations","examples"}`, every agent's /status
+  once a second) and a direct probe of each running node the checker was not given (the
+  old primary). `single_writer_violations` is the sum. `semisync_nodes` (per-node flags at
+  run start), `semisync_effective` (any node had a side enabled), `async_verified` (naive
+  rows only, no node had either side on). `naive_netem_ms` on kill rows.
+  `rebuild_after_s`, `replacements_during_run`, `heal.spare_dropped`. Orchestrator rows
+  carry `agent_guards` (self-fence and wake guard turned off on every node).
+- Events are matched against a mark taken in the manager's clock before each action (the
+  newest event ts and the keys of the events within 5 s of it), never against a host
+  timestamp. Durations derived from events use the host time the harness first saw the
+  event.
 - A run that raised is not written to the results file. It goes to
   `results/<scenario>_<mode>.errors.jsonl` with the traceback.
 - Only the row survives a run. The ack log and the workload output are deleted once the
@@ -391,7 +428,7 @@ Harness additions to the row. Extra keys only, nothing removed.
   plus iptables and iproute2, built on first use). Same kernel state as running them inside
   the target, and no dependency on the target image.
 
-### disk-full (not implemented yet)
+### disk-full
 
 Filling a node's datadir would fill the Docker VM disk that every container shares, so the
 scenario fills a small binlog tmpfs on one node instead. It is opt-in and never on by
@@ -415,7 +452,9 @@ measure.
   the datadir, which the new index does not list. So switch to a1 only after the other
   replicas have caught up, or they will fail with error 1236 asking a1 for purged GTIDs.
 
-Until `bin/chaos --scenario disk-full` implements this, it raises NotImplementedError.
+`bin/chaos --scenario disk-full` implements exactly this procedure (dbguard and naive modes
+only). The row's `disk_full` key holds the node, free bytes before and after the fill, the
+fill exit code, mysqld's state after the failover, and the matching mysqld log lines.
 
 ### Orchestrator baseline
 
@@ -466,7 +505,8 @@ probe_timeout_s: 1
 probe_failures: 3
 fence_deadline_s: 3
 catchup_deadline_s: 30
-rebuild_after_s: 60
+rebuild_after_s: 120     # lab default. The hang injection lasts 90 s, so a replacement must not start
+                         # before the frozen node thaws. A real fleet picks this from host reboot time.
 cooldown_s: 20           # no second automatic failover of the same set within this window
 rejoin: auto             # or manual
 poll_interval_s: 0.5

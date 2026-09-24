@@ -147,9 +147,10 @@ def test_row_has_every_contract_key(tmp_path):
     json.dumps(row)
 
 
-def test_disk_full_is_explicitly_blocked(tmp_path):
-    run = chaos.Run(opts=Opts(scenario="disk-full"), fleet=chaos.Fleet("rs1", "dbguard"),
-                    run_id="r", dir=tmp_path)
+def test_disk_full_refuses_orchestrator_mode(tmp_path):
+    run = chaos.Run(opts=Opts(scenario="disk-full", mode="orchestrator"),
+                    fleet=chaos.Fleet("rs1", "orchestrator"), run_id="r", dir=tmp_path)
+    run.row = {}
     with pytest.raises(NotImplementedError):
         chaos.sc_disk_full(run)
 
