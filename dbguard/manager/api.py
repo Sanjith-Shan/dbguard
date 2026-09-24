@@ -6,6 +6,7 @@ from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST
 
 from dbguard.manager.doctor import doctor
+from dbguard.manager.model import State
 
 MGR: web.AppKey = web.AppKey("mgr")
 
@@ -43,7 +44,10 @@ async def set_status(request):
 
 async def set_primary(request):
     ctl = _ctl(request)
-    return web.json_response({"primary": ctl.primary, "state": ctl.st.state.value})
+    # Mid-failover the old primary is still ctl.primary until the promote step. A woken
+    # node asking now must not be told it is the primary, so answer null.
+    primary = None if ctl.st.state == State.FAILING_OVER else ctl.primary
+    return web.json_response({"primary": primary, "state": ctl.st.state.value})
 
 
 async def set_doctor(request):
