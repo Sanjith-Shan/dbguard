@@ -98,7 +98,7 @@ def exec_(container: str, cmd: list[str] | str, *, check: bool = True, user: str
     return _run(args, check=check, timeout=timeout, mutate=mutate)
 
 
-exec = exec_  # noqa: A001  (the name the harness contract uses)
+exec = exec_
 
 
 def up(*services: str, profiles: tuple[str, ...] = (), wait: bool = False) -> None:
@@ -241,9 +241,14 @@ def host_description() -> str:
 def mysql_version(host: str = "127.0.0.1", port: int = 13311, user: str = "root",
                   password: str = "root") -> str | None:
     try:
+        import ssl
+
         import pymysql
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
         conn = pymysql.connect(host=host, port=port, user=user, password=password,
-                               connect_timeout=3, read_timeout=3)
+                               connect_timeout=3, read_timeout=3, ssl=ctx)
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT VERSION()")

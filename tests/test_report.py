@@ -1,7 +1,10 @@
 import json
 
 from dbguard.harness.report import (
-    load_rows, percentile, render_markdown, summarize,
+    load_rows,
+    percentile,
+    render_markdown,
+    summarize,
 )
 
 

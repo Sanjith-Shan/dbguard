@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 FAILOVER_SCENARIOS = ["kill", "hang-container", "hang-process", "partition-replicas", "disk-full",
                       "kill-two"]
