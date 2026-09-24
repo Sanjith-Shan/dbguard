@@ -33,6 +33,7 @@ x-node-env: &node-env
   DBGUARD_SEMISYNC: ${DBGUARD_SEMISYNC:-1}
   DBGUARD_MODE: ${DBGUARD_MODE:-dbguard}
   DBGUARD_MANAGER_URL: http://dbguard:9090
+  DBGUARD_PRIMARY_STALE_S: "2"
 
 services:
   mysql-a1:
