@@ -969,3 +969,47 @@ async def test_stop_cancels_the_errant_watch(sim_factory):
     await s.mgr.stop()
     await asyncio.sleep(0)
     assert task.cancelled() or task.done()
+
+
+async def test_kill_two_stall_heals_with_the_primary_as_donor_of_last_resort(sim_factory):
+    """kill-two: the primary and the best replica die together. The survivor is promoted
+    with no semi-sync replica, so writes stall. Both dead nodes return holding transactions
+    the survivor lacks. The manager must rebuild one from the stalled primary (donor of
+    last resort), repoint it so writes resume, then rebuild the other from that new
+    replica. No acknowledged write lost, no operator action."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.3)
+    a1, a2, a3 = (s.fleet.nodes[n] for n in A)
+    # an unacknowledged tail on the primary, and an errant local write on the best replica:
+    # neither was ever acknowledged, so losing them is correct
+    s.fleet.writing = False
+    await asyncio.sleep(0.1)
+    a1.executed = a1.executed | GtidSet.of(a1.uuid, (a1.next_gno, a1.next_gno + 2))
+    a1.next_gno += 3
+    a2.executed = a2.executed | GtidSet.of(a2.uuid, 1)
+    s.fleet.kill("mysql-a1")
+    s.fleet.kill("mysql-a2")
+    s.fleet.writing = True
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover to a3")
+    assert s.ctl().primary == "mysql-a3"
+    await s.until(lambda: any(e.type == "stall" and "stalled" in (e.note or "")
+                              for e in s.events("rs1")), what="stall recorded")
+    stall_ev = [e for e in s.events("rs1", "stall") if "stalled" in e.note][0]
+    assert "no replica is reachable" in stall_ev.note or "rejoining" in stall_ev.note
+    s.fleet.start("mysql-a1")
+    s.fleet.start("mysql-a2")
+    await s.until(lambda: any(e.type == "stall" and "resumed" in (e.note or "")
+                              for e in s.events("rs1")), timeout=20, what="writes resume")
+    await s.until(lambda: len([e for e in s.events("rs1", "rejoin")
+                               if e.rejoin and e.rejoin.branch == "rebuild"]) == 2,
+                  timeout=20, what="both rebuilt")
+    rebuilds = [e for e in s.events("rs1", "rejoin") if e.rejoin and e.rejoin.branch == "rebuild"]
+    first, second = rebuilds
+    assert first.clone.donor == "mysql-a3" and "donor of last resort: primary" in first.note
+    assert second.clone.donor == first.rejoin.node, "second is cloned from the new replica"
+    await s.healthy("rs1", "mysql-a3")
+    await s.until(lambda: s.fleet.acked["rs1"].is_subset(a3.executed), what="lossless")
+    lossless(s)
+    assert s.ctl().st.state != State.HALTED

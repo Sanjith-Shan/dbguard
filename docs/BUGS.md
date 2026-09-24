@@ -513,3 +513,29 @@ heredocs and cache mounts already).
   GTID the primary lacked.
 - Fix. Read the replicas first and the primary last, so the primary's set can only be
   larger. The two rows keep the raw value in `errant_gtids_false_positive` with a note.
+
+### kill-two left the set stalled until a human acted
+
+- Symptom. In kill-two runs the primary and the best replica died together. The last
+  survivor was promoted with no semi-sync replica, so writes stalled, which is correct. The
+  manager's own heartbeat write then blocked too, the set sat in SUSPECT, and the rejoin pass
+  never ran for the two restarted nodes. Both held transactions the survivor lacked and
+  needed a rebuild, and a rebuild required a replica donor that did not exist. The set stayed
+  stalled until an operator acted.
+- How found. The chaos campaign's kill-two rows.
+- Fix. Three changes. A SUSPECT caused only by the stall (the primary's agent answers, it is
+  not fenced, super_read_only=0, the heartbeat or the manager's probe write is stalled, and
+  the primary has zero semi-sync clients) still runs the rejoin pass, treating the primary as
+  alive. When no replica streams, the donor falls back to the stalled primary itself, and the
+  event note says "donor of last resort: primary". A stalled primary has no foreground I/O to
+  protect, and the node restored from it becomes the semi-sync replica that unblocks writes.
+  The next node is then cloned from that new replica, because the donor is chosen only when
+  the maintenance slot is free. The stall event now says what the manager is doing about it.
+  A simulation test runs the whole sequence with no acknowledged write lost and no operator
+  action.
+- Open risk. The agent section of this file records that a clone from a primary stalled on
+  semi-sync hung for five minutes (the donor's clone threads stayed in `starting`). If that
+  holds on 8.4.11, the last-resort donor will not work on the real fleet and the rebuild will
+  wait out the agent's clone timeout. Only a real kill-two run can say. If it hangs, the
+  alternatives are an agent step that frees the stalled sessions without releasing their
+  acks, or a HALT with a clear reason.

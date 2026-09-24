@@ -197,6 +197,13 @@ class SetController:
             if v.kind == "SUSPECT":
                 self.st.to(State.SUSPECT, note=self._suspect_note(v),
                            detect=_detect(v))
+                if not self.stalled_primary_alive(ob):
+                    return
+                # The SUSPECT is only the stall: the primary answers, is writable, and has
+                # no semi-sync replica, so the manager's heartbeat write blocks. It is alive,
+                # and the only way out is to give it a replica, so rejoin runs (kill-two).
+                from dbguard.manager.rejoin import rejoin_actions
+                await rejoin_actions(self, ob)
                 return
             if v.kind == "REPLICAS_ONLY":
                 if not self.replicas_only_logged:
@@ -295,6 +302,31 @@ class SetController:
                 log.info("spare is a member", rs=self.rs, node=sp,
                          source=nv.replica.source_host)
 
+    def stalled_primary_alive(self, ob: Observation | None = None) -> bool:
+        """The primary's agent answers, it is not fenced, super_read_only=0, and it is stalled
+        only because no semi-sync replica is connected."""
+        ob = ob or self.last_obs
+        if ob is None or self.primary is None:
+            return False
+        pv = ob.nodes.get(self.primary)
+        if pv is None or not pv.usable or pv.fenced or pv.super_read_only is not False:
+            return False
+        hb = (pv.raw or {}).get("heartbeat") or {}
+        stalled = (hb.get("stalled_s") or 0) > 0 or \
+            (ob.probe is not None and ob.probe.write_stalled)
+        return stalled and pv.semisync.source_enabled and pv.semisync.source_clients == 0
+
+    def _stall_plan(self, ob: Observation) -> str:
+        """What the manager is doing about a stall, for the stall event."""
+        back = [n for n in self.members if n != self.primary and
+                (nv := ob.nodes.get(n)) is not None and nv.usable]
+        if not back:
+            return ("no replica is reachable, waiting for one to come back; writes resume "
+                    "when a replica attaches")
+        return (f"rejoining {', '.join(back)} to give it a semi-sync replica (repoint, or "
+                f"rebuild with the stalled primary as donor of last resort if no replica "
+                f"can donate)")
+
     def _check_stall(self, ob: Observation, pv: NodeView | None) -> None:
         """Record a stall event when writes on the primary stop, and another when they resume."""
         stalled = False
@@ -310,7 +342,8 @@ class SetController:
         if stalled and self.stall_since is None:
             self.stall_since = ob.ts
             self.event(type="stall", old_primary=self.primary, new_primary=self.primary,
-                       note=f"writes stalled on {self.primary}: {why}")
+                       note=f"writes stalled on {self.primary}: {why}; "
+                            f"{self._stall_plan(ob)}")
         elif not stalled and self.stall_since is not None:
             dur = ob.ts - self.stall_since
             self.stall_since = None

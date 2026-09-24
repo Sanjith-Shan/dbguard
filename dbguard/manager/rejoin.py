@@ -206,21 +206,38 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
 
 async def _rebuild(ctl: SetController, n: str, phantom: GtidSet, why: str, wait: bool,
                    branch: str) -> Event | None:
-    """Clone ``n`` from the first healthy replica, in the background unless ``wait``."""
-    views = await ctl.fresh_views([m for m in ctl.members if m != n])
-    donors = ctl.healthy_replicas(views, exclude=(n,))
-    if not donors:
-        log.warning("rebuild needed but no healthy replica to clone from", rs=ctl.rs, node=n,
-                    phantom=phantom.count())
-        ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
-        return None
-    coro = rebuild_and_join(ctl, n, donors[0], phantom_count=phantom.count(),
-                            phantom=str(phantom) if phantom else None, why=why,
-                            event_type="rejoin", branch=branch)
+    """Clone ``n`` from a donor (see pick_donor). With ``wait`` the clone runs here and its
+    event is returned. Otherwise it is started through start_maintenance (the node is marked
+    busy), waiting for the maintenance slot first, and None is returned."""
     if wait:
-        return await coro
-    ctl.start_maintenance(coro, [n])
+        views = await ctl.fresh_views([m for m in ctl.members if m != n])
+        donor, dnote = pick_donor(ctl, views, n)
+        if donor is None:
+            log.warning("rebuild needed but no donor", rs=ctl.rs, node=n,
+                        phantom=phantom.count())
+            ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
+            return None
+        return await rebuild_and_join(ctl, n, donor, phantom_count=phantom.count(),
+                                      phantom=str(phantom) if phantom else None,
+                                      why=f"{why}; {dnote}" if dnote else why,
+                                      event_type="rejoin", branch=branch)
+    if not await start_rebuild_when_free(ctl, n, phantom, why, branch,
+                                         give_up_s=QUIESCE_DEADLINE_S):
+        ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
     return None
+
+
+def pick_donor(ctl: SetController, views: dict[str, NodeView], n: str) -> tuple[str | None, str]:
+    """A streaming replica, never the primary, except as the donor of last resort: when no
+    replica streams and the primary is stalled with zero semi-sync clients. A stalled
+    primary has no foreground I/O to protect, and the node restored from it becomes the
+    semi-sync replica that unblocks its writes (kill-two). Returns (donor, note)."""
+    donors = ctl.healthy_replicas(views, exclude=(n,))
+    if donors:
+        return donors[0], ""
+    if ctl.stalled_primary_alive():
+        return ctl.primary, "donor of last resort: primary"
+    return None, ""
 
 
 async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None:
@@ -250,24 +267,29 @@ async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None
 
 
 async def start_rebuild_when_free(ctl: SetController, n: str, phantom: GtidSet, why: str,
-                                  branch: str) -> None:
+                                  branch: str, give_up_s: float | None = None) -> bool:
     """Start the rebuild through start_maintenance, like every other clone, so the node is
     marked busy and rejoin_actions never starts a second rejoin or rebuild of it. Waits for
-    the maintenance slot and for a donor, retrying until the manager stops."""
-    while True:
+    the maintenance slot and for a donor, which is chosen only once the slot is free (a node
+    rebuilt just before may be the donor now). Retries until ``give_up_s`` (None: until the
+    manager stops). Returns whether the rebuild was started."""
+    end = None if give_up_s is None else time.monotonic() + give_up_s
+    while end is None or time.monotonic() < end:
         await _wait_maintenance_slot(ctl)
         views = await ctl.fresh_views([m for m in ctl.members if m != n])
-        donors = ctl.healthy_replicas(views, exclude=(n,))
-        if donors:
-            coro = rebuild_and_join(ctl, n, donors[0], phantom_count=phantom.count(),
-                                    phantom=str(phantom), why=why, event_type="rejoin",
-                                    branch=branch)
+        donor, dnote = pick_donor(ctl, views, n)
+        if donor:
+            coro = rebuild_and_join(ctl, n, donor, phantom_count=phantom.count(),
+                                    phantom=str(phantom),
+                                    why=f"{why}; {dnote}" if dnote else why,
+                                    event_type="rejoin", branch=branch)
             if ctl.start_maintenance(coro, [n]):
-                return
+                return True
         else:
-            log.warning("rebuild needed but no healthy replica to clone from", rs=ctl.rs,
-                        node=n, phantom=phantom.count())
+            log.warning("rebuild needed but no donor", rs=ctl.rs, node=n,
+                        phantom=phantom.count())
         await asyncio.sleep(ctl.quiesce_interval_s)
+    return False
 
 
 async def _wait_maintenance_slot(ctl: SetController) -> None:
