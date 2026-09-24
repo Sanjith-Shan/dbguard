@@ -66,8 +66,33 @@ heredocs and cache mounts already).
 - How found. The checker's `converge_s` on the acceptance run, then the lag sampling.
 - Fix. The 8.4 default of `replica_parallel_workers=4` was the limit. Setting it to 16 on
   one replica during the same load brought that replica to 0 to 1 s of lag while the other
-  kept growing. my.cnf now sets `replica_parallel_workers=16` and
-  `replica_preserve_commit_order=ON`.
+  kept growing. my.cnf then set `replica_parallel_workers=16` and
+  `replica_preserve_commit_order=ON`. 16 later cost an OOM kill and is now 8 (next entry).
+
+### Nodes sat at their memory limit and mysqld was OOM-killed
+
+- Symptom. The manager's entry "mysqld OOM-killed during START REPLICA" below. mysqld died
+  with SIGKILL from the kernel on replicas as `START REPLICA` spawned the applier workers.
+  `docker stats` showed the replicas at 655 to 697 MiB of their 700 MiB `mem_limit` and the
+  primaries at about 490 MiB.
+- How found. The manager agent traced repoint failures to `mysqld_exited` with returncode -9,
+  and the fleet had set both numbers (700 MiB and 16 applier workers).
+- Fix. `mem_limit: 1g` per node, `replica_parallel_workers=8` (commit order still preserved),
+  `max_connections=120`, `innodb_log_buffer_size=8M`, `tmp_table_size` and
+  `max_heap_table_size` 16M, and `performance-schema-instrument='wait/%=OFF'`.
+  performance_schema stays on because the agent reads `threads` and `clone_progress`.
+  Measured on this machine:
+
+| Measurement | Before | After |
+|---|---|---|
+| Idle single node from the image, `docker stats` (mysqld RSS) | 455.7 MiB (450 MiB) | 397.6 MiB (392 MiB) |
+| Idle node with `performance_schema_max_thread_instances=400`, `max_thread_classes=100` added | | 397.6 MiB, no change, so not adopted |
+| Replica under 60 s of 8-client load | mysql-a2 on the old config, 668 rising to 696 MiB of 700 MiB | mysql-a3 recreated on the new config, 519 rising to a 549 MiB plateau of 1 GiB |
+| Replica lag in that run, sampled every 5 s | mysql-a2 0 to 1 s (16 workers) | mysql-a3 0 to 1 s (8 workers) |
+
+  The run acked 58,505 writes at 975 writes/s with 0 errors, p50 6.5 ms and p99 31.5 ms.
+  Seven nodes at their 1 GiB limit would be 7 GiB, but the observed peak is about 550 MiB,
+  so seven nodes plus haproxy, the manager and Orchestrator stay under the VM's 7.7 GB.
 
 ### The init wrapper died on an unset variable
 
@@ -314,8 +339,8 @@ heredocs and cache mounts already).
   through `docker logs` of the nodes. `docker stats` showed every node at about 684 of 700 MiB
   (`mem_limit: 700m`), with `replica_parallel_workers=16` in my.cnf. SIGKILL at the moment the
   applier workers start points at the container memory limit.
-- Fix. In progress by the fleet agent (fewer applier workers or more memory per node). The
-  manager side already copes. A failed repoint is noted in the event and retried by the rejoin
+- Fix. The fleet side is under Fleet, "Nodes sat at their memory limit" (1 GiB per node and 8
+  applier workers). The manager side already copes. A failed repoint is noted in the event and retried by the rejoin
   pass, and the stalled primary is failed over like any other. The outage is the fleet's.
 
 ### A stale status view repointed a replica the failover had just repointed

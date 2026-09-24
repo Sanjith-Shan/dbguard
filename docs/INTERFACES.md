@@ -104,10 +104,10 @@ Fleet deviations from the block above, all in `deploy/mysql/my.cnf`.
 |---|---|
 | `loose_rpl_semi_sync_source_*` | `mysqld --initialize` ignores `plugin_load_add`, so without `loose_` the first boot aborts on an unknown variable. `bin/bootstrap` checks the plugins are ACTIVE instead |
 | one `plugin_load_add` line per plugin | same effect as the `;` list, easier to read |
-| `replica_parallel_workers=16`, `replica_preserve_commit_order=ON` | with 4 workers the replicas fell 44 s behind in five minutes of 8-client load (BUGS.md) |
+| `replica_parallel_workers=8`, `replica_preserve_commit_order=ON` | with 4 workers the replicas fell 44 s behind in five minutes of 8-client load, and 16 got mysqld OOM-killed. 8 keeps lag at 0 to 1 s (BUGS.md) |
 | `relay_log_recovery=ON` | crash-safe replica. A replica that crashed refetches its relay log from the source by GTID auto-position |
 | `binlog_expire_logs_seconds=3600` | the laptop disk is small |
-| `innodb_buffer_pool_size=128M`, `innodb_redo_log_capacity=128M`, `mem_limit: 700m` | eight nodes fit in Docker Desktop's 8 GB |
+| `innodb_buffer_pool_size=128M`, `innodb_redo_log_capacity=128M`, `innodb_log_buffer_size=8M`, `tmp_table_size` and `max_heap_table_size` 16M, `max_connections=120`, `performance-schema-instrument='wait/%=OFF'`, `mem_limit: 1g` | a replica under load peaks near 550 MiB, well below its limit, so seven nodes plus the rest fit in the 7.7 GB VM (BUGS.md) |
 | `skip_name_resolve`, `mysqlx=0`, `bind_address=0.0.0.0`, `report_port=3306` | plumbing |
 
 Node startup. `/entrypoint.sh` (under tini) renders `/etc/mysql/conf.d/dbguard-node.cnf`

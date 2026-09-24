@@ -16,7 +16,7 @@ x-node: &node
     context: ..
     dockerfile: deploy/Dockerfile
   cap_add: [NET_ADMIN, SYS_NICE]
-  mem_limit: 700m
+  mem_limit: 1g
   logging: *logging
   networks: [dbguard]
   restart: "no"
