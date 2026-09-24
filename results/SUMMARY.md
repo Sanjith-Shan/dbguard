@@ -4,6 +4,8 @@
 
 - Apple M3 Pro, Docker Desktop 4.71.0 (225177) (engine 29.4.1), 12 cpu 18GB, VM 12 cpu 7.7GB | MySQL 8.4.11
 
+rs2 changes counts every rs2 event during a run. In every table rs2 had 0 role changes (no failover, switchover, rejoin, rebuild, replace or halt). The events are suspect and stall notices while rs1 cloned (see rs2_events_by_type in the rows). kill-two has no failover time because writes stayed stalled until the harness reset the set, and its errant-GTID count was taken with the pre-4be4918 read order in a scenario where the restarted nodes legitimately hold transactions the survivor lacks, so it is not interpreted.
+
 Configuration per table, reruns and archived rows: see results/CONFIG_HISTORY.md. kill/dbguard and partition-manager/dbguard ran under the earlier agent-live-primary-check configuration, every other table under the final one.
 
 ## Failover under injected faults
@@ -15,9 +17,9 @@ Configuration per table, reruns and archived rows: see results/CONFIG_HISTORY.md
 | partition-replicas | dbguard | 30 | 11.58 | 14.23 | 0 | 0 | 0 | 0 | 0 | 30/30 | - | 9.98 | 10.54 | 10.04 | 0 | 0 |
 | kill-two | dbguard | 11 | - | - | 0 | 0 | 0 | 0 | 0 | 11/11 | - | 0.02 | 0.09 | - | 9 | 0 |
 
-## Primary killed with a replica delay (tc netem on the replicas)
+## Primary killed as a host death, with a replication delay
 
-Same workload and kill as above, with a fixed egress delay on both replicas so a crash can land between commit and replication. Both modes under the same delay.
+Same workload as above. tc netem delays the primary's packets to the replicas (the replication stream only), and at injection the primary's packets to the replicas are dropped (about 0.3 to 0.4 s before the SIGKILL) so the in-flight binlog is lost as in a power failure. Identical injection in both modes. The naive loss count scales with that window.
 
 | scenario | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | single-writer violations | converged | runs with errant GTIDs |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -42,14 +44,16 @@ Same workload and kill as above, with a fixed egress delay on both replicas so a
 
 ## Cost of losslessness
 
-| mode | semi-sync | netem ms | runs | commit p50 ms | commit p99 ms | writes/s | semi-sync avg wait us |
-|---|---|---|---|---|---|---|---|
-| dbguard | on | 0.00 | 3 | 5.88 | 43.14 | 953.21 | 457.00 |
-| dbguard | on | 2.00 | 3 | 9.75 | 52.10 | 615.11 | 1127.00 |
-| dbguard | on | 20.00 | 3 | 23.94 | 56.65 | 297.74 | 2267.00 |
-| dbguard | off | 0.00 | 3 | 4.23 | 26.48 | 1389.14 | 2713.00 |
-| dbguard | off | 2.00 | 3 | 4.41 | 43.64 | 1215.84 | 2775.00 |
-| dbguard | off | 20.00 | 3 | 4.37 | 29.55 | 1309.03 | 2886.00 |
+| mode | semi-sync | netem ms (replica egress) | runs | commit p50 ms | commit p99 ms | writes/s |
+|---|---|---|---|---|---|---|
+| dbguard | on | 0.00 | 3 | 5.88 | 43.14 | 953.21 |
+| dbguard | on | 2.00 | 3 | 9.75 | 52.10 | 615.11 |
+| dbguard | on | 20.00 | 3 | 23.94 | 56.65 | 297.74 |
+| dbguard | off | 0.00 | 3 | 4.23 | 26.48 | 1389.14 |
+| dbguard | off | 2.00 | 3 | 4.41 | 43.64 | 1215.84 |
+| dbguard | off | 20.00 | 3 | 4.37 | 29.55 | 1309.03 |
+
+The netem delay here is on the replicas' egress, which is the semi-sync ack path. With semi-sync off it adds no replication delay, so the off rows with netem show no effect by construction.
 
 ## Replica loss and replacement
 

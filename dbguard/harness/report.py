@@ -213,6 +213,14 @@ def render_markdown(s: dict) -> str:
     for env in s["environment"]:
         parts.append(f"- {env}")
     parts.append("")
+    parts.append("rs2 changes counts every rs2 event during a run. In every table rs2 had 0 role "
+                 "changes (no failover, switchover, rejoin, rebuild, replace or halt). The events are "
+                 "suspect and stall notices while rs1 cloned (see rs2_events_by_type in the rows). "
+                 "kill-two has no failover time because writes stayed stalled until the harness reset "
+                 "the set, and its errant-GTID count was taken with the pre-4be4918 read order in a "
+                 "scenario where the restarted nodes legitimately hold transactions the survivor "
+                 "lacks, so it is not interpreted.")
+    parts.append("")
     parts.append("Configuration per table, reruns and archived rows: see results/CONFIG_HISTORY.md. "
                  "kill/dbguard and partition-manager/dbguard ran under the earlier "
                  "agent-live-primary-check configuration, every other table under the final one.")
@@ -238,9 +246,12 @@ def render_markdown(s: dict) -> str:
               x["runs_with_errant_gtids"],
               x["rs2_state_changes"]] for x in fo]), ""]
     if fo_netem:
-        parts += ["## Primary killed with a replica delay (tc netem on the replicas)", "",
-                  "Same workload and kill as above, with a fixed egress delay on both replicas so a "
-                  "crash can land between commit and replication. Both modes under the same delay.",
+        parts += ["## Primary killed as a host death, with a replication delay", "",
+                  "Same workload as above. tc netem delays the primary's packets to the replicas "
+                  "(the replication stream only), and at injection the primary's packets to the "
+                  "replicas are dropped (about 0.3 to 0.4 s before the SIGKILL) so the in-flight "
+                  "binlog is lost as in a power failure. Identical injection in both modes. The "
+                  "naive loss count scales with that window.",
                   "", md_table(
             ["scenario", "mode", "runs", "failover p50 s", "failover p99 s", "lost acked writes",
              "runs with loss", "phantom writes", "single-writer violations", "converged",
@@ -264,11 +275,14 @@ def render_markdown(s: dict) -> str:
              for x in s["rejoin"]]), ""]
     if s["cost"]:
         parts += ["## Cost of losslessness", "", md_table(
-            ["mode", "semi-sync", "netem ms", "runs", "commit p50 ms", "commit p99 ms", "writes/s",
-             "semi-sync avg wait us"],
+            ["mode", "semi-sync", "netem ms (replica egress)", "runs", "commit p50 ms",
+             "commit p99 ms", "writes/s"],
             [[x["mode"], "on" if x["semisync"] else "off", x["netem_ms"], x["runs"],
-              x["commit_p50_ms"], x["commit_p99_ms"], x["writes_per_s"],
-              x["semisync_avg_wait_us"]] for x in s["cost"]]), ""]
+              x["commit_p50_ms"], x["commit_p99_ms"], x["writes_per_s"]] for x in s["cost"]]),
+            "",
+            "The netem delay here is on the replicas' egress, which is the semi-sync ack path. "
+            "With semi-sync off it adds no replication delay, so the off rows with netem show "
+            "no effect by construction.", ""]
     if s["replica_loss"]:
         parts += ["## Replica loss and replacement", "", md_table(
             ["mode", "runs", "stall p50 s (no replica)", "resume p50 s", "clones", "clone MB",

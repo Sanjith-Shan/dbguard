@@ -88,6 +88,27 @@
       "writes_on_woken_primary": null
     },
     {
+      "converged_runs": 10,
+      "failed_over_runs": 10,
+      "failover_p50_s": 6.358705997467041,
+      "failover_p99_s": 9.540707111358643,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "dbguard (netem 2 ms)",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 6.198339939117432,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 0,
+      "runs": 10,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "kill",
+      "single_writer_violations": 0,
+      "stall_p50_s": 6.178826093673706,
+      "stall_p99_s": 9.307379007339478,
+      "writes_on_woken_primary": null
+    },
+    {
       "converged_runs": 30,
       "failed_over_runs": 30,
       "failover_p50_s": 5.450585126876831,
@@ -111,22 +132,22 @@
     {
       "converged_runs": 10,
       "failed_over_runs": 10,
-      "failover_p50_s": 5.490654945373535,
-      "failover_p99_s": 5.762304067611694,
+      "failover_p50_s": 5.917625904083252,
+      "failover_p99_s": 7.504487037658691,
       "false_failovers": 0,
-      "lost_acked_writes": 0,
+      "lost_acked_writes": 1160,
       "mode": "naive (netem 2 ms)",
       "phantom_writes": 0,
-      "reconnect_gap_p50_s": 5.5233070850372314,
+      "reconnect_gap_p50_s": 5.511731863021851,
       "rs2_role_changes": 0,
-      "rs2_state_changes": 0,
+      "rs2_state_changes": 4,
       "runs": 10,
       "runs_with_errant_gtids": 0,
-      "runs_with_loss": 0,
+      "runs_with_loss": 10,
       "scenario": "kill",
       "single_writer_violations": 0,
-      "stall_p50_s": 5.455227851867676,
-      "stall_p99_s": 5.70512580871582,
+      "stall_p50_s": 5.487167119979858,
+      "stall_p99_s": 5.604023218154907,
       "writes_on_woken_primary": null
     },
     {
@@ -207,6 +228,18 @@
       "scenario": "kill"
     },
     {
+      "mode": "dbguard (netem 2 ms)",
+      "other": 0,
+      "phantom_gtids_max": 9,
+      "phantom_gtids_mean": 7.7,
+      "rebuild": 10,
+      "rejoin_p50_s": 5.393,
+      "rejoin_p99_s": 6.304,
+      "rejoins": 10,
+      "repoint": 0,
+      "scenario": "kill"
+    },
+    {
       "mode": "naive",
       "other": 0,
       "phantom_gtids_max": 8,
@@ -221,13 +254,13 @@
     {
       "mode": "naive (netem 2 ms)",
       "other": 0,
-      "phantom_gtids_max": 6,
-      "phantom_gtids_mean": 2.2,
-      "rebuild": 5,
-      "rejoin_p50_s": 0.181,
-      "rejoin_p99_s": 8.659,
+      "phantom_gtids_max": 152,
+      "phantom_gtids_mean": 119.7,
+      "rebuild": 10,
+      "rejoin_p50_s": 8.257,
+      "rejoin_p99_s": 13.619,
       "rejoins": 10,
-      "repoint": 5,
+      "repoint": 0,
       "scenario": "kill"
     },
     {
@@ -256,7 +289,7 @@
       "stall_p50_s": 22.436190843582153
     }
   ],
-  "rows": 170,
+  "rows": 180,
   "switchover": [
     {
       "errors": 80,
