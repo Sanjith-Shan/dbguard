@@ -61,16 +61,12 @@ def semisync_available(conn) -> bool:
 
 
 def setup_primary(node: str, conn, semisync: bool) -> None:
-    rs = m.replica_status(conn)
-    if rs is not None:
+    if m.replica_status(conn) is not None:
         m.execute(conn, "STOP REPLICA")
         m.execute(conn, "RESET REPLICA ALL")
-    m.execute(conn, "SET GLOBAL rpl_semi_sync_replica_enabled=0") if semisync_available(conn) \
-        else None
-    if semisync and semisync_available(conn):
-        m.execute(conn, "SET GLOBAL rpl_semi_sync_source_enabled=1")
-    elif semisync_available(conn):
-        m.execute(conn, "SET GLOBAL rpl_semi_sync_source_enabled=0")
+    if semisync_available(conn):
+        m.execute(conn, "SET GLOBAL rpl_semi_sync_replica_enabled=0")
+        m.execute(conn, f"SET GLOBAL rpl_semi_sync_source_enabled={1 if semisync else 0}")
     m.execute(conn, "SET GLOBAL super_read_only=0")
     m.execute(conn, "SET GLOBAL read_only=0")
     log("primary ready", node=node, semisync=semisync)
@@ -170,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
         primary = sc.nodes[0]
         conns = {n: m.connect("127.0.0.1", host_port(n), a.user, a.password, timeout=3)
                  for n in sc.nodes}
+        if semisync:
+            missing = [n for n, c in conns.items() if not semisync_available(c)]
+            if missing:
+                raise SystemExit(f"{rs}: semi-sync requested but the plugins are not ACTIVE on "
+                                 f"{missing} (my.cnf uses loose_ variables, check the error log)")
         # Refuse to bootstrap a set whose nodes already disagree (not a fresh fleet).
         from dbguard.gtid import GtidSet
         g = {n: GtidSet.parse(m.gtid_executed(c)) for n, c in conns.items()}
