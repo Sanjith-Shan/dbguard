@@ -569,6 +569,11 @@ class Fleet:
             if cd and float(cd) > time.time():
                 return False, f"cooldown for {float(cd) - time.time():.0f}s"
             members = [p] + reps
+            # every original node must be back in the set (a replacement spare does not
+            # stand in for a node that never rejoined)
+            missing = [n for n in self.nodes if n not in members]
+            if missing:
+                return False, f"original nodes not yet rejoined: {missing}"
         else:
             members = self.nodes
         ss = self.statuses(members)
@@ -608,6 +613,7 @@ class Fleet:
         if down:
             docker.up(*down)
         why = ""
+        spare_dropped = False
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.mode == "orchestrator":
@@ -618,18 +624,60 @@ class Fleet:
                     why = f"HALTED: {st.get('halt_reason')}"
                     break
             ok, why = self.healthy_now()
+            if ok and docker.container_status(spare_node(self.rs)) is not None:
+                # a replacement happened during the run (review #2/#13): the three original
+                # nodes are healthy again, so take the spare out of the set
+                dropped = self.drop_spare()
+                spare_dropped = spare_dropped or dropped
+                continue
             if ok:
                 log(f"heal: {self.rs} clean in {time.time() - t0:.1f}s, primary {self.primary()}")
-                return {"hard_reset": False, "heal_s": time.time() - t0}
+                return {"hard_reset": False, "heal_s": time.time() - t0,
+                        "spare_dropped": spare_dropped}
             time.sleep(1.0)
         log(f"heal: {self.rs} not clean after {time.time() - t0:.0f}s ({why}), hard reset")
         self.hard_reset()
         return {"hard_reset": True, "heal_s": time.time() - t0, "heal_reason": why}
 
+    def drop_spare(self, timeout: float = 60.0) -> bool:
+        """Remove the spare container and its volumes, and make the manager forget it.
+
+        The manager keeps set membership in memory and has no API to remove a member, so it
+        is restarted afterwards and reloads the members from fleet.yaml (it re-adopts a
+        spare only while that spare is running and replicating). If the spare is the
+        primary, a planned switchover to an original node comes first."""
+        sp = spare_node(self.rs)
+        if docker.container_status(sp) is None:
+            return False
+        if self.primary() == sp and self.mode != "orchestrator":
+            target = next((n for n in self.nodes if (agent(n).status() or {}).get("replica", {})
+                           .get("source_host") == sp), None)
+            log(f"heal: spare {sp} is primary, switching over to {target}")
+            try:
+                self.mc.failover(self.rs, target, timeout=60)
+            except ApiError as e:
+                log(f"heal: switchover off the spare failed: {e}")
+                return False
+            deadline = time.time() + timeout
+            while time.time() < deadline and self.primary() == sp:
+                time.sleep(1)
+            if self.primary() == sp:
+                return False
+        vols = docker.volumes_of(sp)
+        docker.rm(sp, profiles=("spare",))
+        docker.rm_volume(*vols)
+        if self.mode != "orchestrator":
+            docker._run(docker.compose_args("restart", MANAGER_CONTAINER), timeout=120)
+            deadline = time.time() + timeout
+            while time.time() < deadline and self.manager_set() is None:
+                time.sleep(1)
+        log(f"heal: removed spare {sp} and its volumes {vols}")
+        return True
+
     def hard_reset(self, timeout: float = 240.0) -> None:
         nodes = self.nodes + [spare_node(self.rs)]
         vols = [v for n in nodes for v in docker.volumes_of(n)]
-        docker.rm(*nodes)
+        docker.rm(*nodes, profiles=("spare",))
         docker.rm_volume(*vols)
         if self.mode != "orchestrator":
             # the manager holds per-set state (HALTED, cooldown); restart it so it bootstraps
@@ -909,6 +957,7 @@ def base_row(run: Run, env: dict) -> dict:
         "docker_version": env["docker_version"],
         "detect_window_s": env["knobs"].get("detect_window_s"),
         "probe_timeout_s": env["knobs"].get("probe_timeout_s"),
+        "rebuild_after_s": env["knobs"].get("rebuild_after_s"),
         "config": env["knobs"],
         "clients": o.clients, "workload_s": o.workload_seconds, "inject_ts": None,
         "failover_s": None, "first_error_ts": None, "first_ok_after_ts": None,
@@ -1444,11 +1493,7 @@ def sc_replica_loss(run: Run) -> None:
     docker.up(r2)
     t_back = time.time()
     rejoin_after_restart(run, r2, t_back, timeout=120, mark=m_back)
-    spare = spare_node(o.rs)
-    if docker.container_status(spare):
-        vols = docker.volumes_of(spare)
-        docker.rm(spare)
-        docker.rm_volume(*vols)
+    # the spare is taken out of the set by heal(), once the three original nodes are healthy
 
 
 def sc_switchover(run: Run) -> None:
@@ -1571,6 +1616,12 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
     other = "rs2" if opts.rs != "rs2" else "rs1"
     other_p = Fleet(other, opts.mode).primary()
     other_mark = f.mark(other)
+    start_mark = f.mark()
+    rb = env["knobs"].get("rebuild_after_s")
+    if opts.scenario in ("hang-container", "hang-process") and rb is not None \
+            and opts.hang_seconds >= float(rb):
+        note(run, f"hang_seconds {opts.hang_seconds:g} >= rebuild_after_s {rb}, the manager may "
+                  "provision and clone the spare during the hang")
     snap = semisync_snapshot(opts.rs)
     run.row["semisync_nodes"] = snap
     problems = semisync_problems(opts.mode, snap)
@@ -1596,6 +1647,8 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
             oks, errs = read_ack_log(rs2_wl.ack_log)
             run.row["rs2_workload"] = {"acked": len(oks), "errors": len(errs)}
         run.row["rs2_state_changes"] = rs2_changes(f, other_mark)
+        run.row["replacements_during_run"] = sum(
+            1 for e in f.events(start_mark) if e.get("type") == "replace")
         if Fleet(other, opts.mode).primary() not in (other_p, None) and run.row["rs2_state_changes"] == 0:
             run.row["rs2_state_changes"] = 1
         extra = [MANAGER_CONTAINER] if opts.mode != "orchestrator" and opts.scenario == "partition-manager" else []

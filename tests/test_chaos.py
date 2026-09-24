@@ -258,3 +258,50 @@ def test_mark_with_no_prior_events():
     assert m.max_ts is None
     f.mc.evs.append({"ts": 5.0, "rs": "rs1", "type": "failover"})
     assert len(f.events(m)) == 1
+
+
+G = f"{U1}:1-100"
+
+
+def _fleet_with(monkeypatch, nodes_roles, statuses):
+    from dbguard.harness import chaos as c
+    f = c.Fleet("rs1", "dbguard")
+    monkeypatch.setattr(f, "agent_primaries", lambda: [n for n, r in nodes_roles.items() if r == "primary"])
+    monkeypatch.setattr(f, "manager_set", lambda: {
+        "state": "HEALTHY", "primary": next(n for n, r in nodes_roles.items() if r == "primary"),
+        "nodes": {n: {"role": r, "reachable": r != "down"} for n, r in nodes_roles.items()},
+        "cooldown_until": None})
+    monkeypatch.setattr(f, "statuses", lambda nodes=None: {n: statuses.get(n) for n in (nodes or statuses)})
+    return f
+
+
+def _rep(src):
+    return {"gtid_executed": G, "replica": {"source_host": src, "io_running": "Yes", "sql_running": "Yes"}}
+
+
+def test_healthy_requires_every_original_node(monkeypatch):
+    roles = {"mysql-a1": "primary", "mysql-a2": "replica", "mysql-a3": "down", "mysql-a4": "replica"}
+    st = {"mysql-a1": {"gtid_executed": G}, "mysql-a2": _rep("mysql-a1"), "mysql-a4": _rep("mysql-a1")}
+    ok, why = _fleet_with(monkeypatch, roles, st).healthy_now()
+    assert not ok and "mysql-a3" in why
+    roles["mysql-a3"] = "replica"
+    st["mysql-a3"] = _rep("mysql-a1")
+    ok, why = _fleet_with(monkeypatch, roles, st).healthy_now()
+    assert ok, why
+
+
+def test_drop_spare_uses_the_spare_profile(monkeypatch):
+    from dbguard.harness import chaos as c
+    calls = []
+    f = c.Fleet("rs1", "dbguard")
+    monkeypatch.setattr(c.docker, "container_status", lambda n: "running")
+    monkeypatch.setattr(c.docker, "volumes_of", lambda n: ["dbguard_mysql-a4-data"])
+    monkeypatch.setattr(c.docker, "rm", lambda *a, **k: calls.append(("rm", a, k)))
+    monkeypatch.setattr(c.docker, "rm_volume", lambda *a: calls.append(("rmv", a)))
+    monkeypatch.setattr(c.docker, "_run", lambda args, **k: calls.append(("run", tuple(args[-2:]))))
+    monkeypatch.setattr(f, "primary", lambda: "mysql-a1")
+    monkeypatch.setattr(f, "manager_set", lambda: {"state": "HEALTHY"})
+    assert f.drop_spare()
+    assert ("rm", ("mysql-a4",), {"profiles": ("spare",)}) in calls
+    assert ("rmv", ("dbguard_mysql-a4-data",)) in calls
+    assert ("run", ("restart", "dbguard")) in calls
