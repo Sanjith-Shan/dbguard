@@ -617,6 +617,7 @@ class Fleet:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.mode == "orchestrator":
+                set_agent_guards(False, [self.rs])
                 self.harness_repair()
             else:
                 st = self.manager_set()
@@ -879,9 +880,35 @@ def event_key(e: dict) -> str:
                       default=str)
 
 
+ALL_SETS = ["rs1", "rs2"]
+
+
+def set_agent_guards(on: bool, sets: list[str] = ALL_SETS) -> dict[str, Any]:
+    """Turn DBGuard's self-fence lease and wake guard on or off on every node (review #12).
+
+    The orchestrator baseline must run on Orchestrator's own logic. With the dbguard manager
+    stopped, a primary with no semi-sync client would self-fence after 10 s, and a woken node
+    would fence on a leftover fence file, which would flatter Orchestrator's numbers. The
+    toggles live in agent memory and reset to on when the agent restarts, so the harness
+    re-applies them before every run and after it restarts a node."""
+    res: dict[str, Any] = {}
+    for rs in sets:
+        for n in set_nodes(rs) + [spare_node(rs)]:
+            if docker.container_status(n) != "running":
+                continue
+            try:
+                code, body = agent(n).post("/configure", {"self_fence": on, "wake_guard": on},
+                                           timeout=5)
+                res[n] = body if code == 200 else f"HTTP {code}"
+            except ApiError as e:
+                res[n] = str(e)
+    return res
+
+
 def orch_setup(rs_list: list[str]) -> None:
     docker.up(ORCH_CONTAINER, profiles=("orchestrator",))
     docker.stop(MANAGER_CONTAINER)
+    log(f"agent guards off for the orchestrator baseline: {set_agent_guards(False)}")
     deadline = time.time() + 120
     while time.time() < deadline and orch_get("/api/health") is None:
         time.sleep(2)
@@ -905,6 +932,7 @@ def orch_setup(rs_list: list[str]) -> None:
 
 def orch_teardown() -> None:
     docker.stop(ORCH_CONTAINER, profiles=("orchestrator",))
+    log(f"agent guards restored: {set_agent_guards(True)}")
     docker.up(MANAGER_CONTAINER)
 
 
@@ -1058,6 +1086,8 @@ def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 
             if s and s.get("mysqld_responsive"):
                 break
             time.sleep(1)
+        set_agent_guards(False, [f.rs])
+        note(run, f"guards turned off on {old} after its restart, its startup guard ran first")
         acts = [a for a in f.harness_repair() if a.get("node") == old]
         if acts:
             a = acts[0]
@@ -1617,6 +1647,9 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
     other_p = Fleet(other, opts.mode).primary()
     other_mark = f.mark(other)
     start_mark = f.mark()
+    if opts.mode == "orchestrator":
+        run.row["agent_guards"] = {"self_fence": False, "wake_guard": False,
+                                   "applied": set_agent_guards(False)}
     rb = env["knobs"].get("rebuild_after_s")
     if opts.scenario in ("hang-container", "hang-process") and rb is not None \
             and opts.hang_seconds >= float(rb):

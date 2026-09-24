@@ -305,3 +305,24 @@ def test_drop_spare_uses_the_spare_profile(monkeypatch):
     assert ("rm", ("mysql-a4",), {"profiles": ("spare",)}) in calls
     assert ("rmv", ("dbguard_mysql-a4-data",)) in calls
     assert ("run", ("restart", "dbguard")) in calls
+
+
+def test_set_agent_guards_posts_both_toggles(monkeypatch):
+    from dbguard.harness import chaos as c
+    posted = []
+
+    class FakeAgent:
+        def __init__(self, n):
+            self.n = n
+
+        def post(self, path, body, timeout=None):
+            posted.append((self.n, path, body))
+            return 200, {"ok": True, **body}
+
+    monkeypatch.setattr(c, "agent", FakeAgent)
+    monkeypatch.setattr(c.docker, "container_status",
+                        lambda n: None if n.endswith("4") else "running")
+    res = c.set_agent_guards(False, ["rs1"])
+    assert sorted(res) == ["mysql-a1", "mysql-a2", "mysql-a3"]
+    assert all(p == "/configure" and b == {"self_fence": False, "wake_guard": False}
+               for _, p, b in posted)
