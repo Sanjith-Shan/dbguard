@@ -121,3 +121,12 @@ Every real bug found while building DBGuard. Symptom, how it was found, fix.
 - Fix. A node with no replication configured is not a candidate at all, the reason is kept in
   the choose step (`excluded`), and with no candidate left the set HALTs with
   "no promotable replica" instead of promoting.
+
+### A torn last line in events.jsonl swallowed the next event
+
+- Symptom. After a simulated crash mid-write, the next event appended after restart was
+  glued onto the torn line, and both were skipped when the log was read back.
+- How found. The event log round-trip test in tests/test_manager_client.py, written to check
+  that a torn line does not stop startup, also appended after it.
+- Fix. On open, the log checks the last byte and writes a newline if the file does not end
+  with one. Every append is flushed and fsync'd.
