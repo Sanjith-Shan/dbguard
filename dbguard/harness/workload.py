@@ -6,8 +6,12 @@ INSERT returned OK. On any error the client logs an error row for that exact seq
 the connection, backs off 50 ms, reconnects and continues with seq + 1.
 
 Ack log lines (JSONL, flushed per line):
-  {"client":c,"seq":s,"t_ok":<unix>,"latency_ms":f}
-  {"client":c,"seq":s,"error":"...","t_err":<unix>}
+  {"client":c,"seq":s,"t_ok":<unix>,"latency_ms":f,"t_start":<unix>,"conn":n}
+  {"client":c,"seq":s,"error":"...","t_err":<unix>,"t_start":<unix>,"conn":n}
+t_start is the wall clock when the INSERT was sent. conn counts this client's connections
+(1 for the first, +1 per reconnect). A failover is over at the first ok whose request
+STARTED after the first error, because an ok that lands after an error may belong to a
+write that committed on the old primary before the fault.
 A seq whose INSERT was still in flight when the workload stopped is logged as an error row
 with error "in-flight at shutdown", so the checker treats it as may-or-may-not-exist.
 """
@@ -101,6 +105,7 @@ class ClientStats:
     errors: int = 0
     latencies_ms: list[float] = field(default_factory=list)
     ok_ts: list[float] = field(default_factory=list)
+    ok_start_ts: list[float] = field(default_factory=list)
     err_ts: list[float] = field(default_factory=list)
     in_flight_seq: int | None = None
 
@@ -129,6 +134,7 @@ class Client(threading.Thread):
         self.stats = ClientStats()
         self.conn = None
         self.last_error: str | None = None
+        self.conn_no = 0
 
     def _connect(self):
         o = self.opts
@@ -151,6 +157,7 @@ class Client(threading.Thread):
             if self.conn is None:
                 try:
                     self.conn = self._connect()
+                    self.conn_no += 1
                 except Exception as e:  # connection refused, reset, auth... keep trying
                     self.last_error = f"connect: {e}"
                     self.stop_ev.wait(BACKOFF_S)
@@ -158,6 +165,7 @@ class Client(threading.Thread):
             seq += 1
             payload = os.urandom(PAYLOAD_BYTES)
             st.in_flight_seq = seq
+            t_start = time.time()
             t0 = time.perf_counter()
             try:
                 with self.conn.cursor() as cur:
@@ -168,7 +176,8 @@ class Client(threading.Thread):
                 st.err_ts.append(now)
                 self.last_error = str(e)
                 self.ack.write({"client": self.cid, "seq": seq, "error": str(e)[:300],
-                                "t_err": now})
+                                "t_err": now, "t_start": round(t_start, 6),
+                                "conn": self.conn_no})
                 st.in_flight_seq = None  # only after the row is in the log (see run())
                 self._drop()
                 self.stop_ev.wait(BACKOFF_S)
@@ -178,8 +187,10 @@ class Client(threading.Thread):
             st.acked += 1
             st.latencies_ms.append(lat)
             st.ok_ts.append(now)
+            st.ok_start_ts.append(t_start)
             self.ack.write({"client": self.cid, "seq": seq, "t_ok": now,
-                            "latency_ms": round(lat, 3)})
+                            "latency_ms": round(lat, 3), "t_start": round(t_start, 6),
+                            "conn": self.conn_no})
             st.in_flight_seq = None  # only after the ack is in the log (see run())
         self._drop()
 
@@ -188,17 +199,20 @@ def summarize(clients: list[Client], opts: WorkloadOptions, t_start: float, t_en
               in_flight: int) -> dict[str, Any]:
     lats: list[float] = []
     oks: list[float] = []
+    ok_pairs: list[tuple[float, float]] = []   # (t_start, t_ok)
     errs: list[float] = []
     for c in clients:
         lats.extend(c.stats.latencies_ms)
         oks.extend(c.stats.ok_ts)
+        ok_pairs.extend(zip(c.stats.ok_start_ts, c.stats.ok_ts))
         errs.extend(c.stats.err_ts)
     oks.sort()
     errs.sort()
     first_err = errs[0] if errs else None
     first_ok_after = None
     if first_err is not None:
-        first_ok_after = next((t for t in oks if t > first_err), None)
+        # only a write that was sent after the first error proves the new primary serves
+        first_ok_after = min((t for ts, t in ok_pairs if ts >= first_err), default=None)
     elapsed = max(t_end - t_start, 1e-9)
     p50 = percentile(lats, 50)
     p99 = percentile(lats, 99)

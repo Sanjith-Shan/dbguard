@@ -160,3 +160,20 @@ def test_rejoin_matches():
     assert rejoin_matches(e, "mysql-a1")
     assert not rejoin_matches(e, "mysql-a2")
     assert not rejoin_matches({"type": "rejoin", "rejoin": {"branch": "none", "node": "mysql-a1"}}, "mysql-a1")
+
+
+def test_failover_ignores_ok_of_a_write_sent_before_the_error():
+    # review finding 1: a pre-crash write whose ack lands 1 ms after the first error
+    oks = [ok(100 + i * 0.1) for i in range(100)]
+    oks.append({"client": 3, "seq": 9, "t_ok": 110.003, "latency_ms": 5.0, "t_start": 109.998})
+    oks += [{"client": 1, "seq": 50 + i, "t_ok": 118.0 + i * 0.1, "latency_ms": 2.0,
+             "t_start": 117.998 + i * 0.1} for i in range(5)]
+    st = analyze_acks(oks, [err(110.002)], inject_ts=110.0)
+    assert st.first_ok_after_ts == pytest.approx(118.0)
+    assert st.failover_s == pytest.approx(8.0)
+
+
+def test_ok_start_falls_back_to_latency():
+    from dbguard.harness.chaos import ok_start
+    assert ok_start({"t_ok": 10.0, "latency_ms": 500}) == pytest.approx(9.5)
+    assert ok_start({"t_ok": 10.0, "t_start": 9.9}) == 9.9

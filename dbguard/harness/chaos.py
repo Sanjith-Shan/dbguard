@@ -188,9 +188,18 @@ def nearest_rank(xs: list[float], q: float) -> float | None:
     return xs[max(1, math.ceil(q / 100 * len(xs))) - 1]
 
 
+def ok_start(r: dict) -> float:
+    """When the request of an ok row was sent. Old logs lack t_start, derive it."""
+    if r.get("t_start") is not None:
+        return float(r["t_start"])
+    return float(r["t_ok"]) - float(r.get("latency_ms") or 0) / 1000.0
+
+
 def analyze_acks(oks: list[dict], errs: list[dict], inject_ts: float | None,
                  window_end: float | None = None, stall_threshold_s: float = 1.0) -> AckStats:
-    """failover_s: inject -> first ok after the first error at/after inject. If there was no
+    """failover_s: inject -> first ok whose request STARTED after the first error at/after
+    inject (an ok that merely lands after the error can be a write the old primary committed
+    before the fault, which would make failover_s ~0). If there was no
     error (a stall without errors, e.g. semi-sync blocking commits), inject -> end of the
     largest ack gap that starts after inject - 1 s, when that gap exceeds stall_threshold_s.
     stall_s: the largest gap between consecutive acknowledged writes (all clients merged) in
@@ -211,8 +220,8 @@ def analyze_acks(oks: list[dict], errs: list[dict], inject_ts: float | None,
     st.errors_after_inject = len(after)
     if after:
         st.first_error_ts = after[0]
-        nxt = [t for t in t_ok if t > after[0]]
-        st.first_ok_after_ts = nxt[0] if nxt else None
+        nxt = [float(r["t_ok"]) for r in oks if ok_start(r) >= after[0]]
+        st.first_ok_after_ts = min(nxt) if nxt else None
     # largest ack gap around/after the injection
     lo = inject_ts - 1.0
     hi = window_end if window_end is not None else float("inf")
