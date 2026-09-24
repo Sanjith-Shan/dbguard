@@ -1310,13 +1310,17 @@ def sc_hang_process(run: Run) -> None:
         pid.append(int(mp))
         run.row["mysqld_pid"] = int(mp)
         docker.signal_pid(p, int(mp), "STOP")
+        state = docker.proc_state(p, int(mp))
+        run.row["mysqld_state_after_stop"] = state
+        if not state or not state.startswith("T"):
+            raise RuntimeError(f"mysqld {mp} in {p} is not stopped after SIGSTOP: {state}")
         note(run, f"hang mechanism: docker exec kill -STOP {mp} (mysqld only, agent alive)")
 
     def after(old: str, new: str | None) -> None:
         wake_at = run.row["inject_ts"] + o.hang_seconds
         while time.time() < wake_at:
             time.sleep(0.5)
-        docker.signal_pid(old, pid[0], "CONT")
+        docker.signal_pid(old, pid[0], "CONT", check=False)   # may be gone after a kill fence
         t_wake = time.time()
         run.row["wake_ts"] = t_wake
         now_pid = (agent(old).status() or {}).get("mysqld_pid")
@@ -1930,7 +1934,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def _interrupt(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: list[str] | None = None) -> int:
+    # A job started in the background by a non-interactive shell (nohup, bin/campaign) inherits
+    # SIGINT as ignored, so SIGINT and SIGTERM are turned into KeyboardInterrupt explicitly:
+    # the run's finally blocks then thaw frozen nodes, flush iptables and heal the set.
+    signal.signal(signal.SIGINT, _interrupt)
+    signal.signal(signal.SIGTERM, _interrupt)
     a = parse_args(argv)
     verify_mode(a.mode, a.rs)
     log(f"compose env pinned to the running fleet: {docker.pin_compose_env(set_nodes(a.rs))}")

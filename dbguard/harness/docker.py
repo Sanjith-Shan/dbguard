@@ -191,8 +191,18 @@ def pid_of_mysqld(container: str) -> int | None:
     return int(pids[0]) if pids else None
 
 
-def signal_pid(container: str, pid: int, sig: str) -> None:
-    exec_(container, ["kill", f"-{sig}", str(pid)], check=False)
+def signal_pid(container: str, pid: int, sig: str, *, check: bool = True) -> None:
+    """Send `sig` to `pid` inside the container. The node image has no /usr/bin/kill, only
+    the shell builtin, so this goes through sh. It raises unless check=False, because a
+    signal that silently failed to arrive turns a hang run into a no-fault run."""
+    exec_(container, ["sh", "-c", f"kill -{sig} {int(pid)}"], check=check)
+
+
+def proc_state(container: str, pid: int) -> str | None:
+    """The State line of /proc/<pid>/status ('T (stopped)', 'S (sleeping)', ...)."""
+    cp = exec_(container, ["sh", "-c", f"grep '^State:' /proc/{int(pid)}/status"], check=False,
+               mutate=False)
+    return cp.stdout.split(":", 1)[1].strip() if cp.returncode == 0 and ":" in cp.stdout else None
 
 
 # ---------------------------------------------------------------- network faults
