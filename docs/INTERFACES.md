@@ -11,7 +11,8 @@ authoritative over any module docstring.
 dbguard/                  Python 3.12 package (installed as `dbguard`)
   gtid.py                 GtidSet, pure Python, hypothesis-tested
   config.py               pydantic models, loads fleet.yaml
-  mysqlx.py               aiomysql helpers shared by agent and manager
+  mysqlx.py               TLS context and SHOW REPLICA STATUS parsing, shared
+  mysqlx_sync.py          PyMySQL client for the harness and dbgctl osc
   events.py               JSON event rows (schema below)
   agent/                  dbguard-agent (mysqld supervisor + HTTP :8080)
   manager/                dbguard (manager daemon, HTTP :9090)
@@ -64,9 +65,9 @@ docs/                     DESIGN, CAPACITY, RUNBOOK, BUGS, INTERFACES (this)
   uses `SOURCE_SSL=1` for the same reason. `dbguard/agent/db.py` has the agent's copy
   (`insecure_tls()`).
   The fleet re-verified it against the running compose fleet (a fresh `repl` login over
-  plain TCP fails, TLS succeeds). `dbguard/mysqlx.py` and `dbguard/mysqlx_sync.py` connect
-  with TLS by default (`tls=False` exists only for tests), and `bin/bootstrap`, `bin/workload`
-  and `bin/checker` go through them.
+  plain TCP fails, TLS succeeds). `dbguard/mysqlx_sync.py` connects with TLS by default
+  (`tls=False` exists only for tests) using the context in `dbguard/mysqlx.py`, and
+  `bin/bootstrap`, `bin/workload` and `bin/checker` go through it.
 - Schema `dbguard`:
   - `heartbeat(rs VARCHAR(16) PRIMARY KEY, ts TIMESTAMP(6), writer VARCHAR(64))` written by
     the primary's agent every 500 ms with `INSERT ... ON DUPLICATE KEY UPDATE`.
