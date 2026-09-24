@@ -19,7 +19,7 @@ other. Parse, then compare.
 from __future__ import annotations
 
 import re
-from typing import Iterable, Iterator
+from collections.abc import Iterable, Iterator
 
 Interval = tuple[int, int]
 Key = tuple[str, str]  # (uuid lowercase, tag lowercase or "")
@@ -51,8 +51,7 @@ def _normalize(intervals: Iterable[Interval]) -> tuple[Interval, ...]:
         if s > e:
             raise GtidParseError(f"bad interval {s}-{e}")
         if out and s <= out[-1][1] + 1:
-            if e > out[-1][1]:
-                out[-1][1] = e
+            out[-1][1] = max(out[-1][1], e)
         else:
             out.append([s, e])
     return tuple((s, e) for s, e in out)
@@ -97,7 +96,7 @@ def _intersect_iv(a: tuple[Interval, ...], b: tuple[Interval, ...]) -> tuple[Int
 class GtidSet:
     """Immutable, hashable GTID set."""
 
-    __slots__ = ("_m", "_hash")
+    __slots__ = ("_hash", "_m")
 
     def __init__(self, mapping: dict[Key, Iterable[Interval]] | None = None):
         m: dict[Key, tuple[Interval, ...]] = {}
@@ -110,7 +109,7 @@ class GtidSet:
 
     # construction -----------------------------------------------------------------
     @classmethod
-    def parse(cls, text: str | None) -> "GtidSet":
+    def parse(cls, text: str | None) -> GtidSet:
         if text is None:
             return cls()
         if isinstance(text, GtidSet):
@@ -153,7 +152,7 @@ class GtidSet:
         return cls(acc)
 
     @classmethod
-    def of(cls, uuid: str, *intervals: Interval | int, tag: str = "") -> "GtidSet":
+    def of(cls, uuid: str, *intervals: Interval | int, tag: str = "") -> GtidSet:
         ivs = [(i, i) if isinstance(i, int) else i for i in intervals]
         return cls({(_norm_uuid(uuid), tag.lower()): ivs})
 
@@ -189,12 +188,12 @@ class GtidSet:
         return False
 
     # algebra ----------------------------------------------------------------------
-    def union(self, other: "GtidSet") -> "GtidSet":
+    def union(self, other: GtidSet) -> GtidSet:
         other = _coerce(other)
         keys = set(self._m) | set(other._m)
         return GtidSet({k: self._m.get(k, ()) + other._m.get(k, ()) for k in keys})
 
-    def subtract(self, other: "GtidSet") -> "GtidSet":
+    def subtract(self, other: GtidSet) -> GtidSet:
         other = _coerce(other)
         out = {}
         for k, ivs in self._m.items():
@@ -202,27 +201,27 @@ class GtidSet:
             out[k] = _subtract_iv(ivs, o) if o else ivs
         return GtidSet(out)
 
-    def intersection(self, other: "GtidSet") -> "GtidSet":
+    def intersection(self, other: GtidSet) -> GtidSet:
         other = _coerce(other)
         return GtidSet(
             {k: _intersect_iv(ivs, other._m[k]) for k, ivs in self._m.items() if k in other._m}
         )
 
-    def is_subset(self, other: "GtidSet") -> bool:
+    def is_subset(self, other: GtidSet) -> bool:
         """GTID_SUBSET(self, other). The empty set is a subset of everything."""
         return self.subtract(_coerce(other)).is_empty
 
-    def is_superset(self, other: "GtidSet") -> bool:
+    def is_superset(self, other: GtidSet) -> bool:
         return _coerce(other).is_subset(self)
 
     __or__ = union
     __sub__ = subtract
     __and__ = intersection
 
-    def __le__(self, other: "GtidSet") -> bool:
+    def __le__(self, other: GtidSet) -> bool:
         return self.is_subset(other)
 
-    def __ge__(self, other: "GtidSet") -> bool:
+    def __ge__(self, other: GtidSet) -> bool:
         return self.is_superset(other)
 
     # identity ---------------------------------------------------------------------
@@ -262,7 +261,7 @@ class GtidSet:
             raise AttributeError("GtidSet is immutable")
 
 
-def _coerce(x: "GtidSet | str | None") -> GtidSet:
+def _coerce(x: GtidSet | str | None) -> GtidSet:
     if isinstance(x, GtidSet):
         return x
     return GtidSet.parse(x)
