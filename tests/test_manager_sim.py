@@ -224,9 +224,14 @@ async def test_naive_fails_over_on_probe_alone(sim_factory):
     ev = s.events("rs1", "failover")[0]
     assert ev.mode == "naive" and ev.steps.fence.outcome == "skipped"
     assert ev.steps.catchup.duration_s == 0.0
-    # naive did not fence: the old primary is still writable, a second writer, which the
-    # rejoin pass then fences
-    await s.until(lambda: s.fleet.nodes["mysql-a1"].fenced, what="second writer fenced")
+    # naive has no fence: the old primary stays writable, a split brain that is recorded
+    # and left alone for the harness to measure
+    await s.until(lambda: s.events("rs1", "split_brain"), what="split_brain event")
+    await asyncio.sleep(0.3)
+    assert not s.fleet.nodes["mysql-a1"].fenced
+    assert "/fence" not in s.fleet.nodes["mysql-a1"].calls
+    assert len(s.events("rs1", "split_brain")) == 1
+    assert s.fleet.primary_of("rs1") == ["mysql-a1", ev.new_primary]
 
 
 async def test_replicas_partitioned_stalls_then_fails_over(sim_factory):
@@ -357,7 +362,8 @@ async def test_planned_switchover_via_api(sim_factory):
         assert ev["type"] == "switchover" and ev["new_primary"] == "mysql-a3"
         assert ev["trigger"] == "planned" and ev["steps"]["catchup"]["ok"]
         assert s.fleet.primary_of("rs1") == ["mysql-a3"]
-        assert s.fleet.nodes["mysql-a1"].source == "mysql-a3"
+        await s.until(lambda: s.fleet.nodes["mysql-a1"].source == "mysql-a3",
+                      what="old primary repointed in the background")
         r = await c.get("/v1/sets/rs1/primary")
         assert (await r.json())["primary"] == "mysql-a3"
         # every write acknowledged before or after the switch is on the new primary
@@ -711,3 +717,44 @@ async def test_healthy_requires_streaming_replicas(sim_factory):
     await s.until(lambda: s.ctl().primary == "mysql-a1", what="discovered")
     await s.until(lambda: s.ctl().st.state == State.DEGRADED, what="DEGRADED")
     assert not s.events("rs1", "healthy")
+
+
+async def test_switchover_order_keeps_the_stall_short(sim_factory):
+    """Replicas move under the candidate BEFORE the quiesce, the stall is quiesce + catch-up +
+    promote only, and the old primary is repointed after the stall."""
+    s = await sim_factory(sets={"rs1": A}, catchup_deadline_s=15)
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    a1 = s.fleet.nodes["mysql-a1"]
+    n0 = a1.next_gno
+    await s.until(lambda: a1.next_gno > n0 + 3, what="writes")
+    s.fleet.nodes["mysql-a1"].repoint_delay = 0.5      # a slow START REPLICA on the old primary
+    s.fleet.log.clear()
+    from dbguard.manager.switchover import switchover
+    ev = await switchover(s.ctl(), "mysql-a3")
+    log = [(n, what) for _, n, what in s.fleet.log]
+    assert log.index(("mysql-a2", "repointed")) < log.index(("mysql-a1", "fenced"))
+    assert log.index(("mysql-a1", "fenced")) < log.index(("mysql-a3", "promoted"))
+    assert ("mysql-a1", "repointed") not in log[: log.index(("mysql-a3", "promoted"))]
+    assert ev.steps.prepare.nodes == ["mysql-a2"]
+    assert ev.stall_s is not None and ev.stall_s < 0.5, ev.stall_s
+    assert ev.stall_s <= ev.total_s
+    for k in ("fence", "catchup", "promote"):
+        assert getattr(ev.steps, k).duration_s <= ev.stall_s
+    await s.until(lambda: a1.source == "mysql-a3", what="old primary repointed after")
+    await s.until(lambda: any(e.rejoin and e.rejoin.node == "mysql-a1"
+                              for e in s.events("rs1", "rejoin")), what="rejoin event")
+    await s.until(lambda: s.fleet.acked["rs1"].is_subset(s.fleet.nodes["mysql-a3"].executed),
+                  what="lossless")
+
+
+async def test_switchover_two_node_set_repoints_old_primary_inside_the_stall(sim_factory):
+    s = await sim_factory(sets={"rs1": ["mysql-a1", "mysql-a2"]})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.log.clear()
+    from dbguard.manager.switchover import switchover
+    ev = await switchover(s.ctl(), "mysql-a2")
+    log = [(n, what) for _, n, what in s.fleet.log]
+    assert log.index(("mysql-a1", "repointed")) < log.index(("mysql-a2", "promoted"))
+    assert ev.steps.prepare is None and ev.steps.repoint.nodes == ["mysql-a1"]
+    assert "inside the stall" in ev.note

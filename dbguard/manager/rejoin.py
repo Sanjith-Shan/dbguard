@@ -63,9 +63,19 @@ async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
         if nv is None or not nv.usable:
             continue
         if nv.writable:
+            if ctl.mode == "naive":
+                # A naive tool has no fence. Record the split brain once and leave both
+                # writable, so the harness measures what a naive baseline really does.
+                if n not in ctl.split_noted:
+                    ctl.split_noted.add(n)
+                    ctl.event(type="split_brain", old_primary=n, new_primary=primary,
+                              note=f"{n} and {primary} are both writable; naive mode does "
+                                   f"not fence")
+                continue
             # A second writer. Fence first, think later (woken primary, stale manager).
             ctl.spawn_node_task(n, fence_second_writer(ctl, n, primary))
             continue
+        ctl.split_noted.discard(n)
         why = needs_rejoin(nv, primary)
         if why is None:
             ctl.manual_noted.discard(n)
@@ -92,8 +102,6 @@ async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> Non
         note = f"{n} was writable while {primary} is primary, fenced it"
     except AgentError as e:
         note = f"{n} is writable while {primary} is primary and fencing failed: {e}"
-    if ctl.mode == "naive":
-        note += " (naive mode borrows this safety net from dbguard mode)"
     ctl.event(type="rejoin", old_primary=n, new_primary=primary, note=note,
               rejoin=Rejoin(branch="none", node=n))
 

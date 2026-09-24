@@ -309,6 +309,15 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   reporting loss. The primary is declared dead only with at least one vote and votes
   strictly more than half of the witnesses. Zero witnesses stays SUSPECT. A DEGRADED set
   with one live replica can therefore fail over on that single witness.
+- `type` may also be `split_brain` (naive mode only: a node other than the primary is
+  writable. Naive mode has no fence, so it records the two writable nodes once and leaves
+  them alone. dbguard mode fences the second writer instead and records a `rejoin` event with
+  branch `none`).
+- A `switchover` event carries `stall_s` (quiesce start to the promote answer) and
+  `steps.prepare` (the replicas moved under the candidate before the quiesce). Its
+  `steps.repoint` is the old primary's repoint when it had to happen inside the stall (no
+  other replica attached to the candidate), otherwise empty, and the old primary's
+  background repoint is recorded as a `rejoin` event.
 - `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set) or
   `cold_start` (every node booted read-only, the replicas agree on a source that is not
   fenced and holds everything they hold, so the manager promoted it in place instead of

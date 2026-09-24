@@ -59,6 +59,7 @@ class SetController:
         self.verdict: Verdict | None = None
         self.backoff: dict[str, float] = {}
         self.manual_noted: set[str] = set()
+        self.split_noted: set[str] = set()
         self.busy: set[str] = set()             # nodes a maintenance task is working on
         self.maint: asyncio.Task | None = None
         self.unhealthy_since: float | None = None
