@@ -774,3 +774,36 @@ def test_wake_guard_env_default_and_off():
     assert AgentSettings.from_env({}).wake_guard is True
     assert AgentSettings.from_env({"DBGUARD_WAKE_GUARD": "0"}).wake_guard is False
     assert AgentSettings.from_env({"DBGUARD_RESTART_HOLD_S": "5"}).restart_hold_s == 5.0
+
+
+# --------------------------------------------------------------------------- heartbeat gate
+
+async def _run_heartbeat(agent, seconds):
+    agent.s.heartbeat_interval_s = 0.01
+    task = asyncio.create_task(agent._heartbeat())
+    await asyncio.sleep(seconds)
+    agent._stopping = True
+    await asyncio.wait_for(task, 2)
+
+
+async def test_heartbeat_writes_on_a_healthy_primary(settings):
+    db = FakeDB()
+    db.sro = 0
+    agent = make_agent(settings, db)
+    agent.startup_done.set()
+    await _run_heartbeat(agent, 0.1)
+    assert any(s.startswith("INSERT INTO dbguard.heartbeat") for s in db.log)
+
+
+async def test_heartbeat_waits_for_wake_guard_after_a_freeze(settings):
+    """Review #15. A thawed primary must not write a heartbeat (an unacked GTID) before
+    the wake guard has run, and here the guard fences it."""
+    db = FakeDB()
+    db.sro = 0
+    agent = make_agent(settings, db, manager=FakeManager("mysql-a2"))
+    agent.startup_done.set()
+    agent.last_tick -= 10  # frozen for 10 s
+    await _run_heartbeat(agent, 0.2)
+    assert "SET GLOBAL super_read_only=1" in db.log
+    assert not any(s.startswith("INSERT INTO dbguard.heartbeat") for s in db.log)
+    assert agent.fenced

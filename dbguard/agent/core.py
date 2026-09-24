@@ -761,6 +761,12 @@ class Agent:
             self._guard_task = asyncio.create_task(self.wake_guard(reason), name="wake-guard")
         return self._guard_task
 
+    def guard_pending(self) -> bool:
+        """A monotonic gap nobody has handled yet, or a wake guard still running."""
+        if time.monotonic() - self.last_tick > self.s.wake_gap_s:
+            return True
+        return self._guard_task is not None and not self._guard_task.done()
+
     async def ensure_awake(self) -> None:
         """Called by /primary so a frozen-then-thawed agent never answers stale."""
         now = time.monotonic()
@@ -794,7 +800,10 @@ class Agent:
         while not self._stopping:
             await asyncio.sleep(self.s.heartbeat_interval_s)
             self.m.heartbeat_stalled.set(0)
-            if self.fenced or self.rebuilding:
+            # After a freeze the wake guard runs before any heartbeat write, or the woken
+            # node would binlog an unacked heartbeat GTID (review #15).
+            await self.ensure_awake()
+            if self.fenced or self.rebuilding or self.guard_pending():
                 continue
             try:
                 if self._hb_session is None or self._hb_session.closed:
@@ -802,7 +811,8 @@ class Agent:
                 sess = self._hb_session
                 rows = await sess.query("SELECT @@GLOBAL.super_read_only AS sro",
                                         timeout=self.s.sql_timeout_s)
-                if _b(rows[0]["sro"]) is not False or self.fenced or self.rebuilding:
+                if (_b(rows[0]["sro"]) is not False or self.fenced or self.rebuilding
+                        or self.guard_pending()):
                     continue
                 self._hb_inflight_since = time.monotonic()
                 # A semi-sync stall blocks this for as long as the source timeout. That
