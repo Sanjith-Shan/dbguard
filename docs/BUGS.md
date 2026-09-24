@@ -205,3 +205,41 @@ heredocs and cache mounts already).
   that a torn line does not stop startup, also appended after it.
 - Fix. On open, the log checks the last byte and writes a newline if the file does not end
   with one. Every append is flushed and fsync'd.
+
+### Lagging replicas voted the primary dead through the heartbeat
+
+- Symptom. Under the 8-client workload on the real fleet, doctor said "2 of 2 replicas report
+  heartbeat stale for 97.9 s" about a healthy primary. The replicas were 94 and 98 s behind.
+  The primary survived only because the manager's own probe was passing. With the manager
+  partitioned (Experiment 4) that would have been a false failover.
+- How found. Reading `/v1/sets/rs1/doctor` on the real fleet during a five minute workload.
+- Fix. The heartbeat row is read after the SQL thread applied it, so its age includes the
+  apply lag. The vote now uses the age minus `Seconds_Behind_Source`. The IO thread and the
+  TCP check still vote directly. Orchestrator calls this case
+  UnreachableMasterWithLaggingReplicas and does not fail over either.
+
+### Cold start false failover
+
+- Symptom. After the whole fleet was stopped and started again with its volumes, rs2 failed
+  over from mysql-b1 to mysql-b2 on startup. The manager believed mysql-b1 was primary (both
+  replicas pointed at it), its probe failed because mysql-b1 had booted with
+  super_read_only=1 from my.cnf, and both replicas voted because the heartbeat row was
+  32545 s old from before the pause.
+- How found. The coordinator watching `make up` after a pause.
+- Fix. Two changes. At discovery, if no node is writable and the replicas agree on a source
+  that is reachable, not fenced, not itself replicating, and holds every transaction any
+  replica holds, the manager promotes it in place and records a `cold_start` event. A fenced
+  node is never promoted this way. And a heartbeat older than ten detection windows is no
+  longer a vote, since it was not written by a primary that was alive recently.
+
+### Two bootstraps at once on make up
+
+- Symptom. On `make up` the manager logged "no writable node, believing replicas' source"
+  for rs1 and a SUSPECT with error 1290 (read-only) on mysql-a1, two seconds before it went
+  HEALTHY.
+- How found. The rs1 event log on the real fleet. `bin/bootstrap` had configured the
+  replicas but not yet promoted mysql-a1 when the manager's first poll ran.
+- Fix. It was harmless (the SUSPECT cleared and no action was taken), and with the cold start
+  rule the manager now promotes mysql-a1 itself, which is idempotent with the script's
+  promote. Only one of them should bootstrap: when the manager container runs, `make up`
+  should leave bootstrapping to it.

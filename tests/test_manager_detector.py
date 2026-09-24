@@ -190,3 +190,12 @@ def test_lagging_replicas_do_not_vote_with_the_heartbeat():
                 lambda t: replica("r2", hb=98 + t, sbs=97 + t))
     v = evaluate(h, MEMBERS, P)
     assert v.kind == "SUSPECT" and v.replica_votes == 0
+
+
+def test_heartbeat_left_over_from_before_a_restart_is_not_a_vote():
+    """Cold start on the real fleet: the row was 32545 s old because the whole set had been
+    down, not because the primary just died. IO threads are fine, so no vote."""
+    h = history(30, bad_probe, lambda t: replica("r1", hb=32545 + t),
+                lambda t: replica("r2", hb=32545 + t))
+    v = evaluate(h, MEMBERS, P)
+    assert v.kind == "SUSPECT" and v.replica_votes == 0

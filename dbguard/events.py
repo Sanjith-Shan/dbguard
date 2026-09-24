@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 EventType = Literal[
     "failover", "switchover", "rejoin", "rebuild", "replace", "halt", "resume",
-    "suspect", "degraded", "healthy", "stall", "bootstrap",
+    "suspect", "degraded", "healthy", "stall", "bootstrap", "cold_start",
 ]
 Trigger = Literal["dead", "hung", "partition", "planned", "manual"]
 

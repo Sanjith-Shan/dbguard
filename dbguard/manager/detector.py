@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from dbguard.manager.model import NodeView, Observation
 
 
+HEARTBEAT_VOTE_MAX_WINDOWS = 10
+
+
 @dataclass(frozen=True)
 class DetectParams:
     mode: str = "dbguard"
@@ -87,8 +90,13 @@ def replica_vote(nv: NodeView, primary: str, window_s: float) -> list[str]:
         # merely behind shows an old heartbeat while its IO thread receives fine. Only
         # staleness not explained by apply lag is a vote (orchestrator calls the other
         # case UnreachableMasterWithLaggingReplicas and does not fail over).
+        # A row older than HEARTBEAT_VOTE_MAX_WINDOWS windows was not written by a primary
+        # that was alive recently: it is left over from before a restart of the whole set
+        # (cold start, found on the real fleet with a 32545 s old row). It says nothing
+        # about the primary now, so it is not a vote.
         lag = r.seconds_behind_source or 0
-        if nv.heartbeat_age_s - lag > window_s:
+        stale = nv.heartbeat_age_s - lag
+        if window_s < stale <= HEARTBEAT_VOTE_MAX_WINDOWS * window_s:
             out.append(f"heartbeat stale for {nv.heartbeat_age_s:.1f} s")
     return out
 

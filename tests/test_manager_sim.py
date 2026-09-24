@@ -64,7 +64,7 @@ async def sim_factory(tmp_path):
     made = []
 
     async def make(mode="dbguard", sets=None, spares=None, replicate=True, rejoin=None,
-                   provision=False, **kw):
+                   provision=False, start=True, **kw):
         sets = sets or {"rs1": A, "rs2": B}
         fleet = FakeFleet(sets, semisync=(mode == "dbguard"), spares=spares)
         if replicate:
@@ -82,7 +82,8 @@ async def sim_factory(tmp_path):
                       prober=FakeProber(fleet, cfg.probe_timeout_s),
                       provisioner=FakeProvisioner(fleet) if provision else None,
                       state_dir=str(tmp_path), rejoin=rejoin)
-        await mgr.start()
+        if start:
+            await mgr.start()
         s = Sim(fleet, mgr, cfg)
         made.append(s)
         return s
@@ -337,24 +338,30 @@ async def test_cooldown_blocks_second_automatic_failover(sim_factory):
 
 
 async def test_planned_switchover_via_api(sim_factory):
-    s = await sim_factory(sets={"rs1": A})
+    # Generous deadline: under a loaded full-suite run the simulation task can be starved
+    # long enough to miss a 2 s catch-up deadline, which aborts the switchover by design.
+    s = await sim_factory(sets={"rs1": A}, catchup_deadline_s=15)
     await s.healthy("rs1", "mysql-a1")
     s.fleet.writing = True
-    await asyncio.sleep(0.2)
-    app = make_app(s.mgr)
+    a1 = s.fleet.nodes["mysql-a1"]
+    start_gno = a1.next_gno
+    await s.until(lambda: a1.next_gno > start_gno + 3, what="some writes")
     from aiohttp.test_utils import TestClient, TestServer
-    async with TestClient(TestServer(app)) as c:
+    async with TestClient(TestServer(make_app(s.mgr))) as c:
         r = await c.post("/v1/sets/rs1/failover", json={"to": "mysql-a3"})
         body = await r.json()
         assert r.status == 200, body
         ev = body["event"]
         assert ev["type"] == "switchover" and ev["new_primary"] == "mysql-a3"
-        assert ev["trigger"] == "planned"
+        assert ev["trigger"] == "planned" and ev["steps"]["catchup"]["ok"]
         assert s.fleet.primary_of("rs1") == ["mysql-a3"]
         assert s.fleet.nodes["mysql-a1"].source == "mysql-a3"
         r = await c.get("/v1/sets/rs1/primary")
         assert (await r.json())["primary"] == "mysql-a3"
-        await asyncio.sleep(0.2)
+        # every write acknowledged before or after the switch is on the new primary
+        a3 = s.fleet.nodes["mysql-a3"]
+        await s.until(lambda: s.fleet.acked["rs1"].is_subset(a3.executed),
+                      what="acked writes on mysql-a3")
         lossless(s)
         # switching to a node that is not a member fails cleanly
         r = await c.post("/v1/sets/rs1/failover", json={"to": "mysql-b1"})
@@ -474,3 +481,33 @@ async def test_degraded_set_fails_over_to_its_last_replica(sim_factory):
     assert ev.new_primary == "mysql-a2"
     assert ev.detect.replica_votes == 1 and ev.detect.replica_total == 1
     lossless(s)
+
+
+async def test_cold_start_promotes_in_place(sim_factory):
+    """Whole set rebooted: every node read-only, replicas still point at mysql-a1, the
+    heartbeat row is hours old. Promote mysql-a1 in place, never fail over."""
+    fleet_sets = {"rs1": A}
+    s = await sim_factory(sets=fleet_sets, replicate=False, start=False)
+    s.fleet.setup_replication("rs1")
+    a1 = s.fleet.nodes["mysql-a1"]
+    a1.super_read_only = True
+    a1.semisync_source = False
+    for n in A:
+        s.fleet.nodes[n].heartbeat_ts = time.time() - 32545
+    await s.mgr.start()
+    await s.healthy("rs1", "mysql-a1")
+    assert [e.type for e in s.events("rs1", "cold_start")] == ["cold_start"]
+    assert not s.events("rs1", "failover")
+    assert s.fleet.primary_of("rs1") == ["mysql-a1"]
+
+
+async def test_cold_start_refused_when_a_replica_is_ahead(sim_factory):
+    s = await sim_factory(sets={"rs1": A}, replicate=False, start=False)
+    s.fleet.setup_replication("rs1")
+    a1, a2 = s.fleet.nodes["mysql-a1"], s.fleet.nodes["mysql-a2"]
+    a1.super_read_only = True
+    a2.executed = a2.executed | GtidSet.of(a1.uuid, (1, 5))    # a2 holds more than a1
+    await s.mgr.start()
+    await asyncio.sleep(0.5)
+    assert not s.events("rs1", "cold_start")
+    assert "/promote" not in a1.calls

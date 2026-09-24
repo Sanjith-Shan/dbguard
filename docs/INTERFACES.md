@@ -275,7 +275,13 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   reporting loss. The primary is declared dead only with at least one vote and votes
   strictly more than half of the witnesses. Zero witnesses stays SUSPECT. A DEGRADED set
   with one live replica can therefore fail over on that single witness.
-- `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set).
+- `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set) or
+  `cold_start` (every node booted read-only, the replicas agree on a source that is not
+  fenced and holds everything they hold, so the manager promoted it in place instead of
+  failing over).
+- A replica's heartbeat age counts as a vote only between `detect_window_s` and
+  `10 x detect_window_s` after subtracting its `seconds_behind_source`. A lagging replica, or
+  a row left over from before the whole set restarted, is not evidence that the primary died.
 - `rejoin` also carries `"node"`, the node that rejoined (for a rejoin event `old_primary`
   is that node too, and `new_primary` the primary it now follows).
 - `"clone":{"bytes":n,"duration_s":f,"mb_per_s":f|null,"donor":str}|null` on events whose
