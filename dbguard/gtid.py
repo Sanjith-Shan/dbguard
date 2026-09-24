@@ -1,19 +1,11 @@
-"""GTID set arithmetic, pure Python.
+"""GTID set arithmetic in pure Python, the one place DBGuard compares what nodes hold.
 
-A MySQL GTID set looks like ``3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5:8-10,<uuid2>:3``.
-MySQL 8.4 also allows tagged GTIDs, ``<uuid>:1-5:mytag:1-3``, where the intervals after a
-tag belong to ``<uuid>:mytag``. This module models a set as a mapping from
-``(uuid, tag)`` to a sorted tuple of non-overlapping, non-adjacent inclusive intervals.
-
-Semantics follow the server functions:
-
-- ``a.is_subset(b)`` is ``GTID_SUBSET(a, b)``
-- ``a.subtract(b)`` / ``a - b`` is ``GTID_SUBTRACT(a, b)``
-- ``len(a)`` / ``a.count()`` is the number of transactions in the set
-
-GTID sets must never be compared as strings. ``"u:1-3:4-5"`` and ``"u:1-5"`` are the same
-set, and ``"u:1-10"`` is a superset of ``"u:1-9"`` although neither string contains the
-other. Parse, then compare.
+Every failover decision reduces to it. Choosing the winner, the subset check that HALTs a
+diverged set, catch-up, and rejoin's repoint-or-rebuild are all ``is_subset`` and ``subtract``
+here, held to MySQL's ``GTID_SUBSET`` and ``GTID_SUBTRACT`` by hypothesis tests. A set is a map
+from ``(uuid, tag)`` to a sorted tuple of merged inclusive intervals, so equal sets have one
+representation. The trap it exists to avoid is comparing GTID strings. ``"u:1-3:4-5"`` equals
+``"u:1-5"``, and ``"u:1-10"`` holds ``"u:1-9"`` though neither string contains the other.
 """
 
 from __future__ import annotations
@@ -32,7 +24,7 @@ _MAX_GNO = (1 << 63) - 1
 
 
 class GtidParseError(ValueError):
-    pass
+    """The text is not a GTID set MySQL would accept."""
 
 
 def _norm_uuid(text: str) -> str:
@@ -58,6 +50,7 @@ def _normalize(intervals: Iterable[Interval]) -> tuple[Interval, ...]:
 
 
 def _subtract_iv(a: tuple[Interval, ...], b: tuple[Interval, ...]) -> tuple[Interval, ...]:
+    """The parts of sorted intervals ``a`` not covered by sorted intervals ``b``."""
     out: list[Interval] = []
     j = 0
     for s, e in a:
@@ -79,6 +72,7 @@ def _subtract_iv(a: tuple[Interval, ...], b: tuple[Interval, ...]) -> tuple[Inte
 
 
 def _intersect_iv(a: tuple[Interval, ...], b: tuple[Interval, ...]) -> tuple[Interval, ...]:
+    """The overlap of two sorted interval lists."""
     out: list[Interval] = []
     i = j = 0
     while i < len(a) and j < len(b):
@@ -110,6 +104,9 @@ class GtidSet:
     # construction -----------------------------------------------------------------
     @classmethod
     def parse(cls, text: str | None) -> GtidSet:
+        """Parse MySQL's text form, tolerating whitespace, newlines and upper case.
+
+        None and "" are the empty set. A GtidSet passes through unchanged."""
         if text is None:
             return cls()
         if isinstance(text, GtidSet):
@@ -153,20 +150,17 @@ class GtidSet:
 
     @classmethod
     def of(cls, uuid: str, *intervals: Interval | int, tag: str = "") -> GtidSet:
+        """Build a one-uuid set from ints and ``(start, end)`` pairs, mostly for tests."""
         ivs = [(i, i) if isinstance(i, int) else i for i in intervals]
         return cls({(_norm_uuid(uuid), tag.lower()): ivs})
 
     # views ------------------------------------------------------------------------
     def items(self) -> Iterator[tuple[Key, tuple[Interval, ...]]]:
+        """Iterate ``((uuid, tag), intervals)`` in sorted order."""
         return iter(self._m.items())
 
-    def uuids(self) -> list[str]:
-        return sorted({u for u, _ in self._m})
-
-    def intervals(self, uuid: str, tag: str = "") -> tuple[Interval, ...]:
-        return self._m.get((uuid.lower(), tag.lower()), ())
-
     def count(self) -> int:
+        """Number of transactions in the set."""
         return sum(e - s + 1 for ivs in self._m.values() for s, e in ivs)
 
     def __len__(self) -> int:
@@ -174,12 +168,14 @@ class GtidSet:
 
     @property
     def is_empty(self) -> bool:
+        """True when the set holds no transaction."""
         return not self._m
 
     def __bool__(self) -> bool:
         return bool(self._m)
 
     def contains(self, uuid: str, n: int, tag: str = "") -> bool:
+        """True when transaction ``uuid[:tag]:n`` is in the set."""
         for s, e in self._m.get((uuid.lower(), tag.lower()), ()):
             if s <= n <= e:
                 return True
@@ -189,11 +185,13 @@ class GtidSet:
 
     # algebra ----------------------------------------------------------------------
     def union(self, other: GtidSet) -> GtidSet:
+        """Every transaction in either set, ``a | b``."""
         other = _coerce(other)
         keys = set(self._m) | set(other._m)
         return GtidSet({k: self._m.get(k, ()) + other._m.get(k, ()) for k in keys})
 
     def subtract(self, other: GtidSet) -> GtidSet:
+        """GTID_SUBTRACT(self, other), ``a - b``. Rejoin counts phantoms with it."""
         other = _coerce(other)
         out = {}
         for k, ivs in self._m.items():
@@ -202,6 +200,7 @@ class GtidSet:
         return GtidSet(out)
 
     def intersection(self, other: GtidSet) -> GtidSet:
+        """Transactions in both sets, ``a & b``."""
         other = _coerce(other)
         return GtidSet(
             {k: _intersect_iv(ivs, other._m[k]) for k, ivs in self._m.items() if k in other._m}
@@ -212,6 +211,7 @@ class GtidSet:
         return self.subtract(_coerce(other)).is_empty
 
     def is_superset(self, other: GtidSet) -> bool:
+        """GTID_SUBSET(other, self)."""
         return _coerce(other).is_subset(self)
 
     __or__ = union
@@ -226,6 +226,7 @@ class GtidSet:
 
     # identity ---------------------------------------------------------------------
     def __eq__(self, other: object) -> bool:
+        """Set equality. A string operand is parsed first, never compared as text."""
         if isinstance(other, str):
             other = GtidSet.parse(other)
         if not isinstance(other, GtidSet):
@@ -238,6 +239,7 @@ class GtidSet:
         return self._hash
 
     def __str__(self) -> str:
+        """Canonical text, uuids sorted and untagged intervals before tagged ones."""
         by_uuid: dict[str, list[tuple[str, tuple[Interval, ...]]]] = {}
         for (u, t), ivs in self._m.items():
             by_uuid.setdefault(u, []).append((t, ivs))
@@ -262,13 +264,7 @@ class GtidSet:
 
 
 def _coerce(x: GtidSet | str | None) -> GtidSet:
+    """Accept a GtidSet or its text wherever a set is expected."""
     if isinstance(x, GtidSet):
         return x
     return GtidSet.parse(x)
-
-
-def gtid_count(text: str | None) -> int:
-    return GtidSet.parse(text).count()
-
-
-EMPTY = GtidSet()
