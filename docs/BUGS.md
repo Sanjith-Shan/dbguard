@@ -266,3 +266,37 @@ heredocs and cache mounts already).
   rule the manager now promotes mysql-a1 itself, which is idempotent with the script's
   promote. Only one of them should bootstrap: when the manager container runs, `make up`
   should leave bootstrapping to it.
+
+### Switchover stalled writes until the first replica reattached
+
+- Symptom. A planned switchover on the real fleet (rs1, mysql-a2 to mysql-a3, 4 clients)
+  stalled clients for 3.8 s although fence, catch-up and promote took 0.9 s together. The
+  new primary had semi-sync on and no replica connected, and the repoint of mysql-a1 spent
+  2.4 s in `START REPLICA`.
+- How found. Comparing the workload's first error and first success after the error with
+  the step durations in the switchover event.
+- Fix. The switchover now repoints every other node to the candidate before promoting it.
+  The candidate is read-only and already holds all of the old primary's transactions, so
+  replicas can attach early. The next switchover stalled clients for 0.89 s.
+
+### Switchover refused because two snapshots were taken at different moments
+
+- Symptom. `POST /v1/sets/rs1/failover {"to":"mysql-a2"}` answered 409 "mysql-a2 has 9
+  transactions the primary lacks" while every node's gtid_executed was identical a second
+  later.
+- How found. The second real switchover under the workload.
+- Fix. The errant transaction check compared the candidate's status with the primary's
+  status read a few milliseconds earlier while writes were flowing. It now runs after the
+  quiesce, against the final gtid_executed the fence returned, and rolls back by promoting
+  the old primary again if the candidate really holds something extra. A unit test then
+  showed that an empty final set ("") was treated as unknown and skipped the check, which
+  is also fixed.
+
+### A replacement replica was forgotten after a manager restart
+
+- Symptom. After the manager container was rebuilt, rs1 status showed mysql-a4, which had
+  been cloned in as a replacement, with role "spare", and a later switchover did not repoint
+  it, so it kept replicating from the old primary.
+- How found. `/v1/status` after restarting the dbguard container on the real fleet.
+- Fix. Membership lived only in memory. The reconcile pass now adopts the spare as a member
+  whenever it replicates from a member, so a restart rediscovers it.

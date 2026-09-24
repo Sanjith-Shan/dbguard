@@ -511,3 +511,26 @@ async def test_cold_start_refused_when_a_replica_is_ahead(sim_factory):
     await asyncio.sleep(0.5)
     assert not s.events("rs1", "cold_start")
     assert "/promote" not in a1.calls
+
+
+async def test_spare_already_replicating_is_adopted_after_restart(sim_factory):
+    s = await sim_factory(sets={"rs1": A}, spares={"rs1": "mysql-a4"}, start=False)
+    a4 = s.fleet.nodes["mysql-a4"]
+    s.fleet.start("mysql-a4")
+    a4.source, a4.semisync_replica = "mysql-a1", True
+    await s.mgr.start()
+    await s.healthy("rs1", "mysql-a1")
+    await s.until(lambda: "mysql-a4" in s.ctl().members, what="adopted")
+    assert s.ctl().status()["nodes"]["mysql-a4"]["role"] == "replica"
+
+
+async def test_switchover_refuses_candidate_with_errant_transactions(sim_factory):
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    a3 = s.fleet.nodes["mysql-a3"]
+    a3.executed = a3.executed | GtidSet.of(a3.uuid, 1)
+    from dbguard.manager.switchover import SwitchoverError, switchover
+    with pytest.raises(SwitchoverError, match="never had"):
+        await switchover(s.ctl(), "mysql-a3")
+    assert s.fleet.primary_of("rs1") == ["mysql-a1"]     # rolled back, still writable
+    assert s.ctl().primary == "mysql-a1"

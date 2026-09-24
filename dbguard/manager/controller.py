@@ -190,6 +190,8 @@ class SetController:
         from dbguard.manager.rejoin import rejoin_actions
         from dbguard.manager.replacement import maybe_replace
 
+        self._adopt_spare(ob)
+
         await rejoin_actions(self, ob)
 
         healthy = [n for n in self.members
@@ -215,6 +217,19 @@ class SetController:
                     f"missing {', '.join(missing) or 'none'}"))
             if self.st.state == State.DEGRADED:
                 await maybe_replace(self, ob, healthy)
+
+    def _adopt_spare(self, ob: Observation) -> None:
+        """A spare that replicates from the primary was made a member by an earlier
+        replacement. Membership lives in memory, so after a manager restart it is found
+        again here, otherwise it would be reported as a spare and never repointed."""
+        sp = self.scfg.spare
+        if sp and sp not in self.members:
+            nv = ob.nodes.get(sp)
+            if nv is not None and nv.usable and nv.replica.configured and \
+                    nv.replica.source_host in self.members:
+                self.members.append(sp)
+                log.info("spare is a member", rs=self.rs, node=sp,
+                         source=nv.replica.source_host)
 
     def _check_stall(self, ob: Observation, pv: NodeView | None) -> None:
         stalled = False
