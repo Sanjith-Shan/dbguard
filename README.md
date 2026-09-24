@@ -1,5 +1,7 @@
 # DBGuard
 
+![CI](https://github.com/Sanjith-Shan/dbguard/actions/workflows/ci.yml/badge.svg)
+
 MySQL 8.4 replica-set manager with lossless automated failover, in Python.
 
 DBGuard watches a fleet of MySQL replica sets, each one primary and two replicas on GTID
@@ -24,162 +26,107 @@ below publishes exactly that boundary.
 ## Results
 
 Every number is produced by `bin/chaos` and summarised by `bin/report` into
-`results/SUMMARY.md`. A tag of the form `[[N: what, source file]]` marks a number that has
-not been filled in from those files yet. Percentiles are nearest-rank. The tables below
-use the column names `bin/report` prints, with only the columns each experiment needs.
+`results/SUMMARY.md`. A tag of the form `[[N: what, source file]]` marks a number whose rows
+had not landed when this page was written, and `bin/fill-docs` fills it from those rows.
+Percentiles are nearest-rank. The tables use the column names `bin/report` prints, with only
+the columns each experiment needs.
 
-Environment. `[[N: host, Docker Desktop and MySQL version, results/SUMMARY.md]]`.
-`detect_window_s=5`, `probe_timeout_s=1`, three failed probes, 8 clients doing one
-autocommit `INSERT` at a time through HAProxy.
+Environment. MySQL 8.4.11 on Docker Desktop 4.71 (engine 29.4.1), Apple M3 Pro, a Docker VM
+with 12 CPUs and 7.7 GB of memory. `detect_window_s=5`, `probe_timeout_s=1`, three failed
+probes, 8 clients doing one autocommit `INSERT` at a time through HAProxy, a 30 s workload
+with the fault injected at 8 s. The campaign ran on 2026-09-24 and its configuration is
+tagged `campaign-config-2026-09-24`. The configuration changed twice during the campaign and
+[results/CONFIG_HISTORY.md](results/CONFIG_HISTORY.md) records which one each table ran
+under. The sentence under each table says the same.
 
 ### At a glance
 
 | | |
 |---|---|
-| Primary kills, DBGuard | `[[N: kill run count, results/kill_dbguard.jsonl]]` runs |
-| Acknowledged writes lost by DBGuard across every injection | **`[[N: dbguard lost acked writes total all scenarios except kill-two, results/*_dbguard.jsonl]]`** |
-| Acknowledged writes lost by the asynchronous baseline across the same kills | **`[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]`** |
-| Failover after a primary kill, median | **`[[N: kill failover p50, results/kill_dbguard.jsonl]]` s** |
-| False failovers with the manager partitioned from the primary | **`[[N: false failovers dbguard, results/partition-manager_dbguard.jsonl]]`** |
-| Commit latency cost of semi-sync at the median, no added delay | `[[N: commit p50 semisync on vs off at 0 ms netem, results/cost_dbguard.jsonl]]` |
+| Primary kills, DBGuard | 30 runs |
+| Acknowledged writes lost by DBGuard across every measured injection | **0** |
+| Acknowledged writes lost by the asynchronous baseline across its kills | **`[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]`** |
+| Failover after a primary kill, median | **8.83 s** |
+| False failovers with the manager partitioned from the primary | **0** of 30 |
+| Commit latency cost of semi-sync at the median, no added delay | +1.6 ms (5.9 ms on vs 4.2 ms off) |
 
-### Experiment 1. Primary killed
+### Primary killed
 
 `docker kill -s KILL` on the primary while the workload runs. Failover time is injection to
 the first successful write through HAProxy, measured on the clients' clock.
 
 | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | single-writer violations | converged |
 |---|---|---|---|---|---|---|---|---|
-| dbguard | `[[N: kill run count, results/kill_dbguard.jsonl]]` | `[[N: kill failover p50, results/kill_dbguard.jsonl]]` | `[[N: kill failover p99, results/kill_dbguard.jsonl]]` | `[[N: kill lost acked writes total, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard runs with loss, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard phantom writes, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard single-writer violations, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard converged runs, results/kill_dbguard.jsonl]]` |
+| dbguard | 30 | 8.83 | 9.75 | 0 | 0 | 0 | 0 | 30/30 |
 | naive | `[[N: kill naive run count, results/kill_naive.jsonl]]` | `[[N: kill naive failover p50, results/kill_naive.jsonl]]` | `[[N: kill naive failover p99, results/kill_naive.jsonl]]` | `[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]` | `[[N: kill naive runs with loss, results/kill_naive.jsonl]]` | `[[N: kill naive phantom writes, results/kill_naive.jsonl]]` | `[[N: kill naive single-writer violations, results/kill_naive.jsonl]]` | `[[N: kill naive converged runs, results/kill_naive.jsonl]]` |
-| orchestrator | `[[N: kill orchestrator run count, results/kill_orchestrator.jsonl]]` | `[[N: kill failover p50 orchestrator, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator failover p99, results/kill_orchestrator.jsonl]]` | `[[N: kill lost acked writes orchestrator, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator runs with loss, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator phantom writes, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator single-writer violations, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator converged runs, results/kill_orchestrator.jsonl]]` |
 
-The row to read first is the naive one. It runs asynchronous replication with no fence and
-no subset check, and it has to lose writes, because a baseline that loses nothing would mean
-the harness never landed a crash between commit and replication. Naive mode also decides on
-the manager's own probe alone and skips the fence, so its failover time is expected to be
-shorter than DBGuard's. That speed is what it bought with the lost writes, and the table
-shows both. If the Orchestrator row is faster than DBGuard's, that is reported as it stands.
+The dbguard row ran under the earlier `agent-live-primary-check` configuration (the agent
+answered HAProxy's health check with a live SQL query, HAProxy `fall 1`, before the rejoin
+quiescence fix), and its planned rerun was dropped at the deadline. About 9 s is the detection
+window (three failed probes plus `detect_window_s=5` of agreement from the replicas) followed
+by the fence, the catch-up and the promotion. The naive row runs asynchronous replication with
+no fence and no subset check, and it is expected to lose writes, because a baseline that loses
+nothing would mean the harness never landed a crash between commit and replication. It also
+decides on the manager's own probe alone, so it is expected to fail over faster. That speed is
+what it bought with the lost writes.
 
 Rejoin of the killed primary once its container is back.
 
 | scenario | mode | rejoins | repoint | rebuild | other | phantom GTIDs mean | phantom GTIDs max | rejoin p50 s | rejoin p99 s |
 |---|---|---|---|---|---|---|---|---|---|
-| kill | dbguard | `[[N: kill dbguard rejoins, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard rejoin repoint count, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard rejoin rebuild count, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard rejoin other count, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard phantom GTIDs per rebuild mean, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard phantom GTIDs per rebuild max, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard rejoin p50, results/kill_dbguard.jsonl]]` | `[[N: kill dbguard rejoin p99, results/kill_dbguard.jsonl]]` |
+| kill | dbguard | 30 | 5 | 25 | 0 | 3.37 | 8 | 4.46 | 16.55 |
 | kill | naive | `[[N: kill naive rejoins, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin repoint count, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin rebuild count, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin other count, results/kill_naive.jsonl]]` | `[[N: kill naive phantom GTIDs mean, results/kill_naive.jsonl]]` | `[[N: kill naive phantom GTIDs max, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin p50, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin p99, results/kill_naive.jsonl]]` |
-| kill | orchestrator | `[[N: kill orchestrator rejoins, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator rejoin repoint count, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator rejoin rebuild count, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator rejoin other count, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator phantom GTIDs mean, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator phantom GTIDs max, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator rejoin p50, results/kill_orchestrator.jsonl]]` | `[[N: kill orchestrator rejoin p99, results/kill_orchestrator.jsonl]]` |
 
-Repoint means the old primary's `gtid_executed` was a subset of the new primary's after
-crash recovery, so it rejoined with no data copy. Rebuild means it held transactions that
-reached its binary log but were never acknowledged to a client, and the phantom columns
-count how many of those the clone discarded. How often a crashed primary needs a rebuild is
-a property of the workload and the kill timing, not a constant. Orchestrator does not rejoin
-a dead primary itself, so in that row the harness did it through the agents and the runs
-land in `other`.
+Same configuration as the table above. Repoint means the old primary's `gtid_executed` was a
+subset of the new primary's after crash recovery, so it rejoined with no data copy. Rebuild
+means it held transactions that reached its binary log but were never acknowledged to a
+client, and the phantom columns count how many of those the clone discarded (the mean is over
+all 30 rejoins, repoints count as 0). Under 8 clients a crashed primary usually has a few
+unacknowledged transactions in its binary log, so 25 of 30 needed a clone.
 
-### Experiment 2. Primary hung
-
-The process is alive and TCP connects still succeed, which is the case that breaks tools
-that trust a connect. Two ways of freezing it. `hang-container` pauses the whole container
-with the cgroup freezer, agent included. `hang-process` sends `SIGSTOP` to `mysqld` alone,
-so the agent stays up and has to fence a `mysqld` that will not answer SQL. Both are woken
-90 s later.
-
-| scenario | mode | runs | failover p50 s | failover p99 s | lost acked writes | single-writer violations | converged | writes on woken primary |
-|---|---|---|---|---|---|---|---|---|
-| hang-container | dbguard | `[[N: hang-container dbguard run count, results/hang-container_dbguard.jsonl]]` | `[[N: hang failover p50, results/hang-container_dbguard.jsonl]]` | `[[N: hang-container dbguard failover p99, results/hang-container_dbguard.jsonl]]` | `[[N: hang-container dbguard lost acked writes, results/hang-container_dbguard.jsonl]]` | `[[N: hang-container dbguard single-writer violations, results/hang-container_dbguard.jsonl]]` | `[[N: hang-container dbguard converged runs, results/hang-container_dbguard.jsonl]]` | `[[N: hang-container dbguard writes on woken primary, results/hang-container_dbguard.jsonl]]` |
-| hang-container | naive | `[[N: hang-container naive run count, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive failover p50, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive failover p99, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive lost acked writes, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive single-writer violations, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive converged runs, results/hang-container_naive.jsonl]]` | `[[N: hang-container naive writes on woken primary, results/hang-container_naive.jsonl]]` |
-| hang-container | orchestrator | `[[N: hang-container orchestrator run count, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator failover p50, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator failover p99, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator lost acked writes, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator single-writer violations, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator converged runs, results/hang-container_orchestrator.jsonl]]` | `[[N: hang-container orchestrator writes on woken primary, results/hang-container_orchestrator.jsonl]]` |
-| hang-process | dbguard | `[[N: hang-process dbguard run count, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard failover p50, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard failover p99, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard lost acked writes, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard single-writer violations, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard converged runs, results/hang-process_dbguard.jsonl]]` | `[[N: hang-process dbguard writes on woken primary, results/hang-process_dbguard.jsonl]]` |
-| hang-process | naive | `[[N: hang-process naive run count, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive failover p50, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive failover p99, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive lost acked writes, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive single-writer violations, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive converged runs, results/hang-process_naive.jsonl]]` | `[[N: hang-process naive writes on woken primary, results/hang-process_naive.jsonl]]` |
-| hang-process | orchestrator | `[[N: hang-process orchestrator run count, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator failover p50, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator failover p99, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator lost acked writes, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator single-writer violations, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator converged runs, results/hang-process_orchestrator.jsonl]]` | `[[N: hang-process orchestrator writes on woken primary, results/hang-process_orchestrator.jsonl]]` |
-
-The last column is the one this experiment exists for. A frozen primary wakes up still
-believing it is the primary, with client connections that were mid-write. Its agent notices
-the gap in its own monotonic clock, asks the manager who the primary is and fences itself
-before HAProxy's next check, so any nonzero count in the DBGuard rows is a bug. In the
-`hang-process` rows the fence has to go through the kill path, because `SET GLOBAL
-super_read_only=1` never returns from a stopped process.
-
-### Experiment 3. Primary partitioned from its replicas
+### Primary partitioned from its replicas
 
 `iptables` drops the primary's traffic to both replicas, while the manager and HAProxy can
 still reach it. With semi-sync every commit on the primary now blocks.
 
 | mode | runs | failover p50 s | failover p99 s | stall p50 s | stall p99 s | lost acked writes | single-writer violations | old primary fenced |
 |---|---|---|---|---|---|---|---|---|
-| dbguard | `[[N: partition-replicas dbguard run count, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition failover p50, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition failover p99, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition stall_s p50, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition stall_s p99, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition-replicas dbguard lost acked writes, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition-replicas dbguard single-writer violations, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition-replicas dbguard runs with old primary fenced and fence outcome, results/partition-replicas_dbguard.jsonl]]` |
-| naive | `[[N: partition-replicas naive run count, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive failover p50, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive failover p99, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive stall p50, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive stall p99, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive lost acked writes, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive single-writer violations, results/partition-replicas_naive.jsonl]]` | `[[N: partition-replicas naive runs with old primary fenced, results/partition-replicas_naive.jsonl]]` |
+| dbguard | 30 | 11.58 | 14.23 | 9.98 | 10.54 | 0 | 0 | 30/30 (0 sql, 30 kill) |
 
-The stall columns are the availability cost the design chose. For that long, clients were
-waiting on commits that the primary refused to acknowledge because no replica could hold
-them. The naive primary keeps acknowledging writes that exist only on itself, so it may show
-no stall at all, and whatever it accepted during the partition is what goes missing after
-the failover. The last column comes from each row's `old_primary_fenced` field and the
-event's `steps.fence.outcome` (`sql` or `kill`), which `bin/report` does not tabulate.
+| scenario | mode | rejoins | repoint | rebuild | other | phantom GTIDs mean | phantom GTIDs max | rejoin p50 s | rejoin p99 s |
+|---|---|---|---|---|---|---|---|---|---|
+| partition-replicas | dbguard | 30 | 0 | 30 | 0 | 9.93 | 10 | 7.63 | 10.07 |
 
-### Experiment 4. Manager partitioned from the primary
+Measured under the final configuration (in-memory `/primary` check with a 2 s staleness
+bound, HAProxy `fall 2`, the rejoin quiescence fix). The stall columns are the availability
+cost the design chose. For about 10 s, clients waited on commits the primary refused to
+acknowledge because no replica could hold them. Failover takes about 2.5 s longer than after a
+kill because the primary still answers, so the replicas' votes carry the decision. Every fence
+went through the kill path, because a primary stuck in a semi-sync wait cannot run `SET
+GLOBAL super_read_only`. Every old primary was rebuilt, each holding 8 to 10 transactions that
+had reached its binary log during the stall and that no client was ever told committed. The
+spec asks the naive baseline only for kill and partition-manager, so there is no naive row.
+
+### Manager partitioned from the primary
 
 `iptables` in the manager's container cuts it off from the primary. The replicas and the
 clients are fine, so the correct action is no action.
 
-| mode | runs | false failovers | lost acked writes | converged | rs2 changes |
-|---|---|---|---|---|---|
-| dbguard | `[[N: partition-manager dbguard run count, results/partition-manager_dbguard.jsonl]]` | `[[N: false failovers dbguard, results/partition-manager_dbguard.jsonl]]` | `[[N: partition-manager dbguard lost acked writes, results/partition-manager_dbguard.jsonl]]` | `[[N: partition-manager dbguard converged runs, results/partition-manager_dbguard.jsonl]]` | `[[N: partition-manager dbguard rs2 changes, results/partition-manager_dbguard.jsonl]]` |
-| naive | `[[N: partition-manager naive run count, results/partition-manager_naive.jsonl]]` | `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive lost acked writes, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive converged runs, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive rs2 changes, results/partition-manager_naive.jsonl]]` |
-| orchestrator | `[[N: partition-manager orchestrator run count, results/partition-manager_orchestrator.jsonl]]` | `[[N: false failovers orchestrator, results/partition-manager_orchestrator.jsonl]]` | `[[N: partition-manager orchestrator lost acked writes, results/partition-manager_orchestrator.jsonl]]` | `[[N: partition-manager orchestrator converged runs, results/partition-manager_orchestrator.jsonl]]` | `[[N: partition-manager orchestrator rs2 changes, results/partition-manager_orchestrator.jsonl]]` |
+| mode | runs | false failovers | lost acked writes | converged |
+|---|---|---|---|---|
+| dbguard | 30 | 0 | 0 | 30/30 |
+| naive | `[[N: partition-manager naive run count, results/partition-manager_naive.jsonl]]` | `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive lost acked writes, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive converged runs, results/partition-manager_naive.jsonl]]` |
 
-DBGuard declares a primary dead only when its own probe fails and a majority of the
-replicas that can be asked also report losing it, so here it sits in `SUSPECT` and logs.
-Naive mode fails over on its own probe alone, and every false failover it makes is a real
-failover of a healthy primary, with the aborted transactions and the rejoin work that come
-with one. Orchestrator uses the same holistic idea, so it is expected to stay put too.
+The dbguard row ran under the earlier `agent-live-primary-check` configuration. In 9 of its
+30 runs the clients saw 8 or more errors although this scenario must see none. The cause was
+the health-check bug that configuration had (a slow live-SQL `/primary` answer made HAProxy
+mark a healthy primary down and cut every session), since fixed, and not a failover. DBGuard
+declares a primary dead only when its own probe fails and a majority of the replicas that can
+be asked also report losing it, so here it sits in `SUSPECT` and logs. Naive mode fails over
+on its own probe alone, and every false failover it makes is a real failover of a healthy
+primary.
 
-### Experiment 5. The cost of losslessness
-
-The same workload against the same fleet with semi-sync on and with
-`rpl_semi_sync_source_enabled=0`, with `tc netem delay` of 0, 2 and 20 ms added between the
-primary and its replicas. Each cell is the median across runs of that run's percentile.
-
-| mode | semi-sync | netem ms | runs | commit p50 ms | commit p99 ms | writes/s |
-|---|---|---|---|---|---|---|
-| dbguard | on | 0.00 | `[[N: cost runs on 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 on 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 0ms, results/cost_dbguard.jsonl]]` |
-| dbguard | on | 2.00 | `[[N: cost runs on 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 on 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 2ms, results/cost_dbguard.jsonl]]` |
-| dbguard | on | 20.00 | `[[N: cost runs on 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 on 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 20ms, results/cost_dbguard.jsonl]]` |
-| dbguard | off | 0.00 | `[[N: cost runs off 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 off 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 0ms, results/cost_dbguard.jsonl]]` |
-| dbguard | off | 2.00 | `[[N: cost runs off 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 off 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 2ms, results/cost_dbguard.jsonl]]` |
-| dbguard | off | 20.00 | `[[N: cost runs off 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p50 off 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 20ms, results/cost_dbguard.jsonl]]` |
-
-This is the price of the guarantee and it is not small. Every semi-sync commit waits for one
-replica to receive the transaction, flush its relay log and send the ack, so the added delay
-shows up in every commit, and with one write in flight per client the throughput falls with
-it. The off rows are the noise floor, since an asynchronous primary never waits for a
-replica. The 20 ms row is why a semi-sync replica belongs in the same region as its primary.
-[docs/CAPACITY.md](docs/CAPACITY.md) turns this table into a sizing guide.
-
-### Experiment 6. Replica loss and replacement
-
-Kill one replica of a two-replica set, and the set runs `DEGRADED` on the survivor. Kill the
-survivor too, and writes stall. Restore one, and writes resume. Then let `rebuild_after_s`
-(60 s) expire and the manager starts the spare, clones it from a healthy replica and joins
-it.
-
-| mode | runs | stall p50 s (no replica) | resume p50 s | clones | clone MB | clone s | clone MB/s | lost acked writes |
-|---|---|---|---|---|---|---|---|---|
-| dbguard | `[[N: replica-loss dbguard run count, results/replica-loss_dbguard.jsonl]]` | `[[N: stall_s with no semi-sync replica, results/replica-loss_dbguard.jsonl]]` | `[[N: replica-loss resume p50, results/replica-loss_dbguard.jsonl]]` | `[[N: replica-loss clones, results/replica-loss_dbguard.jsonl]]` | `[[N: clone MB p50, results/replica-loss_dbguard.jsonl]]` | `[[N: clone duration p50, results/replica-loss_dbguard.jsonl]]` | `[[N: clone MB/s p50, results/replica-loss_dbguard.jsonl]]` | `[[N: replica-loss dbguard lost acked writes, results/replica-loss_dbguard.jsonl]]` |
-
-Time to replace a lost replica, excluding the 60 s `rebuild_after_s` policy wait, was
-`[[N: time to replace p50, results/replica-loss_dbguard.jsonl]]` on
-`[[N: dataset size MB, results/replica-loss_dbguard.jsonl]]` of data.
-
-The stall column is deliberate and it is unflattering. With no replica alive to acknowledge,
-the primary stops completing commits instead of falling back to asynchronous replication,
-and the stall lasts exactly as long as the harness keeps both replicas down. The manager logs
-it as a `stall` event and `dbgctl doctor` says so in plain words. Clone throughput here is
-one SSD shared by donor and recipient inside one Docker VM, so it is a floor for this laptop
-and not a prediction for real hosts.
-
-### Experiment 7. Planned switchover
+### Planned switchover
 
 `dbgctl failover rs1` while the workload runs. The old primary goes read-only first, the
 candidate applies everything, then it is promoted.
@@ -188,47 +135,95 @@ candidate applies everything, then it is promoted.
 |---|---|---|---|---|---|---|
 | dbguard | `[[N: switchover run count, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p99, results/switchover_dbguard.jsonl]]` | `[[N: switchover client errors, results/switchover_dbguard.jsonl]]` | `[[N: switchover runs with errors, results/switchover_dbguard.jsonl]]` | `[[N: switchover lost acked writes, results/switchover_dbguard.jsonl]]` |
 
-The stall is the longest gap between consecutive acknowledged writes across all clients.
-Client errors are the connections HAProxy closed when the old primary was marked down, and a
-client that retries once reconnects to the new primary. A planned switchover cannot lose an
-acknowledged write, so a nonzero last column would be a bug.
+Measured under the final configuration (a 10-run rerun). An earlier 30-run table under the
+`agent-live-primary-check` configuration lost no acknowledged write, but its stall grew from
+0.6 s in the first runs to 24 s as the host ran into swap (p50 2.06 s, p99 24.02 s), which
+is why the health check was changed and the table rerun. Those rows are archived in
+`results/old-config/agent-live-primary-check/`. The stall is the longest gap between
+consecutive acknowledged writes across all clients. Client errors are the connections HAProxy
+closed when the old primary was marked down, and a client that retries once reconnects to the
+new primary. A nonzero last column would be a bug.
 
-### Disk full
+### The cost of losslessness
 
-The primary's binary log volume fills up while the workload runs.
+The same workload against the same fleet with semi-sync on and with
+`rpl_semi_sync_source_enabled=0`, with `tc netem delay` of 0, 2 and 20 ms added between the
+primary and its replicas, 60 s per run. Each cell is the median across runs of that run's
+percentile.
 
-| scenario | mode | runs | failover p50 s | failover p99 s | lost acked writes | single-writer violations | converged |
-|---|---|---|---|---|---|---|---|
-| disk-full | dbguard | `[[N: disk-full dbguard run count, results/disk-full_dbguard.jsonl]]` | `[[N: disk-full dbguard failover p50, results/disk-full_dbguard.jsonl]]` | `[[N: disk-full dbguard failover p99, results/disk-full_dbguard.jsonl]]` | `[[N: disk-full dbguard lost acked writes, results/disk-full_dbguard.jsonl]]` | `[[N: disk-full dbguard single-writer violations, results/disk-full_dbguard.jsonl]]` | `[[N: disk-full dbguard converged runs, results/disk-full_dbguard.jsonl]]` |
+| mode | semi-sync | netem ms | runs | commit p50 ms | commit p99 ms | writes/s |
+|---|---|---|---|---|---|---|
+| dbguard | on | 0 | 3 | 5.9 | 43.1 | 953 |
+| dbguard | on | 2 | 3 | 9.8 | 52.1 | 615 |
+| dbguard | on | 20 | 3 | 23.9 | 56.6 | 298 |
+| dbguard | off | 0 | 3 | 4.2 | 26.5 | 1389 |
+| dbguard | off | 2 | 3 | 4.4 | 43.6 | 1216 |
+| dbguard | off | 20 | 3 | 4.4 | 29.6 | 1309 |
 
-MySQL either waits on a full disk or, if a binlog write fails outright, aborts the server
-under the default `binlog_error_action=ABORT_SERVER`. Either way commits stop, the heartbeat
-goes stale on the replicas and the manager fails over. Which of the two the lab showed is
-`[[N: disk-full primary behaviour and failover outcome, results/disk-full_dbguard.jsonl]]`.
+Measured under the final configuration. This is the price of the guarantee and it is not
+small. With a local replica, semi-sync costs about 1.6 ms at the median and 31% of the
+throughput. With 2 ms of delay to the replicas the median commit rises by 5.4 ms and
+throughput halves. With 20 ms, the delay lands on every commit (23.9 ms against 4.4 ms) and
+throughput falls by 77%, because each client has one write in flight. The off rows are the
+noise floor, since an asynchronous primary never waits for a replica, and their p99 moves
+between 26 and 44 ms with the host's own noise. The 20 ms row is why a semi-sync replica
+belongs in the same region as its primary. [docs/CAPACITY.md](docs/CAPACITY.md) turns this
+table into a sizing guide.
 
 ### Two simultaneous losses, the published boundary
 
 The primary and the replica with the largest `Retrieved_Gtid_Set` are killed at the same
 instant.
 
-| scenario | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | converged |
-|---|---|---|---|---|---|---|---|---|
-| kill-two | dbguard | `[[N: kill-two dbguard run count, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard failover p50, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard failover p99, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard lost acked writes, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard runs with loss, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard phantom writes, results/kill-two_dbguard.jsonl]]` | `[[N: kill-two dbguard converged runs, results/kill-two_dbguard.jsonl]]` |
+| scenario | mode | runs | lost acked writes | runs with loss | phantom writes | failover | converged after heal |
+|---|---|---|---|---|---|---|---|
+| kill-two | dbguard | 11 | 0 | 0 | 0 | none, writes stall until an operator acts | 11/11 |
 
-This is the case semi-sync with `wait_for_replica_count=1` does not cover, and it is here so
-the limit is measured rather than asserted. A write acknowledged by the replica that died
-with the primary may exist on no surviving node. Nonzero losses in this row are the expected
-result and not a failure of the implementation. Closing the window takes three replicas and
-`wait_for_replica_count=2`, which costs the second-fastest ack in every commit and is not
-built here.
+Measured under the final configuration. This is the case semi-sync with
+`wait_for_replica_count=1` does not cover, and it is here so the limit is measured rather
+than asserted. In these 11 runs no acknowledged write was lost, but no run failed over
+either. The manager promotes the last survivor, which has no replica to acknowledge its
+commits, so every write stalls without limit. Both restarted nodes hold transactions the
+survivor lacks (9 of 11 runs recorded errant GTIDs on them), they need a clone, and a clone
+needs a replica donor that does not exist. Nothing moves until a human acts, here the harness
+heal after 120 s. A write acknowledged only by the replica that died with the primary can
+still exist on no surviving node, and these runs did not happen to land one. Closing the
+window takes three replicas and `wait_for_replica_count=2`, which is not built here.
+
+### Not yet measured
+
+These scenarios are built and described, and the harness runs them, but the campaign above
+did not measure them. Each will get a table when it has been run.
+
+- **Primary hung** (`hang-container` freezes the whole container with the cgroup freezer,
+  `hang-process` sends `SIGSTOP` to `mysqld` alone so the agent must fence through the kill
+  path). The measurement is writes accepted by the woken primary. Four archived
+  `hang-container` runs found the woken-primary rejoin divergence bug described below. It is
+  fixed and the rerun is pending.
+- **Replica loss and replacement** (both replicas lost, writes stall, one restored, the spare
+  cloned in after `rebuild_after_s`). One run exists in `results/`, not enough for a table.
+- **Disk full** (the primary's binary log volume fills up while the workload runs).
+- **Every Orchestrator baseline** (kill, hang-container, partition-manager).
+- **kill-two with recovery**, the rerun with the donor-of-last-resort recovery, where the
+  stalled survivor itself serves as the clone donor so the set heals without an operator.
 
 ### Fleet isolation
 
-Every injection runs against `rs1` while the manager also runs `rs2`. Across
-`[[N: total rs1 injections, results/*.jsonl]]` injections, `rs2` changed state
-`[[N: rs2 state changes total across all rs1 injections, results/*.jsonl]]` times. Each set
-has its own loop, state machine, cooldown and event stream, and this is the number that
-shows a bug in per-set state would have been caught.
+Every injection runs against `rs1` while the manager also runs `rs2`. `rs2` changed state 54
+times, all of them in the kill and partition-manager tables run under the earlier
+configuration, where the live-SQL health check flapped on the untouched set too. Under the
+final configuration it changed state 0 times across the other tables.
+
+### Bugs found while building it
+
+[docs/BUGS.md](docs/BUGS.md) has 36 entries, each with the symptom, the cause and the fix. The
+three that mattered most. A primary frozen and then woken committed its clients' in-flight
+transactions after the manager had already judged it a subset of the new primary, so it was
+repointed while holding errant GTIDs (silent divergence, now caught by quiescing first and
+checking again after the repoint). The agent answered HAProxy's health check with a live SQL
+query, and one slow answer under load made HAProxy mark a healthy primary down and cut every
+client. And `mysqld` was OOM-killed at its 700 MiB container limit the moment `START REPLICA` spawned
+16 applier workers, which once left a new primary with no replica to acknowledge its writes.
 
 ## How it works
 
@@ -397,7 +392,7 @@ failing clone, a dead manager, the woken primary, a full disk, and "writes are f
 **Naive mode** (`--mode naive`, fleet started with `make up-naive`) is a deliberately careless
 version of the same program. Asynchronous replication, detection from the manager's probe
 alone, no fence, promote the most advanced replica, no subset check. It is real and runnable,
-and it exists to show that each of those steps changes a number. Its losses in Experiment 1
+and it exists to show that each of those steps changes a number. Its losses in the kill table
 come from the one thing asynchronous replication cannot do, which is keep a write the primary
 acknowledged before any replica received it.
 
@@ -411,11 +406,12 @@ UI and a Raft mode for its own availability. What DBGuard adds by default is fen
 primary itself down to killing the process, refusing to promote when replicas have diverged,
 deciding by GTID subset whether a crashed primary may be repointed or must be rebuilt, the
 clone rebuild, and replacement of a lost replica. The comparison is in
-[DESIGN.md section 10](docs/DESIGN.md#10-the-baselines).
+[DESIGN.md section 10](docs/DESIGN.md#10-the-baselines). The Orchestrator runs are built but
+were not part of this campaign, so there are no Orchestrator numbers yet.
 
 ## Bugs found while building it
 
-[docs/BUGS.md](docs/BUGS.md) has `[[N: BUGS.md entry count, docs/BUGS.md]]` entries, each with
+[docs/BUGS.md](docs/BUGS.md) has 36 entries, each with
 the symptom, how it was found and the fix. Among them are a `Retrieved_Gtid_Set` that is not
 cumulative, so "largest retrieved set" could pick the wrong winner, a fenced old primary that
 voted the new primary dead, the empty GTID set passing every subset check, a semi-sync stall

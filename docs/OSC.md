@@ -1,3 +1,5 @@
+The numbers on this page are preliminary. They come from a single throwaway container while a chaos campaign shared the CPU.
+
 # Online schema change (`dbgctl osc`)
 
 `dbgctl osc` changes the schema of a live table without blocking writes for the length of the copy. It follows the shadow table recipe of Facebook's OnlineSchemaChange (OSC) and of Percona's pt-online-schema-change. It builds an altered empty copy of the table, keeps it current with triggers, copies the existing rows in small primary key chunks, checksums the two tables chunk by chunk, and swaps them with a single `RENAME TABLE`. When MySQL 8.4 can do the change as `ALGORITHM=INSTANT`, the tool does that instead and says so, because a metadata-only change beats any copy.

@@ -1,21 +1,21 @@
 # DBGuard capacity plan
 
-This is the structure of the capacity plan and the arithmetic behind it. Every measured number is a tag of the form `[[N: what, source file]]` until `bin/report` fills it from `results/`. The lab is six `mysqld` in Docker Desktop on one Apple M3 Pro laptop, so absolute numbers describe that laptop. The ratios and the shape of the curves are the part that transfers.
+This is the structure of the capacity plan and the arithmetic behind it. Every measured number comes from `results/SUMMARY.md`, and a tag of the form `[[N: what, source file]]` marks one whose rows had not landed when this was written. `results/CONFIG_HISTORY.md` records the configuration each table ran under. The lab is six `mysqld` in Docker Desktop on one Apple M3 Pro laptop, so absolute numbers describe that laptop. The ratios and the shape of the curves are the part that transfers.
 
 ## 1. What losslessness costs per commit
 
-Experiment 5 runs the standard workload (8 clients, one autocommit `INSERT` at a time, through HAProxy) against the same fleet with semi-sync on and with `rpl_semi_sync_source_enabled=0`, and with `tc netem delay` of 0, 2 and 20 ms added between the primary and its replicas. Each cell is `[[N: ...]]` from `results/cost_dbguard.jsonl`, 30 runs per cell.
+The cost experiment runs the standard workload (8 clients, one autocommit `INSERT` at a time, through HAProxy) against the same fleet with semi-sync on and with `rpl_semi_sync_source_enabled=0`, and with `tc netem delay` of 0, 2 and 20 ms added between the primary and its replicas. Each cell comes from `results/cost_dbguard.jsonl`, 3 runs of 60 s per cell, under the final campaign configuration.
 
 | Semi-sync | Added delay | Commit p50 (ms) | Commit p99 (ms) | Writes/s |
 |---|---|---|---|---|
-| off | 0 ms | `[[N: cost p50 off 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 0ms, results/cost_dbguard.jsonl]]` |
-| on | 0 ms | `[[N: cost p50 on 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 0ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 0ms, results/cost_dbguard.jsonl]]` |
-| off | 2 ms | `[[N: cost p50 off 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 2ms, results/cost_dbguard.jsonl]]` |
-| on | 2 ms | `[[N: cost p50 on 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 2ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 2ms, results/cost_dbguard.jsonl]]` |
-| off | 20 ms | `[[N: cost p50 off 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 off 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps off 20ms, results/cost_dbguard.jsonl]]` |
-| on | 20 ms | `[[N: cost p50 on 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost p99 on 20ms, results/cost_dbguard.jsonl]]` | `[[N: cost wps on 20ms, results/cost_dbguard.jsonl]]` |
+| off | 0 ms | 4.2 | 26.5 | 1389 |
+| on | 0 ms | 5.9 | 43.1 | 953 |
+| off | 2 ms | 4.4 | 43.6 | 1216 |
+| on | 2 ms | 9.8 | 52.1 | 615 |
+| off | 20 ms | 4.4 | 29.6 | 1309 |
+| on | 20 ms | 23.9 | 56.6 | 298 |
 
-The primary also reports its own view of the wait, `Rpl_semi_sync_source_tx_avg_wait_time` in microseconds, which was `[[N: avg semi-sync wait us per netem level, results/cost_dbguard.jsonl]]`.
+The primary also reports its own view of the wait, `Rpl_semi_sync_source_tx_avg_wait_time` in microseconds. It is not published here, because it is an average over the server's whole lifetime and not over one run, so it mixes every earlier variant into each cell (the rows record it, and it even reads higher with semi-sync off).
 
 ### How to read it
 
@@ -29,7 +29,7 @@ What the table means for placement. A replica in the same zone (the 2 ms row) is
 
 ### The stall
 
-With the one-hour timeout, a primary with no replica able to ack does not fall back to asynchronous replication. Commits stop. In Experiment 6 the stall lasted `[[N: stall_s with no semi-sync replica, results/replica-loss_dbguard.jsonl]]`, which is exactly as long as the harness kept both replicas down. In Experiment 3 (primary partitioned from its replicas) clients were stalled for `[[N: partition stall_s p50, results/partition-replicas_dbguard.jsonl]]` median and `[[N: partition stall_s p99, results/partition-replicas_dbguard.jsonl]]` p99 before the failover restored writes. These are the availability price of the guarantee and they are published as such.
+With the one-hour timeout, a primary with no replica able to ack does not fall back to asynchronous replication. Commits stop. In the one replica-loss run so far (the full table is not yet measured) the stall lasted 22.44 s, which is exactly as long as the harness kept both replicas down. With the primary partitioned from its replicas clients were stalled for 9.98 s median and 10.54 s p99 before the failover restored writes. These are the availability price of the guarantee and they are published as such.
 
 ## 2. The failover budget
 
@@ -58,12 +58,12 @@ With the defaults in `deploy/fleet.yaml` and `my.cnf`, and HAProxy's `inter 500m
 | `T_evidence` | 2.5 s | max(poll 0.5 + probe timeout 1.0, poll 0.5 + `replica_net_timeout` 2) |
 | `detect_window_s` | 5.0 s | `fleet.yaml` |
 | `T_fence` | 3.0 s | `fence_deadline_s` |
-| `T_choose` | `[[N: choose step p99, results/kill_dbguard.jsonl]]` | measured |
+| `T_choose` | 0.17 s | measured |
 | `T_catchup` | 30.0 s | `catchup_deadline_s`, usually close to zero |
-| `T_repoint` | 30 s | the agent's role-change budget (the manager waits 35 s). Measured `[[N: repoint step p50, results/kill_dbguard.jsonl]]` |
-| `T_promote` | `[[N: promote step p99, results/kill_dbguard.jsonl]]` | measured, bounded by the agent's 30 s role-change budget |
+| `T_repoint` | 30 s | the agent's role-change budget (the manager waits 35 s). Measured 0.17 s |
+| `T_promote` | 0.52 s | measured, bounded by the agent's 30 s role-change budget |
 | `T_proxy` | 0.5 s | rise 1 times inter 0.5 s |
-| `T_client` | `[[N: client reconnect gap p50, results/kill_dbguard.jsonl]]` | measured |
+| `T_client` | not isolated | no row field separates the client's reconnect from the failover. The kill rows' reconnect gap, 8.85 s median, is injection to reconnect and includes everything above |
 
 In the common case the winner has no relay backlog and the repoint finishes inside the fence deadline, so the budget is 2.5 + 5 + 3 + 0.5 = 11 s plus the promote and the client reconnect. The bounded worst case, with catch-up and repoint both using their whole budgets and the promote its 30 s, is 2.5 + 5 + 30 + 30 + 30 + 0.5 = 98 s plus the stop and choose terms, which is where a failover would end rather than a number anyone should plan around. Each step's duration comes from the event rows, so a slow failover can be attributed to one term.
 
@@ -73,12 +73,12 @@ The measured distribution follows.
 
 | Scenario | Failover p50 | Failover p99 | Runs |
 |---|---|---|---|
-| primary killed | `[[N: kill failover p50, results/kill_dbguard.jsonl]]` | `[[N: kill failover p99, results/kill_dbguard.jsonl]]` | `[[N: kill run count, results/kill_dbguard.jsonl]]` |
-| primary frozen | `[[N: hang failover p50, results/hang-container_dbguard.jsonl]]` | `[[N: hang failover p99, results/hang-container_dbguard.jsonl]]` | `[[N: hang run count, results/hang-container_dbguard.jsonl]]` |
-| primary partitioned from replicas | `[[N: partition failover p50, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition failover p99, results/partition-replicas_dbguard.jsonl]]` | `[[N: partition run count, results/partition-replicas_dbguard.jsonl]]` |
+| primary killed | 8.83 s | 9.75 s | 30 |
+| primary frozen | not yet measured | | |
+| primary partitioned from replicas | 11.58 s | 14.23 s | 30 |
 | planned switchover (client stall) | `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p99, results/switchover_dbguard.jsonl]]` | `[[N: switchover run count, results/switchover_dbguard.jsonl]]` |
 | naive, primary killed | `[[N: kill failover p50 naive, results/kill_naive.jsonl]]` | `[[N: kill failover p99 naive, results/kill_naive.jsonl]]` | `[[N: kill run count naive, results/kill_naive.jsonl]]` |
-| Orchestrator, primary killed | `[[N: kill failover p50 orchestrator, results/kill_orchestrator.jsonl]]` | `[[N: kill failover p99 orchestrator, results/kill_orchestrator.jsonl]]` | `[[N: kill run count orchestrator, results/kill_orchestrator.jsonl]]` |
+| Orchestrator, primary killed | not yet measured | | |
 
 ## 3. Picking detect_window and probe_timeout
 
@@ -94,7 +94,7 @@ A procedure for a team.
 2. Set `probe_timeout_s` above the p99.9 of a probe write under peak load, so a slow write is not a failed probe.
 3. Set `detect_window_s` to a margin above the longest normal stall from step 1.
 4. Check the budget in section 2 against the recovery objective. If the sum is too long, the fix is usually to shorten the stalls, not the window.
-5. Run the manager-partition experiment and a hang shorter than the window. The false failover count has to stay zero. It was `[[N: false failovers dbguard, results/partition-manager_dbguard.jsonl]]` for DBGuard and `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` for naive mode.
+5. Run the manager-partition experiment and a hang shorter than the window. The false failover count has to stay zero. It was 0 for DBGuard and `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` for naive mode.
 
 ## 4. Sizing a replica set
 
@@ -126,7 +126,7 @@ The lab hit both sides of this (`docs/BUGS.md`, measured on the M3 Pro).
 The rule a team can use has two halves.
 
 1. **Enough parallelism.** Pick `replica_parallel_workers` so the replica's sustained apply rate exceeds the primary's peak commit rate with margin, measured under the real write mix. `replica_preserve_commit_order=ON` keeps replicas' commit order equal to the primary's, which the GTID subset reasoning assumes. Check it by sampling `Seconds_Behind_Source` (or heartbeat age) through a peak. It must stay flat, not merely small. A lag that grows at r seconds per second leaves `catchup_deadline_s / r` seconds of peak load before a failover can no longer finish.
-2. **Memory for that parallelism.** Every worker has its own buffers, and they are allocated at `START REPLICA`, which is exactly when a failover or rejoin runs. A replica sized for its idle footprint dies at the worst moment. Size the container for the loaded peak with the chosen worker count plus headroom, and remember that a repoint restarts the workers. The replica's memory under load with 8 workers is `[[N: node mem loaded MB, docker stats]]` in section 7.
+2. **Memory for that parallelism.** Every worker has its own buffers, and they are allocated at `START REPLICA`, which is exactly when a failover or rejoin runs. A replica sized for its idle footprint dies at the worst moment. Size the container for the loaded peak with the chosen worker count plus headroom, and remember that a repoint restarts the workers. The fleet's spot checks put a loaded replica with 8 workers near 549 MiB (section 7, and `results/disk.log` for the campaign's own samples).
 
 ## 6. Clone throughput and time to replace
 
@@ -141,25 +141,18 @@ T_replace = rebuild_after_s                         (120 s in the lab, a policy 
 
 | Measure | Value |
 |---|---|
-| dataset size in the experiment | `[[N: dataset size MB, results/replica-loss_dbguard.jsonl]]` |
-| clone throughput | `[[N: clone MB/s p50, results/replica-loss_dbguard.jsonl]]` |
-| clone duration | `[[N: clone duration p50, results/replica-loss_dbguard.jsonl]]` |
-| restart after clone | `[[N: post-clone restart p50, results/replica-loss_dbguard.jsonl]]` |
-| total time to replace, excluding `rebuild_after_s` | `[[N: time to replace p50, results/replica-loss_dbguard.jsonl]]` |
-| rejoin by rebuild after a primary kill | `[[N: rejoin rebuild duration p50, results/kill_dbguard.jsonl]]` |
-| rejoin by repoint after a primary kill | `[[N: rejoin repoint duration p50, results/kill_dbguard.jsonl]]` |
+| dataset size in the experiment | 200.0 MB |
+| clone throughput | 128.3 MB/s |
+| clone duration | 7.31 s |
+| restart after clone | 0.22 s |
+| total time to replace, excluding `rebuild_after_s` | 7.53 s |
+| rejoin by rebuild after a primary kill | 5.78 s |
+| rejoin by repoint after a primary kill | 0.10 s |
 
 For a larger dataset, extrapolate linearly from the measured throughput only as a first guess. In the lab donor and recipient share one SSD and one Docker VM, so the clone competes with itself for disk. Between real hosts the limit is usually the network or the donor's read rate, and the clone's effect on the donor matters, which is why DBGuard always clones from a replica. Catch-up grows with the primary's write rate times the clone duration, so a very busy primary can make a large clone chase its tail.
 
 ## 7. Footprint of the lab
 
-Read from `docker stats --no-stream` with the fleet idle and under the standard workload.
-
-| Component | Count | Memory each, idle | Memory each, loaded | CPU each, loaded |
-|---|---|---|---|---|
-| node container (`mysqld` + agent) | 8 (6 active, 2 spares) | `[[N: node mem idle MB, docker stats]]` | `[[N: node mem loaded MB, docker stats]]` | `[[N: node cpu loaded pct, docker stats]]` |
-| manager | 1 | `[[N: manager mem MB, docker stats]]` | `[[N: manager mem loaded MB, docker stats]]` | `[[N: manager cpu loaded pct, docker stats]]` |
-| HAProxy | 1 | `[[N: haproxy mem MB, docker stats]]` | `[[N: haproxy mem loaded MB, docker stats]]` | `[[N: haproxy cpu loaded pct, docker stats]]` |
-| agent process alone | 8 | `[[N: agent RSS MB, ps inside container]]` | | |
+A full `docker stats` table for every component was not taken in this campaign. The spot checks below are from `docs/BUGS.md`, and `results/disk.log` has the campaign's own disk and memory samples.
 
 The `mysqld` numbers are dominated by `innodb_buffer_pool_size` (128M here), the per-connection buffers and the applier workers, so they reflect the lab's `my.cnf`, not what MySQL needs in production. Each node runs with `mem_limit: 1g`. The fleet's own spot checks in `docs/BUGS.md` put an idle node at 397.6 MiB and a loaded replica with 8 workers at a plateau near 549 MiB, which is why seven active nodes, HAProxy, the manager and Orchestrator fit in the 7.7 GB Docker VM even though seven limits add up to 7 GiB.
