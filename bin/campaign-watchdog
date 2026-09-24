@@ -114,6 +114,24 @@ def wait_healthy(timeout: float = 600) -> bool:
     return False
 
 
+FLEET = ["mysql-a1", "mysql-a2", "mysql-a3", "mysql-b1", "mysql-b2", "mysql-b3", "haproxy",
+         "dbguard"]
+
+
+def fleet_down() -> list[str]:
+    r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
+    up = set(r.stdout.split())
+    return [c for c in FLEET if c not in up]
+
+
+def bring_up() -> bool:
+    r = subprocess.run(["make", "up"], cwd=REPO, capture_output=True, text=True)
+    log(f"make up rc={r.returncode}")
+    ok = wait_healthy()
+    log("both sets HEALTHY" if ok else "sets not HEALTHY after 10 min")
+    return ok
+
+
 def recover_engine() -> bool:
     log("docker info failed, running open -a Docker")
     subprocess.run(["open", "-a", "Docker"])
@@ -127,13 +145,8 @@ def recover_engine() -> bool:
         log("docker engine still down after 10 min")
         return False
     time.sleep(10)
-    # up the fleet in the mode the campaign's next entry needs (make up is dbguard; the
-    # campaign itself recreates naive when it gets there)
-    r = subprocess.run(["make", "up"], cwd=REPO, capture_output=True, text=True)
-    log(f"make up rc={r.returncode}")
-    ok = wait_healthy()
-    log("both sets HEALTHY" if ok else "sets not HEALTHY after 10 min")
-    return ok
+    # make up is the dbguard fleet; the campaign itself recreates naive when it gets there
+    return bring_up()
 
 
 def start_campaign() -> None:
@@ -183,6 +196,11 @@ def main() -> int:
                 main._disk_logged = True
             time.sleep(60)
             continue
+        if not pid_alive(PIDFILE) and fleet_down():
+            log(f"campaign not running and containers down: {fleet_down()}")
+            if not bring_up():
+                time.sleep(60)
+                continue
         if not pid_alive(PIDFILE):
             st = sets_state()
             if not st or not all(v.get("state") == "HEALTHY" for v in st.values()):
