@@ -36,3 +36,7 @@ markers = ["integration: needs the docker fleet, skips when it is not up"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# Pinned to ruff's classic defaults so a ruff upgrade does not change what CI enforces.
+select = ["E4", "E7", "E9", "F"]
