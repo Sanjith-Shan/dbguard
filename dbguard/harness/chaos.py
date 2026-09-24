@@ -564,9 +564,9 @@ class Fleet:
             if st is None:
                 continue
             if st == "paused":
-                docker._run(["docker", "unpause", c], check=False)
-            if st == "running":
-                docker.thaw(c) if frozen(c) else None
+                docker.thaw(c)
+                _frozen.discard(c)
+            if st in ("running", "paused"):
                 docker.iptables_flush(c)
                 docker.netem_clear(c)
 
@@ -1014,7 +1014,21 @@ def sc_hang_container(run: Run) -> None:
         if new:
             woken_writes(run, old, new, t_wake)
 
-    _failover_common(run, lambda p: freeze(p), extra_s=o.hang_seconds + 20, after_failover=after,
+    def inject(p: str) -> None:
+        freeze(p)
+        note(run, "hang mechanism: docker pause (cgroup freezer, every process in the container)")
+        # the manager must see a silent agent, not just a silent mysqld
+        t_end = time.time() + 3
+        answered = False
+        while time.time() < t_end:
+            if agent(p).status() is not None:
+                answered = True
+            time.sleep(0.5)
+        run.row["agent_answered_while_frozen"] = answered
+        cp = docker.exec_(p, ["true"], check=False, timeout=10)
+        run.row["docker_exec_while_frozen_rc"] = cp.returncode
+
+    _failover_common(run, inject, extra_s=o.hang_seconds + 20, after_failover=after,
                      restart_old=False)
     rejoin_after_restart(run, run.row["primary_at_inject"], run.row.get("wake_ts") or time.time())
 
@@ -1031,6 +1045,7 @@ def sc_hang_process(run: Run) -> None:
         pid.append(int(mp))
         run.row["mysqld_pid"] = int(mp)
         docker.signal_pid(p, int(mp), "STOP")
+        note(run, f"hang mechanism: docker exec kill -STOP {mp} (mysqld only, agent alive)")
 
     def after(old: str, new: str | None) -> None:
         wake_at = run.row["inject_ts"] + o.hang_seconds

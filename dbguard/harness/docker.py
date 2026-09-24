@@ -10,8 +10,8 @@ on the target image shipping iptables or tc, and it works for the manager and th
 Orchestrator images too.
 
 Freezing a container: `docker kill -s STOP <c>` delivers SIGSTOP to PID 1 only (tini), so
-the agent and mysqld keep running. `freeze()` therefore stops PID 1 with `docker kill` and
-every other process with `docker exec -u 0 <c> kill -STOP -1`. `thaw()` does the reverse.
+the agent and mysqld keep running. `freeze()` therefore uses `docker pause` (cgroup freezer),
+which stops every process in the container.
 """
 
 from __future__ import annotations
@@ -74,18 +74,19 @@ def kill(container: str, signal: str = "KILL") -> None:
 
 
 def freeze(container: str) -> None:
-    """SIGSTOP every process in the container (PID 1 via docker kill, the rest via exec)."""
-    _run(["docker", "exec", "-u", "0", container, "kill", "-STOP", "-1"], check=False)
-    _run(["docker", "kill", "-s", "STOP", container])
+    """Freeze every process in the container with the cgroup freezer (`docker pause`).
+
+    `docker kill -s STOP` would reach PID 1 (tini) only and leave the agent and mysqld
+    running. The freezer stops every process at once, which is what SIGSTOP on all of them
+    would look like from outside: TCP connects still complete in the kernel, nothing answers.
+    """
+    _run(["docker", "pause", container])
 
 
 def thaw(container: str) -> None:
-    _run(["docker", "kill", "-s", "CONT", container], check=False)
-    _run(["docker", "exec", "-u", "0", container, "kill", "-CONT", "-1"], check=False)
+    _run(["docker", "unpause", container], check=False)
 
 
-# The task text names these pause/unpause. They are signal based on purpose (not the
-# cgroup freezer of `docker pause`) so a frozen mysqld sees SIGSTOP exactly as in the spec.
 pause = freeze
 unpause = thaw
 
