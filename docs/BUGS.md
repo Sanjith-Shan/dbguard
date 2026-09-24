@@ -426,3 +426,28 @@ heredocs and cache mounts already).
 - Fix. Heal reads the primary, then the replicas, then the primary again, and accepts
   `before <= replica <= after`. A replica holding GTIDs outside `after` is reported as
   errant, not as merely behind.
+
+### Cold start did not fire after a Docker Desktop crash
+
+- Symptom. After Docker Desktop crashed and `make up` restarted the fleet on its volumes,
+  every node booted with super_read_only=1 as designed. Both sets sat SUSPECT for 180 s with
+  "probe of mysql-a1 failed (1290 super-read-only), 2 of 2 replicas report losing it, no
+  action" until the harness promoted mysql-a1 and mysql-b1 by hand. Every node had the same
+  gtid_executed.
+- How found. The chaos campaign after the crash. The cause below is read from the code, the
+  manager's own logs of that start were not kept.
+- Cause. The cold start rule ran only once, in discovery, and needed every replica to follow
+  the source with no IO error. Right after a whole-set restart the source may still be
+  booting and the replicas' IO threads show "Connecting" with a last error, so the rule said
+  no, the manager believed the replicas' source, and it never asked again. From then on the
+  normal detector ran, and a read-only primary with a heartbeat row minutes old looks like a
+  primary in trouble, not like a set with no primary at all.
+- Fix. The rule is now re-checked on every poll and needs only what defines a whole-set
+  restart: no member is writable and the believed primary answers, is not fenced and is
+  read-only. Replica votes are not consulted. The node promoted in place is the believed
+  primary when it holds every transaction any reachable member holds, else the member with
+  the largest executed set that holds everything, else the set HALTs with the reason. It acts
+  after two consecutive polls agree, and repoints replicas to the chosen node first when they
+  followed another. Doctor says "no node is writable, this looks like a whole-set restart".
+  Simulation tests reproduce the restart (source booting last, IO threads Connecting,
+  heartbeat minutes old, probe 1290) and see cold_start within about a second.

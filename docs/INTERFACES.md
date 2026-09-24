@@ -319,9 +319,13 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   other replica attached to the candidate), otherwise empty, and the old primary's
   background repoint is recorded as a `rejoin` event.
 - `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set) or
-  `cold_start` (every node booted read-only, the replicas agree on a source that is not
-  fenced and holds everything they hold, so the manager promoted it in place instead of
-  failing over).
+  `cold_start` (whole-set restart: no member is writable and the believed primary answers,
+  is not fenced and is read-only. The manager promotes in place the believed primary if it
+  holds every transaction any reachable member holds, else the unfenced read-only member with
+  the largest executed set that holds everything, else it HALTs. Heartbeat and IO-thread votes
+  are not consulted, there is no primary to lose. The rule is re-checked on every poll, acts
+  after two consecutive polls agree, and repoints replicas to the chosen node before the
+  promote when they followed another node).
 - A replica's heartbeat age counts as a vote only between `detect_window_s` and
   `10 x detect_window_s` after subtracting its `seconds_behind_source`. A lagging replica, or
   a row left over from before the whole set restarted, is not evidence that the primary died.

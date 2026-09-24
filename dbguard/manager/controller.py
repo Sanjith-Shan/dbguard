@@ -60,6 +60,7 @@ class SetController:
         self.backoff: dict[str, float] = {}
         self.manual_noted: set[str] = set()
         self.split_noted: set[str] = set()
+        self.cold_start_seen = 0
         self.busy: set[str] = set()             # nodes a maintenance task is working on
         self.maint: asyncio.Task | None = None
         self.unhealthy_since: float | None = None
@@ -162,6 +163,8 @@ class SetController:
                 from dbguard.manager.bootstrap import discover
                 await discover(self, ob)
                 return
+            if await self._cold_start_check(ob):
+                return
             v = evaluate(list(self.history), self.members, self.params)
             self.verdict = v
             self._check_stall(ob, ob.nodes.get(self.primary))
@@ -189,6 +192,34 @@ class SetController:
             else:
                 self.replicas_only_logged = False
             await self.reconcile(ob)
+
+    async def _cold_start_check(self, ob: Observation) -> bool:
+        """Re-checked every tick, not only at discovery: right after a whole-set restart the
+        source may still be booting or a replica may show a transient IO error, and a one
+        shot check left both sets SUSPECT for 180 s on the real fleet (docs/BUGS.md). Acts
+        after two consecutive polls agree."""
+        from dbguard.manager.bootstrap import cold_start, cold_start_choice
+        node, halt = cold_start_choice(ob.nodes, self.members, self.primary)
+        if halt:
+            self.st.halt(halt)
+            return True
+        if node is None:
+            self.cold_start_seen = 0
+            return False
+        self.cold_start_seen += 1
+        if self.cold_start_seen < 2:
+            return False
+        self.cold_start_seen = 0
+        await cold_start(self, node, ob.nodes)
+        return True
+
+    def whole_set_restart(self, ob: Observation | None = None) -> bool:
+        ob = ob or self.last_obs
+        if ob is None or self.primary is None:
+            return False
+        pv = ob.nodes.get(self.primary)
+        return (pv is not None and pv.usable and pv.super_read_only is True and not pv.fenced
+                and not any(ob.nodes[m].writable for m in self.members if m in ob.nodes))
 
     def _suspect_note(self, v: Verdict) -> str:
         return (f"manager probe of {self.primary} failed {v.probe_streak} times "

@@ -83,7 +83,10 @@ def doctor(ctl: SetController, now: float | None = None) -> dict:
         else:
             parts.append(f"0 of {v.replica_total} replicas report a problem with it")
         sentence = f"{rs}: " + ", ".join(parts) + f", verdict {verdict}"
-        if v.kind in ("DEAD", "SUSPECT") and v.quorum or v.kind == "DEAD":
+        if ctl.whole_set_restart(ob):
+            sentence += (", no node is writable, this looks like a whole-set restart, the "
+                         "manager promotes the node holding every transaction in place")
+        elif v.kind in ("DEAD", "SUSPECT") and v.quorum or v.kind == "DEAD":
             others = [ob.nodes[n] for n in ctl.members if n != p and n in ob.nodes]
             ch = choose(others, mode=ctl.mode, old_primary=p)
             if ch.halt_reason:

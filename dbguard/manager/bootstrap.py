@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from dbguard.gtid import GtidSet
 from dbguard.manager.client import AgentError
 from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
 from dbguard.manager.model import NodeView, Observation
@@ -55,16 +56,27 @@ async def discover(ctl: SetController, ob: Observation) -> None:
     sources = collections.Counter(
         v.replica.source_host for v in views.values()
         if v.usable and v.replica.configured and v.replica.source_host in ctl.members)
+    src = None
+    if sources:
+        s0, n0 = sources.most_common(1)[0]
+        if n0 * 2 > len(ctl.members) - 1:
+            src = s0
+    # With a source the replicas agree on, only that source can be the cold-start node
+    # until it answers (it may simply be booting last). Without one, every node must answer.
+    node, halt = cold_start_choice(views, ctl.members, src)
+    if halt:
+        ctl.st.halt(halt)
+        return
+    if node:
+        await cold_start(ctl, node, views)
+        return
     if sources:
         src, n = sources.most_common(1)[0]
         if n * 2 > len(ctl.members) - 1:
-            why = cold_start_problem(views, src)
-            if why is None:
-                await cold_start(ctl, src, views)
-                return
+            # Not (yet) a cold start, typically the source is not answering. Believe it; the
+            # tick re-checks for a cold start every poll and detection handles a dead one.
             ctl.set_primary(src)
-            log.warning("no writable node, believing replicas' source", rs=ctl.rs, primary=src,
-                        not_cold_start=why)
+            log.warning("no writable node, believing replicas' source", rs=ctl.rs, primary=src)
             return
     note = (f"no primary found yet: {len(usable)} of {len(ctl.members)} nodes answer, "
             f"none writable")
@@ -73,34 +85,60 @@ async def discover(ctl: SetController, ob: Observation) -> None:
         log.warning("discover", rs=ctl.rs, note=note)
 
 
-def cold_start_problem(views: dict[str, NodeView], src: str) -> str | None:
-    """Why ``src`` may not be promoted in place at cold start, or None if it may."""
-    sv = views.get(src)
-    if sv is None or not sv.usable:
-        return f"{src} not responsive"
-    if sv.fenced:
-        return f"{src} is fenced, someone took it out on purpose"
-    if sv.super_read_only is not True:
-        return f"{src} super_read_only is {sv.super_read_only}"
-    if sv.replica.configured:
-        return f"{src} is itself replicating from {sv.replica.source_host}"
-    for n, v in views.items():
-        if n == src or not v.usable:
-            continue
-        r = v.replica
-        if not r.configured or r.source_host != src:
-            return f"{n} does not replicate from {src}"
-        if r.io_running != "Yes" and r.last_io_error:
-            return f"{n} IO error: {r.last_io_error}"
-        extra = v.have - sv.gtid_executed
-        if extra:
-            return f"{n} holds {extra.count()} transactions {src} lacks"
-    return None
+def cold_start_choice(views: dict[str, NodeView], members: list[str],
+                      believed: str | None) -> tuple[str | None, str | None]:
+    """Is this a whole-set restart, and whom to promote in place?
+
+    Returns (node, None) to promote ``node``, (None, reason) to HALT, or (None, None) when
+    this is not a cold start. A cold start is: no member is writable, and the believed
+    primary (when there is one) answers, is not fenced, and is read-only. That is what every
+    node looks like after the whole set rebooted, because my.cnf boots read-only. There is
+    no primary to lose, so replica votes (a heartbeat row minutes old, IO threads still
+    Connecting to a source that is itself booting) do not matter and are not consulted.
+
+    The node promoted is the believed primary if its gtid_executed holds everything any
+    reachable member holds. Otherwise the reachable, unfenced, read-only member with the
+    largest executed set that holds everything the others hold. If no member holds
+    everything, the sets diverged and a human decides.
+    """
+    reach = {m: views[m] for m in members if m in views and views[m].usable}
+    if any(v.writable for v in reach.values()):
+        return None, None
+    if believed is not None:
+        bv = reach.get(believed)
+        if bv is None or bv.fenced or bv.super_read_only is not True:
+            return None, None       # a primary that is down or fenced is a failover case
+    elif not any(v.replica.configured for v in reach.values()) or len(reach) < len(members):
+        # A brand new set (bootstrap), or replicas that do not agree on a source and not
+        # every node answering yet: wait, the missing node may hold the newest data.
+        return None, None
+    everything = GtidSet()
+    for v in reach.values():
+        everything = everything | v.have
+    cands = [m for m, v in reach.items() if not v.fenced and v.super_read_only is True]
+    if believed in cands and everything.is_subset(reach[believed].gtid_executed):
+        return believed, None
+    full = [m for m in cands if everything.is_subset(reach[m].gtid_executed)]
+    if full:
+        return max(full, key=lambda m: (reach[m].gtid_executed.count(),
+                                        -members.index(m))), None
+    detail = "; ".join(f"{m} lacks {(everything - reach[m].gtid_executed).count()}"
+                       for m in cands) or "no unfenced read-only member"
+    return None, (f"cold start: every node is read-only but no node holds every "
+                  f"transaction the others hold ({detail}); decide which data to keep")
 
 
 async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -> None:
     t0 = time.monotonic()
     log.warning("cold start, promoting in place", rs=ctl.rs, primary=src)
+    # Replicas that do not already follow ``src`` (it was not their source before the
+    # restart) are repointed first, so it has its semi-sync replicas when it becomes
+    # writable. ``src`` holds everything they hold, so this is safe.
+    movers = [m for m in ctl.members if m != src and m in views and views[m].usable
+              and views[m].replica.source_host != src]
+    if movers:
+        from dbguard.manager.failover import repoint_all
+        await repoint_all(ctl, movers, src)
     try:
         resp = await ctl.agents.post(src, "/promote", timeout=ROLE_CHANGE_TIMEOUT_S)
     except AgentError as e:
@@ -108,13 +146,14 @@ async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -
         log.warning("cold start promote failed, letting detection decide", rs=ctl.rs,
                     primary=src, error=str(e))
         return
-    ctl.set_primary(src)
     reps = [n for n, v in views.items() if n != src and v.usable]
-    ctl.event(type="cold_start", old_primary=src, new_primary=src,
+    old = ctl.primary
+    ctl.set_primary(src)
+    ctl.event(type="cold_start", old_primary=old or src, new_primary=src,
               total_s=round(time.monotonic() - t0, 3),
               watermark_gtid=resp.get("gtid_executed") if isinstance(resp, dict) else None,
-              note=f"every node booted read-only, {', '.join(reps) or 'no replica'} "
-                   f"replicate from {src} and hold nothing it lacks, promoted it in place")
+              note=f"no node was writable (whole-set restart), {src} holds every transaction "
+                   f"of {', '.join(reps) or 'no other reachable node'}, promoted it in place")
     # HEALTHY or DEGRADED is decided by the next reconcile, on fresh views
 
 

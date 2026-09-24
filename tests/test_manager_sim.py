@@ -509,17 +509,17 @@ async def test_cold_start_promotes_in_place(sim_factory):
     assert s.fleet.primary_of("rs1") == ["mysql-a1"]
 
 
-async def test_cold_start_refused_when_a_replica_is_ahead(sim_factory):
+async def test_cold_start_promotes_the_superset_when_the_old_primary_is_behind(sim_factory):
     s = await sim_factory(sets={"rs1": A}, replicate=False, start=False)
     s.fleet.setup_replication("rs1")
     a1, a2 = s.fleet.nodes["mysql-a1"], s.fleet.nodes["mysql-a2"]
     a1.super_read_only = True
     a2.executed = a2.executed | GtidSet.of(a1.uuid, (1, 5))    # a2 holds more than a1
     await s.mgr.start()
-    await asyncio.sleep(0.5)
-    assert not s.events("rs1", "cold_start")
+    await s.until(lambda: s.events("rs1", "cold_start"), what="cold_start")
+    assert s.events("rs1", "cold_start")[0].new_primary == "mysql-a2"
     assert "/promote" not in a1.calls
-
+    await s.healthy("rs1", "mysql-a2")
 
 async def test_spare_already_replicating_is_adopted_after_restart(sim_factory):
     s = await sim_factory(sets={"rs1": A}, spares={"rs1": "mysql-a4"}, start=False)
@@ -758,3 +758,89 @@ async def test_switchover_two_node_set_repoints_old_primary_inside_the_stall(sim
     assert log.index(("mysql-a1", "repointed")) < log.index(("mysql-a2", "promoted"))
     assert ev.steps.prepare is None and ev.steps.repoint.nodes == ["mysql-a1"]
     assert "inside the stall" in ev.note
+
+
+
+def _whole_set_restart(fleet, minutes_old=5.0):
+    """What every node looks like after Docker restarted the whole fleet on its volumes."""
+    for rs in fleet.sets:
+        fleet.setup_replication(rs)
+        p = fleet.nodes[fleet.sets[rs][0]]
+        p.super_read_only = True
+        p.semisync_source = False
+        for n in fleet.sets[rs]:
+            fleet.nodes[n].heartbeat_ts = time.time() - minutes_old * 60
+
+
+async def test_cold_start_when_the_old_primary_boots_last(sim_factory):
+    """The real incident: after a Docker Desktop crash every node booted read-only, the
+    heartbeat row was minutes old, the manager's probe got 1290 and both replicas 'reported
+    losing it'. The source was not answering yet at discovery, so the one-shot cold start
+    rule never fired and both sets sat SUSPECT for 180 s."""
+    # detect window long enough that the source boots within it, as on the real fleet
+    s = await sim_factory(replicate=False, start=False, detect_window_s=3.0)
+    _whole_set_restart(s.fleet)
+    for p in ("mysql-a1", "mysql-b1"):
+        s.fleet.nodes[p].mysqld_up = False          # the source is still booting
+    await s.mgr.start()
+    await asyncio.sleep(0.5)
+    assert s.ctl("rs1").primary == "mysql-a1"       # believed from the replicas
+    for p in ("mysql-a1", "mysql-b1"):
+        s.fleet.nodes[p].mysqld_up = True
+    t0 = time.time()
+    await s.until(lambda: s.events("rs1", "cold_start") and s.events("rs2", "cold_start"),
+                  timeout=3, what="cold_start on both sets")
+    assert time.time() - t0 < 1.5
+    for rs, p in (("rs1", "mysql-a1"), ("rs2", "mysql-b1")):
+        await s.healthy(rs, p)
+        assert not s.events(rs, "failover")
+        assert s.fleet.primary_of(rs) == [p]
+
+
+async def test_cold_start_ignores_io_connecting_and_stale_heartbeat_votes(sim_factory):
+    s = await sim_factory(sets={"rs1": A}, replicate=False, start=False)
+    _whole_set_restart(s.fleet)
+    s.fleet.partition("mysql-a1", "mysql-a2")       # IO threads stuck Connecting
+    s.fleet.partition("mysql-a1", "mysql-a3")
+    await s.mgr.start()
+    await s.until(lambda: s.events("rs1", "cold_start"), timeout=3, what="cold_start")
+    assert s.events("rs1", "cold_start")[0].new_primary == "mysql-a1"
+    assert not s.events("rs1", "failover")
+
+
+async def test_cold_start_halts_when_no_node_holds_everything(sim_factory):
+    s = await sim_factory(sets={"rs1": A}, replicate=False, start=False)
+    _whole_set_restart(s.fleet)
+    for n in ("mysql-a2", "mysql-a3"):
+        node = s.fleet.nodes[n]
+        node.executed = node.executed | GtidSet.of(node.uuid, 1)
+    await s.mgr.start()
+    await s.until(lambda: s.ctl().st.state == State.HALTED, timeout=3, what="HALTED")
+    assert s.ctl().st.halt_reason.startswith("cold start: every node is read-only")
+    assert s.fleet.primary_of("rs1") == []
+
+
+async def test_doctor_calls_a_read_only_set_a_whole_set_restart(sim_factory):
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.ctl().st.halt("look first")                    # keep the manager from acting
+    a1 = s.fleet.nodes["mysql-a1"]
+    a1.super_read_only = True
+    await asyncio.sleep(0.4)
+    from dbguard.manager.doctor import doctor
+    first = doctor(s.ctl())["lines"][0]
+    assert "no node is writable, this looks like a whole-set restart" in first
+
+
+async def test_crash_restarted_primary_without_fence_is_promoted_in_place(sim_factory):
+    """mysqld crashed and the agent restarted it read-only, not fenced: nobody is writable,
+    so it is a one-node cold start, not a failover."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.2)
+    s.fleet.start("mysql-a1")                        # boots read-only, config kept
+    await s.until(lambda: s.events("rs1", "cold_start"), timeout=3, what="cold_start")
+    assert not s.events("rs1", "failover")
+    await s.healthy("rs1", "mysql-a1")
+    lossless(s)
