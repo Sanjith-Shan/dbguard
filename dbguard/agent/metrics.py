@@ -37,6 +37,9 @@ class AgentMetrics:
         self.primary_check = Histogram(
             "dbguard_agent_primary_check_seconds", "GET /primary handler latency",
             buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0), registry=r)
+        self.unstick_killed = Counter("dbguard_agent_unstick_killed_total",
+                                      "Sessions waiting for a semi-sync ACK killed by /unstick",
+                                      registry=r)
         self.mysqld_restarts = Counter("dbguard_agent_mysqld_restarts_total",
                                        "mysqld restarts by the supervisor", registry=r)
         self.heartbeat_age = Gauge("dbguard_agent_heartbeat_age_seconds",

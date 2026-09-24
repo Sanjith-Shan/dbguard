@@ -213,6 +213,18 @@ Agent additions to the shapes above. Extra keys only, nothing removed.
   unacked binlog tail to replicas that still point at it. `/promote`, `/repoint` and
   `/rebuild` end the hold at once, wait for mysqld to answer, then run their SQL. `/kill-mysqld`
   (the crash test hook) never holds.
+- `/unstick` (POST, no body) KILLs every client session whose state is "Waiting for semi-sync
+  ACK from replica" (performance_schema.threads, foreground `one_connection` threads, not
+  repl, not system accounts, not its own connection) and answers
+  `{"killed":n,"gtid_executed":"...","still_waiting":n,"duration_ms":f}`. Those transactions
+  are already in the binlog, so their clients get an error and nothing acknowledged is left
+  single-copy. It does not touch read_only or the fence flag, it is idempotent (0 when nothing
+  waits), and it refreshes the `/primary` sample and `semisync.wait_sessions`. Reason: a clone
+  from a primary stalled on semi-sync hangs (docs/BUGS.md "A clone from a stalled semi-sync
+  primary hangs"). Caveat: on mysql 8.4.11 a KILLed session was seen to stay in the ACK wait
+  with command `Killed` (docs/BUGS.md "A semi-sync stall makes the SQL fence impossible"), so
+  callers must read `still_waiting`, not assume the KILL released anything. Metric
+  `dbguard_agent_unstick_killed_total`.
 - `/rebuild` also returns `gtid_executed` after the clone. `/kill-mysqld` and `/hang-mysqld`
   answer `{"ok":true,"pid":n}` (plus `seconds`) and 409 without a supervised mysqld.
 - `/primary` never awaits SQL. It answers from the fence flag (checked first) and a sample of

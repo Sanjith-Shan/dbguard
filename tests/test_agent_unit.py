@@ -29,6 +29,8 @@ class FakeSession:
     def __init__(self, db: FakeDB):
         self.db = db
         self._closed = False
+        db.next_conn_id += 1
+        self.conn_id = db.next_conn_id
 
     @property
     def closed(self) -> bool:
@@ -52,7 +54,7 @@ class FakeSession:
         self.db.log.append(sql)
         for hook in self.db.hooks:
             hook(sql, args)
-        return self.db.respond(sql, args)
+        return self.db.respond(sql, args, self)
 
     async def query(self, sql, args=None, *, timeout=None, log_sql=False):
         return await self._run(sql, args, timeout)
@@ -69,6 +71,9 @@ class FakeDB:
         self.hang: set[str] = set()
         self.down = False
         self.delay = 0.0
+        self.next_conn_id = 1000
+        self.threads: list[dict[str, Any]] = []
+        self.kill_sticks = False  # real 8.4: a KILLed ACK waiter may keep waiting
         self.sro = 1
         self.ro = 1
         self.gtid = f"{UUID_A}:1-10"
@@ -81,8 +86,21 @@ class FakeDB:
         self.clients = [{"id": 101, "user": "app"}, {"id": 102, "user": "chaos"}]
 
     # SQL "engine"
-    def respond(self, sql: str, args: Any) -> Any:
+    def respond(self, sql: str, args: Any, sess: Any = None) -> Any:
         s = sql.strip()
+        if "PROCESSLIST_STATE LIKE 'Waiting for semi-sync ACK" in s:
+            me = sess.conn_id if sess else None
+            return [{"id": t["id"], "user": t["user"]} for t in self.threads
+                    if t["type"] == "FOREGROUND" and t["name"] == "thread/sql/one_connection"
+                    and (t["state"] or "").startswith("Waiting for semi-sync ACK")
+                    and t["id"] != me and t["user"] not in args[0]]
+        if s.startswith("KILL "):
+            tid = int(s.split()[1])
+            if not self.kill_sticks:
+                self.threads = [t for t in self.threads if t["id"] != tid]
+            return 0
+        if "performance_schema.global_status" in s:
+            return [{"v": str(self.wait_sessions)}]
         if s.startswith("SELECT @@GLOBAL.super_read_only AS sro, @@GLOBAL.read_only"):
             return [{"sro": self.sro, "ro": self.ro, "g": self.gtid}]
         if s.startswith("SELECT @@GLOBAL.super_read_only"):
@@ -989,3 +1007,81 @@ async def test_kill_fence_invalidates_sample(settings):
     db.hang.add("SET GLOBAL super_read_only=1")
     await agent.fence()
     assert agent._primary_sample is None
+
+
+
+# --------------------------------------------------------------------------- /unstick
+
+WAIT = "Waiting for semi-sync ACK from replica"
+
+
+def _thread(tid, user, state=WAIT, name="thread/sql/one_connection", type_="FOREGROUND"):
+    return {"id": tid, "user": user, "state": state, "name": name, "type": type_}
+
+
+async def test_unstick_kills_only_sessions_waiting_for_an_ack(settings, client_factory):
+    db = FakeDB()
+    db.sro = 0
+    db.threads = [
+        _thread(11, "chaos"),                                     # waiting client: kill
+        _thread(12, "dbguard"),                                   # heartbeat waiting: kill
+        _thread(13, "chaos", state="executing"),                  # busy, not waiting
+        _thread(14, "repl", state=WAIT),                          # binlog dump, protected
+        _thread(15, "system user", name="thread/sql/replica_io"),  # replication thread
+        _thread(16, "event_scheduler", name="thread/sql/event_scheduler"),
+        _thread(17, None, state=WAIT, type_="BACKGROUND", name="thread/innodb/x"),
+    ]
+    agent = make_agent(settings, db)
+    await agent.fence()
+    await agent.unfence()
+    db.log.clear()
+    sro_before, fenced_before = db.sro, agent.fenced
+    c = await client_factory(agent)
+    r = await c.post("/unstick")
+    assert r.status == 200
+    body = await r.json()
+    assert body["killed"] == 2 and body["still_waiting"] == 0
+    assert body["gtid_executed"] == f"{UUID_A}:1-10"
+    assert sorted(x for x in db.log if x.startswith("KILL")) == ["KILL 11", "KILL 12"]
+    assert {t["id"] for t in db.threads} == {13, 14, 15, 16, 17}
+    assert db.sro == sro_before and agent.fenced == fenced_before  # untouched
+    assert not any(x.startswith("SET ") for x in db.log)
+    assert agent.m.unstick_killed._value.get() == 2
+
+
+async def test_unstick_leaves_its_own_connection_alone(settings):
+    db = FakeDB()
+    agent = make_agent(settings, db)
+    # The next session the agent opens gets id next_conn_id + 1. Make that thread waiting.
+    own = db.next_conn_id + 1
+    db.threads = [_thread(own, "dbguard")]
+    body = await agent.unstick()
+    assert body["killed"] == 0 and not any(x.startswith("KILL") for x in db.log)
+
+
+async def test_unstick_is_idempotent_and_returns_zero_when_nothing_waits(settings):
+    db = FakeDB()
+    db.threads = [_thread(21, "chaos")]
+    agent = make_agent(settings, db)
+    assert (await agent.unstick())["killed"] == 1
+    again = await agent.unstick()
+    assert again["killed"] == 0 and again["still_waiting"] == 0
+    assert again["gtid_executed"] == f"{UUID_A}:1-10"
+
+
+async def test_unstick_reports_sessions_a_kill_did_not_release(settings):
+    """mysql 8.4 was seen keeping a KILLed session in the ACK wait (docs/BUGS.md), so the
+    answer says how many still wait instead of assuming the KILL worked."""
+    db = FakeDB()
+    db.kill_sticks = True
+    db.threads = [_thread(31, "chaos"), _thread(32, "chaos")]
+    body = await make_agent(settings, db).unstick()
+    assert body["killed"] == 2 and body["still_waiting"] == 2
+
+
+async def test_unstick_refreshes_wait_sessions_for_status(settings):
+    db = FakeDB()
+    db.wait_sessions = 0
+    agent = make_agent(settings, db)
+    await agent.unstick()
+    assert agent._wait_sessions_sample is not None and agent._wait_sessions_sample[1] == 0

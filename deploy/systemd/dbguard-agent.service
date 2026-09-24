@@ -20,7 +20,7 @@ RestartSec=2
 # SIGTERM goes to the agent alone. It shuts mysqld down cleanly (mysqld needs time to flush
 # InnoDB) and exits. After TimeoutStopSec every remaining process in the unit gets SIGKILL.
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=150
 StateDirectory=dbguard
 LimitNOFILE=65535
 

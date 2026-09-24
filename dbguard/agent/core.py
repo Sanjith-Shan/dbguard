@@ -49,6 +49,19 @@ CLIENT_THREADS_SQL = (
 # repl carries binlog dump threads. The others are system accounts that own threads.
 PROTECTED_USERS = ("event_scheduler", "system user", "mysql.session", "mysql.sys")
 
+# Client sessions whose commit is binlogged and waits for a semi-sync ACK (/unstick).
+WAITING_ACK_SQL = (
+    "SELECT PROCESSLIST_ID AS id, PROCESSLIST_USER AS user FROM performance_schema.threads "
+    "WHERE TYPE='FOREGROUND' AND NAME='thread/sql/one_connection' "
+    "AND PROCESSLIST_STATE LIKE 'Waiting for semi-sync ACK%%' "
+    "AND PROCESSLIST_ID IS NOT NULL AND PROCESSLIST_ID <> CONNECTION_ID() "
+    "AND (PROCESSLIST_USER IS NULL OR PROCESSLIST_USER NOT IN %s)"
+)
+WAIT_SESSIONS_SQL = (
+    "SELECT VARIABLE_VALUE AS v FROM performance_schema.global_status "
+    "WHERE VARIABLE_NAME='Rpl_semi_sync_source_wait_sessions'"
+)
+
 HEARTBEAT_SQL = (
     "INSERT INTO dbguard.heartbeat (rs, ts, writer) VALUES (%s, NOW(6), %s) "
     "ON DUPLICATE KEY UPDATE ts=NOW(6), writer=VALUES(writer)"
@@ -162,6 +175,7 @@ class Agent:
         self._primary_sample: tuple[float, bool | None, bool | None] | None = None
         self._sample_session: Session | None = None
         self._sample_lock = asyncio.Lock()
+        self._wait_sessions_sample: tuple[float, int | None] | None = None
         self.self_fence_on = True
         self.wake_guard_on = settings.wake_guard
         self._mgr_unreachable_since: float | None = None
@@ -299,6 +313,14 @@ class Agent:
                     timeout=self.s.primary_sample_timeout_s)
                 self._primary_sample = (time.monotonic(), _b(rows[0]["sro"]),
                                         _b(rows[0]["ro"]))
+                try:
+                    ws = await self._sample_session.query(
+                        WAIT_SESSIONS_SQL, timeout=self.s.primary_sample_timeout_s)
+                    self._wait_sessions_sample = (time.monotonic(),
+                                                  _i(ws[0]["v"]) if ws else None)
+                except DbError as e:
+                    if e.timeout or e.code is None or e.code in RESTART_CLIENT_CODES:
+                        raise
                 return True
             except DbError:
                 if self._sample_session is not None:
@@ -418,6 +440,10 @@ class Agent:
             out["error"] = f"status deadline {self.s.status_deadline_s}s reached"
             if out["gtid_executed"] is None:
                 out["mysqld_responsive"] = False
+        wss = self._wait_sessions_sample
+        if (out["semisync"]["wait_sessions"] is None and wss is not None
+                and time.monotonic() - wss[0] <= self.s.primary_stale_s):
+            out["semisync"]["wait_sessions"] = wss[1]
         if probe:
             try:
                 out["source_reachable"] = await asyncio.wait_for(
@@ -822,6 +848,40 @@ class Agent:
                  bytes=res["b"], gtid_executed=res["g"], restarted=restarting)
         return {"ok": True, "phantom_gtids": phantom, "duration_ms": dur,
                 "bytes": res["b"] or 0, "gtid_executed": res["g"]}
+
+    # ------------------------------------------------------------------ /unstick
+
+    async def unstick(self) -> dict[str, Any]:
+        """KILL every client session waiting for a semi-sync ACK. Their transactions are
+        already binlogged, so the clients get an error and nothing acknowledged is left
+        single-copy. Does not touch read_only or the fence flag. Used before a clone from a
+        primary stalled on semi-sync, which otherwise hangs (docs/BUGS.md)."""
+        t0 = time.monotonic()
+        killed = 0
+        async with self.db.session(self.s.sql_timeout_s) as s:
+            rows = await s.query(WAITING_ACK_SQL, ((self.s.repl_user,) + PROTECTED_USERS,),
+                                 timeout=self.s.sql_timeout_s, log_sql=True)
+            for row in rows:
+                try:
+                    await s.execute(f"KILL {int(row['id'])}", timeout=self.s.sql_timeout_s,
+                                    log_sql=True)
+                    killed += 1
+                except DbError as e:
+                    if e.timeout:
+                        raise
+                    # ER_NO_SUCH_THREAD: it finished between the SELECT and the KILL.
+            if killed:
+                await asyncio.sleep(0.2)  # let the killed sessions leave the wait
+            still = await s.query(WAITING_ACK_SQL, ((self.s.repl_user,) + PROTECTED_USERS,),
+                                  timeout=self.s.sql_timeout_s)
+            g = (await s.query("SELECT @@GLOBAL.gtid_executed AS g",
+                               timeout=self.s.sql_timeout_s))[0]["g"]
+        await self.refresh_primary_sample()
+        self.m.unstick_killed.inc(killed)
+        dur = round((time.monotonic() - t0) * 1000, 2)
+        log.info("unstick", killed=killed, still_waiting=len(still), duration_ms=dur)
+        return {"killed": killed, "gtid_executed": _gtid(g), "still_waiting": len(still),
+                "duration_ms": dur}
 
     # ------------------------------------------------------------------ test hooks
 

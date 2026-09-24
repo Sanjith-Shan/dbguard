@@ -127,6 +127,11 @@ async def configure(request: web.Request) -> web.Response:
         vals["semisync"], self_fence=vals["self_fence"], wake_guard=vals["wake_guard"]))
 
 
+async def unstick(request: web.Request) -> web.Response:
+    """POST /unstick, KILL sessions waiting for a semi-sync ACK."""
+    return web.json_response(await request.app[AGENT_KEY].unstick())
+
+
 async def kill_mysqld(request: web.Request) -> web.Response:
     """POST /kill-mysqld test hook."""
     return web.json_response(request.app[AGENT_KEY].kill_mysqld())
@@ -170,5 +175,6 @@ def make_app(agent: Agent) -> web.Application:
     app.router.add_post("/configure", configure)
     app.router.add_post("/kill-mysqld", kill_mysqld)
     app.router.add_post("/hang-mysqld", hang_mysqld)
+    app.router.add_post("/unstick", unstick)
     app.router.add_get("/metrics", metrics)
     return app
