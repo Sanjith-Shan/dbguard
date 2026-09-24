@@ -2,6 +2,67 @@
 
 Every real bug found while building DBGuard. Symptom, how it was found, fix.
 
+## Build notes
+
+What the `mysql:8.4` image turned out to be, checked on this machine (Apple M3 Pro, Docker
+Desktop 29.4.1, Compose v5.1.3).
+
+| Question | Answer |
+|---|---|
+| Base OS | Oracle Linux Server 9.8, mysqld 8.4.11 (aarch64) |
+| Package manager | `microdnf` (no `dnf`, no `yum`, no `which`) |
+| python3.12 | in `ol9_appstream`, 3.12.14. No need to fall back to 3.11 |
+| `tc` | package `iproute-tc` (not part of `iproute` on EL9) |
+| `iptables` | `iptables-nft` 1.8.10, nf_tables backend, works in a container with `NET_ADMIN` |
+| `ps` | `procps-ng` 3.3.17 |
+| tini | not in the OL9 repos (it is in EPEL). The static release binary v0.19.0 is fetched by `TARGETARCH` |
+| Build time | the first `microdnf install` takes 6 to 15 minutes because the OL9 appstream metadata is about 250 MB. The Dockerfile keeps it in a BuildKit cache mount and puts the OS layer first, so later builds reuse it |
+| Manager image | `python:3.12-slim` plus the static docker CLI 27.5.1 and compose plugin v2.32.4, so the manager can start a spare through the mounted docker socket |
+
+The node image puts the package in a venv at `/opt/dbguard` so pip never touches the
+system python that microdnf owns.
+
+A `# syntax=docker/dockerfile:1.x` line pulls the dockerfile frontend image and changes the
+cache key of every step. The Dockerfiles use the built-in frontend instead (it supports
+heredocs and cache mounts already).
+
+## Fleet
+
+### mysqld --initialize aborts on the semi-sync variables in my.cnf
+
+- Symptom. Every node died on first boot with
+  `unknown variable 'rpl_semi_sync_source_wait_point=AFTER_SYNC'` followed by
+  `The designated data directory /var/lib/mysql/ is unusable`.
+- How found. The first `make up` with the INTERFACES.md my.cnf.
+- Fix. `mysqld --initialize` ignores `plugin_load_add` (it logs "Ignoring --plugin-load[_add]
+  list"), so the plugin variables do not exist yet. The three `rpl_semi_sync_source_*`
+  settings in my.cnf carry the `loose_` prefix. Because `loose_` would also hide a plugin
+  that failed to load at a real start, `bin/bootstrap` refuses to continue when semi-sync
+  is wanted and `rpl_semi_sync_source_wait_point` is missing.
+
+### super_read_only in my.cnf breaks the image's own initialisation
+
+- Symptom. Same trap the agent section records for the command line. The stock
+  `docker-entrypoint.sh` starts its temporary init server with the same config, so the root
+  setup and our init SQL fail with ERROR 1290.
+- How found. Reading the stock entrypoint before the first boot (its temporary server runs
+  `"$@" --daemonize --skip-networking`).
+- Fix. `/entrypoint.sh` initialises an empty datadir itself with
+  `deploy/mysql/dbguard-initdb.sh`, which sources the stock entrypoint's functions and runs
+  the same steps with the temporary server started as `--super-read-only=OFF
+  --read-only=OFF`. After that `docker-entrypoint.sh mysqld` (the agent's child command)
+  finds an initialised datadir and only execs mysqld, which boots read-only as my.cnf says.
+  The init SQL runs with `sql_log_bin=0` and ends with `RESET BINARY LOGS AND GTIDS`, so
+  every node starts with an empty and identical `gtid_executed`.
+
+### The init wrapper died on an unset variable
+
+- Symptom. First boot stopped at `dbguard-initdb.sh: line 17: DATABASE_ALREADY_EXISTS:
+  unbound variable`.
+- How found. `docker logs mysql-a1` on the first `make up`.
+- Fix. The stock entrypoint functions are not written for `set -u`. The wrapper runs with
+  `set -eo pipefail` only.
+
 ## Agent
 
 ### caching_sha2_password over plain TCP works only sometimes

@@ -63,6 +63,10 @@ docs/                     DESIGN, CAPACITY, RUNBOOK, BUGS, INTERFACES (this)
   some TLS login has warmed the server's auth cache, which a restart flushes. Replication
   uses `SOURCE_SSL=1` for the same reason. `dbguard/agent/db.py` has the agent's copy
   (`insecure_tls()`).
+  The fleet re-verified it against the running compose fleet (a fresh `repl` login over
+  plain TCP fails, TLS succeeds). `dbguard/mysqlx.py` and `dbguard/mysqlx_sync.py` connect
+  with TLS by default (`tls=False` exists only for tests), and `bin/bootstrap`, `bin/workload`
+  and `bin/checker` go through them.
 - Schema `dbguard`:
   - `heartbeat(rs VARCHAR(16) PRIMARY KEY, ts TIMESTAMP(6), writer VARCHAR(64))` written by
     the primary's agent every 500 ms with `INSERT ... ON DUPLICATE KEY UPDATE`.
@@ -93,6 +97,33 @@ user `repl`.
 
 Naive mode (`DBGUARD_SEMISYNC=0`): semi-sync plugins loaded but never enabled. Everything
 else identical.
+
+Fleet deviations from the block above, all in `deploy/mysql/my.cnf`.
+
+| Setting | Why |
+|---|---|
+| `loose_rpl_semi_sync_source_*` | `mysqld --initialize` ignores `plugin_load_add`, so without `loose_` the first boot aborts on an unknown variable. `bin/bootstrap` checks the plugins are ACTIVE instead |
+| one `plugin_load_add` line per plugin | same effect as the `;` list, easier to read |
+| `relay_log_recovery=ON` | crash-safe replica. A replica that crashed refetches its relay log from the source by GTID auto-position |
+| `binlog_expire_logs_seconds=3600` | the laptop disk is small |
+| `innodb_buffer_pool_size=128M`, `innodb_redo_log_capacity=128M`, `mem_limit: 700m` | eight nodes fit in Docker Desktop's 8 GB |
+| `skip_name_resolve`, `mysqlx=0`, `bind_address=0.0.0.0`, `report_port=3306` | plumbing |
+
+Node startup. `/entrypoint.sh` (under tini) renders `/etc/mysql/conf.d/dbguard-node.cnf`
+(`server_id`, `report_host`) from env, initialises an empty datadir itself with a writable
+temporary server (see BUGS.md), then execs `dbguard-agent`. The agent's child command
+`docker-entrypoint.sh mysqld` therefore always finds an initialised datadir and just starts
+mysqld read-only. The init SQL is not binlogged and ends with `RESET BINARY LOGS AND GTIDS`,
+so every node starts with an empty `gtid_executed`. If `dbguard.agent.main` is not
+importable the entrypoint falls back to `docker-entrypoint.sh mysqld`.
+
+Compose. Project name `dbguard`, network `dbguard`, `container_name` equals the service name
+(`docker kill mysql-a1` works). Volumes `dbguard_<node>-data` (datadir) and
+`dbguard_<node>-state` (`/var/lib/dbguard`, the fence file). The manager mounts the compose
+file at `/deploy/docker-compose.yml` and the docker socket, with
+`DBGUARD_COMPOSE_PROJECT=dbguard`. The spare services have no bind mounts, so the manager
+can start them from inside its container. HAProxy lists the spares too, resolved lazily
+(`init-addr none`), so they show `MAINT (resolution)` until they exist.
 
 ## Agent HTTP API (`:8080`, JSON)
 
@@ -365,6 +396,22 @@ first_ok_after_error_ts, p50/p99 latency, writes/s).
 `bin/checker --run-id X --ack-log ... --nodes mysql-a1:13311,...` connects directly to each
 node, finds the primary (super_read_only=0), asserts lossless / no-phantom / single-writer /
 convergence, prints a JSON verdict with counts and lists.
+
+Workload details. Each INSERT is `(client_id, seq, NOW(6), run_id, 256 random bytes)` as user
+`chaos` with TLS. A seq still in flight when the workload is stopped (SIGTERM or SIGINT) gets
+an error row `"error":"in-flight at shutdown"`, because its outcome is unknown. The summary
+keys are `acked, errors, in_flight_at_stop, first_error_ts, first_ok_after_error_ts,
+latency_p50_ms, latency_p99_ms, latency_max_ms, writes_per_s, duration_s` (nearest-rank
+percentiles). `--query-timeout` is off by default, so a semi-sync stall blocks the client.
+
+Checker verdict keys (flat, for the result row) are `pass, primary, acked, rows,
+lost_acked_writes, lost_list, phantom_writes, phantom_list, single_writer_violations,
+converged, converge_s, unreachable`, and `properties.{lossless,no_phantom,single_writer,
+convergence}` hold the detail. Single writer means exactly one node with
+`super_read_only=0 AND read_only=0`, and on every other node a root `INSERT` inside a
+rolled-back transaction is rejected. Convergence compares GTID sets (not strings) of the
+reachable nodes and waits up to `--converge-timeout` (default 60 s). Exit 0 only if all
+four hold. The logic lives in `dbguard/harness/{workload,checker,bootstrap}.py`.
 
 ## Config, deploy/fleet.yaml
 
