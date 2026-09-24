@@ -42,6 +42,8 @@ class FakeSession:
             raise DbError("closed", code=2013)
         if self.db.down:
             raise DbError("Can't connect", code=2003)
+        if self.db.delay:
+            await asyncio.sleep(self.db.delay)
         for frag in self.db.hang:
             if frag in sql:
                 await asyncio.sleep(timeout if timeout is not None else 1.0)
@@ -66,6 +68,7 @@ class FakeDB:
         self.hooks: list = []
         self.hang: set[str] = set()
         self.down = False
+        self.delay = 0.0
         self.sro = 1
         self.ro = 1
         self.gtid = f"{UUID_A}:1-10"
@@ -646,3 +649,28 @@ async def test_primary_is_503_while_rebuilding(settings):
     agent.startup_done.set()
     agent.rebuilding = True
     assert await agent.primary_check() == (503, {"role": "unknown"})
+
+
+async def test_status_answers_within_one_deadline_when_mysqld_is_slow(settings):
+    """Review #3. Each query is under its own 1 s timeout, but together they would take
+    1.5 s, and the source TCP probe another 0.5 s. /status must still answer by its single
+    deadline and degrade the fields it did not get to to null."""
+    settings.sql_timeout_s = 1.0
+    settings.status_deadline_s = 1.0
+    db = FakeDB()
+    db.delay = 0.3
+    db.replica = {"Source_Host": "mysql-a2", "Replica_IO_Running": "Yes"}
+
+    async def slow_probe(host, port):
+        await asyncio.sleep(0.5)
+        return False
+    agent = Agent(settings, db, FakeSupervisor(), manager_get=FakeManager("mysql-a1"),
+                  reachable=slow_probe)
+    t0 = time.monotonic()
+    d = await agent.status()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.05, elapsed
+    _check_shape(d)
+    assert d["mysqld_responsive"] is True and d["gtid_executed"] == f"{UUID_A}:1-10"
+    assert d["heartbeat"]["ts"] is None  # never reached
+    assert "deadline" in d["error"]

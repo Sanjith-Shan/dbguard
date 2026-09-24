@@ -258,6 +258,10 @@ class Agent:
             "self_fence": self.self_fence_state(),
         }
 
+        t0 = time.monotonic()
+        deadline = t0 + self.s.status_deadline_s
+        probe: list[asyncio.Task] = []
+
         async def collect(sess: Session) -> None:
             t = self.s.sql_timeout_s
             r = (await sess.query("SELECT @@GLOBAL.super_read_only AS sro, "
@@ -300,6 +304,11 @@ class Agent:
                     "last_io_error": _s(row.get("Last_IO_Error")),
                     "last_sql_error": _s(row.get("Last_SQL_Error")),
                 }
+                src_host = out["replica"]["source_host"]
+                if src_host:
+                    # Runs beside the remaining SQL so a DROPped source costs 0.5 s once.
+                    probe.append(asyncio.create_task(
+                        self.reachable(src_host, self.s.source_port)))
             try:
                 hb = await sess.query("SELECT UNIX_TIMESTAMP(ts) AS ts, writer FROM "
                                       "dbguard.heartbeat WHERE rs=%s", (self.s.rs,), timeout=t)
@@ -313,14 +322,24 @@ class Agent:
                 out["heartbeat"]["age_s"] = round(max(0.0, time.time() - ts), 3)
                 out["heartbeat"]["writer"] = _s(hb[0]["writer"])
 
+        # One deadline for the whole handler (the manager's timeout is larger), so a slow
+        # or hung mysqld degrades fields to null instead of making /status late.
+        sql_budget = max(0.05, deadline - time.monotonic() - 0.1)
         try:
-            await self._sql(collect)
+            await asyncio.wait_for(self._sql(collect), sql_budget)
         except DbError as e:
             out["mysqld_responsive"] = False
             out["error"] = str(e)
-        src = out["replica"]["source_host"]
-        if src:
-            out["source_reachable"] = await self.reachable(src, self.s.source_port)
+        except TimeoutError:
+            out["error"] = f"status deadline {self.s.status_deadline_s}s reached"
+            if out["gtid_executed"] is None:
+                out["mysqld_responsive"] = False
+        if probe:
+            try:
+                out["source_reachable"] = await asyncio.wait_for(
+                    probe[0], max(0.01, deadline - time.monotonic()))
+            except TimeoutError:
+                out["source_reachable"] = None
         alive = self.sup.alive
         out["mysqld_alive"] = alive if alive is not None else out["mysqld_responsive"]
         self.m.mysqld_alive.set(1 if out["mysqld_alive"] else 0)
