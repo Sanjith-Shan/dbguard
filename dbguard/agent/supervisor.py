@@ -46,6 +46,15 @@ class NullSupervisor:
     async def wait_generation(self, gen: int, timeout: float) -> bool:
         return False
 
+    def hold(self, seconds: float) -> None:
+        return None
+
+    def release_hold(self) -> bool:
+        return False
+
+    held = False
+    hold_remaining_s = 0.0
+
     async def stop(self, timeout: float = 120.0) -> None:
         return None
 
@@ -65,6 +74,8 @@ class MysqldSupervisor:
         self._immediate = False      # next restart without backoff (kill fence, clone)
         self._task: asyncio.Task | None = None
         self._changed = asyncio.Condition()
+        self._hold_until: float | None = None
+        self._hold_release = asyncio.Event()
         self._on_restart = on_restart
 
     @property
@@ -113,6 +124,13 @@ class MysqldSupervisor:
             if self._stopping:
                 break
             self.restarts += 1
+            if self._hold_until is not None:
+                await self._wait_hold()
+                if self._stopping:
+                    break
+                self._immediate = False
+                backoff = self.min_backoff
+                continue
             if rc == RESTART_EXIT_CODE or self._immediate:
                 self._immediate = False
                 backoff = self.min_backoff
@@ -121,6 +139,44 @@ class MysqldSupervisor:
                 backoff = self.min_backoff
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.max_backoff)
+
+    def hold(self, seconds: float) -> None:
+        """Do not restart mysqld for `seconds` after it exits (the kill fence). Keeps a
+        dead primary from serving its unacked binlog tail to replicas the manager has not
+        repointed yet. release_hold() ends it early."""
+        if seconds > 0:
+            self._hold_release.clear()
+            self._hold_until = time.monotonic() + seconds
+            log.warning("mysqld_restart_hold", seconds=seconds)
+
+    def release_hold(self) -> bool:
+        if self._hold_until is None:
+            return False
+        self._hold_release.set()
+        return True
+
+    @property
+    def held(self) -> bool:
+        return self._hold_until is not None
+
+    @property
+    def hold_remaining_s(self) -> float:
+        if self._hold_until is None:
+            return 0.0
+        return round(max(0.0, self._hold_until - time.monotonic()), 3)
+
+    async def _wait_hold(self) -> None:
+        remaining = self.hold_remaining_s
+        released = self._hold_release.is_set()
+        if remaining > 0 and not released:
+            try:
+                await asyncio.wait_for(self._hold_release.wait(), remaining)
+                released = True
+            except TimeoutError:
+                pass
+        self._hold_until = None
+        self._hold_release.clear()
+        log.info("mysqld_restart_hold_end", released=released)
 
     def kill(self, sig: int = signal.SIGKILL) -> int | None:
         pid = self.pid
@@ -158,6 +214,7 @@ class MysqldSupervisor:
 
     async def stop(self, timeout: float = 120.0) -> None:
         self._stopping = True
+        self._hold_release.set()
         proc = self.proc
         if proc is not None and proc.returncode is None:
             try:

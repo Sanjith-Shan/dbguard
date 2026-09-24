@@ -42,6 +42,7 @@ class AgentSettings:
     self_fence_interval_s: float = 1.0
     clone_timeout_s: float = 3600.0
     restart_wait_s: float = 600.0
+    restart_hold_s: float = 20.0
 
     @property
     def fence_file(self) -> str:
@@ -65,6 +66,7 @@ class AgentSettings:
             repl_user=e.get("DBGUARD_REPL_USER", "repl"),
             repl_password=e.get("DBGUARD_REPL_PASSWORD", "repl"),
             source_port=int(e.get("DBGUARD_SOURCE_PORT", "3306")),
+            restart_hold_s=float(e.get("DBGUARD_RESTART_HOLD_S", "20")),
             self_fence_after_s=float(e.get("DBGUARD_SELF_FENCE_AFTER_S", "10")),
             mysqld_cmd=shlex.split(e.get("DBGUARD_MYSQLD_CMD", "docker-entrypoint.sh mysqld")),
         )

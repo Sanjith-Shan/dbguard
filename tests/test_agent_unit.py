@@ -189,7 +189,31 @@ class FakeSupervisor:
         return not self._alive
 
     async def wait_generation(self, gen, timeout):
+        if self.held_s is not None and not self.released:
+            return False
+        self._alive = True
+        self.generation += 1
         return True
+
+    held_s: float | None = None
+    released = False
+
+    def hold(self, seconds):
+        self.held_s, self.released = seconds, False
+
+    def release_hold(self):
+        if self.held_s is None:
+            return False
+        self.released = True
+        return True
+
+    @property
+    def held(self):
+        return self.held_s is not None and not self.released
+
+    @property
+    def hold_remaining_s(self):
+        return float(self.held_s) if self.held else 0.0
 
     async def stop(self, timeout=120.0):
         pass
@@ -674,3 +698,42 @@ async def test_status_answers_within_one_deadline_when_mysqld_is_slow(settings):
     assert d["mysqld_responsive"] is True and d["gtid_executed"] == f"{UUID_A}:1-10"
     assert d["heartbeat"]["ts"] is None  # never reached
     assert "deadline" in d["error"]
+
+
+# --------------------------------------------------------------------------- restart hold
+
+async def test_kill_fence_holds_mysqld_restart(settings):
+    """Review #4. After a kill fence the restarted mysqld would serve its unacked binlog
+    tail to replicas not yet repointed, so the agent holds the restart."""
+    settings.restart_hold_s = 20.0
+    db = FakeDB()
+    db.hang.add("SET GLOBAL super_read_only=1")
+    sup = FakeSupervisor()
+    agent = make_agent(settings, db, sup)
+    code, body = await agent.fence()
+    assert body["method"] == "kill" and sup.held_s == 20.0 and sup.held
+    d = await agent.status()
+    assert d["mysqld_restart_hold_s"] == 20.0
+
+
+@pytest.mark.parametrize("op", ["promote", "repoint", "rebuild"])
+async def test_role_change_ends_restart_hold(settings, op):
+    db = FakeDB()
+    sup = FakeSupervisor()
+    agent = Agent(settings, db, sup, manager_get=FakeManager("mysql-a1"),
+                  donor_db=lambda host: FakeDB())
+    sup.hold(20.0)
+    sup._alive = False
+    if op == "promote":
+        await agent.promote()
+    elif op == "repoint":
+        await agent.repoint("mysql-a2")
+    else:
+        await agent.rebuild("mysql-a2")
+    assert sup.released and not sup.held and sup.alive
+
+
+async def test_sql_fence_does_not_hold(settings):
+    sup = FakeSupervisor()
+    code, body = await make_agent(settings, FakeDB(), sup).fence()
+    assert body["method"] == "sql" and sup.held_s is None

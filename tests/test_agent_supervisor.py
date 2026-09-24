@@ -44,3 +44,29 @@ async def test_exit_code_16_restarts_without_backoff():
     # With a 5 s backoff only one start would fit in 1.5 s. Code 16 skips it.
     assert sup.generation >= 3
     await sup.stop(timeout=5)
+
+
+async def test_hold_delays_restart_until_released():
+    sup = MysqldSupervisor(SLEEPER, min_backoff=0.05)
+    await sup.start()
+    assert await sup.wait_generation(0, 5)
+    gen = sup.generation
+    sup.hold(30.0)
+    sup.kill(signal.SIGKILL)
+    assert not await sup.wait_generation(gen, 0.8)  # held, nothing restarted
+    assert sup.held and 0 < sup.hold_remaining_s <= 30.0
+    assert sup.release_hold()
+    assert await sup.wait_generation(gen, 5)
+    assert not sup.held and sup.alive
+    await sup.stop(timeout=5)
+
+
+async def test_hold_expires_on_its_own():
+    sup = MysqldSupervisor(SLEEPER, min_backoff=0.05)
+    await sup.start()
+    assert await sup.wait_generation(0, 5)
+    gen = sup.generation
+    sup.hold(0.5)
+    sup.kill(signal.SIGKILL)
+    assert await sup.wait_generation(gen, 5)
+    await sup.stop(timeout=5)

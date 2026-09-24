@@ -239,6 +239,7 @@ class Agent:
         out: dict[str, Any] = {
             "node": self.s.node, "rs": self.s.rs, "ts": time.time(),
             "mysqld_alive": None, "mysqld_responsive": False, "mysqld_pid": self.sup.pid,
+            "mysqld_restart_hold_s": self.sup.hold_remaining_s,
             "fenced": self.fenced, "super_read_only": None, "read_only": None,
             "gtid_executed": None,
             "replica": {"configured": False, "source_host": None, "io_running": None,
@@ -394,6 +395,9 @@ class Agent:
                 finally:
                     sess.close()
             else:
+                # Hold the restart so the dead primary does not come back and serve its
+                # unacked binlog tail to replicas that are not repointed yet (review #4).
+                self.sup.hold(self.s.restart_hold_s)
                 pid = self.sup.kill(signal.SIGKILL)
                 if pid is None:
                     # Nothing to kill: either mysqld is already gone, or we do not own it.
@@ -443,9 +447,22 @@ class Agent:
 
     # ------------------------------------------------------------------ role changes
 
+    async def _end_restart_hold(self, why: str) -> None:
+        """A role change needs mysqld. End a kill-fence hold and wait for it to be up."""
+        if not self.sup.held:
+            return
+        gen = self.sup.generation
+        self.sup.release_hold()
+        log.info("mysqld_restart_hold_released", by=why)
+        if not await self.sup.wait_generation(gen, self.s.restart_wait_s):
+            raise AgentError("mysqld did not restart after the hold", status=503)
+        if not await self.wait_responsive(self.s.restart_wait_s):
+            raise AgentError("mysqld not responsive after the hold", status=503)
+
     async def promote(self) -> dict[str, Any]:
         async with self._role_lock:
             t0 = time.monotonic()
+            await self._end_restart_hold("promote")
             async with self.db.session(self.s.sql_timeout_s) as s:
                 await self._role_sql(s, "STOP REPLICA")
                 await self._role_sql(s, "RESET REPLICA ALL")
@@ -472,6 +489,7 @@ class Agent:
             raise AgentError(f"bad source {source!r}", status=400)
         async with self._role_lock:
             t0 = time.monotonic()
+            await self._end_restart_hold("repoint")
             async with self.db.session(self.s.sql_timeout_s) as s:
                 await self._role_sql(s, "STOP REPLICA")
                 await self._role_sql(s, "SET GLOBAL super_read_only=1")
@@ -539,6 +557,7 @@ class Agent:
             raise AgentError(f"bad donor {donor!r}", status=400)
         async with self._role_lock:
             t0 = time.monotonic()
+            await self._end_restart_hold("rebuild")
             own = (await self._sql(lambda s: s.query("SELECT @@GLOBAL.gtid_executed AS g")))[0]
             own_gtid = _gtid(own["g"])
             ddb = self.donor_db(donor)
