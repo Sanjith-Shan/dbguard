@@ -136,6 +136,8 @@ class Agent:
         self._hb_session: Session | None = None
         self._role = "unknown"
         self.rebuilding = False
+        self.self_fence_on = True
+        self.wake_guard_on = settings.wake_guard
         self._mgr_unreachable_since: float | None = None
         self._sf_clients: int | None = None
         self.m.fenced.set(1 if self.fenced else 0)
@@ -257,6 +259,7 @@ class Agent:
             "agent_uptime_s": round(time.monotonic() - self.started_mono, 3),
             "agent_version": AGENT_VERSION,
             "self_fence": self.self_fence_state(),
+            "wake_guard": {"enabled": self.wake_guard_on},
         }
 
         t0 = time.monotonic()
@@ -511,8 +514,24 @@ class Agent:
             log.info("repoint", source=source, duration_ms=dur, semisync=self.semisync)
             return {"ok": True, "duration_ms": dur}
 
-    async def configure(self, semisync: bool | None = None, reason: str = "api"
+    def guard_toggles(self) -> dict[str, bool]:
+        return {"self_fence": self.self_fence_on, "wake_guard": self.wake_guard_on}
+
+    async def configure(self, semisync: bool | None = None, reason: str = "api", *,
+                        self_fence: bool | None = None, wake_guard: bool | None = None
                         ) -> dict[str, Any]:
+        """Re-assert semi-sync for the current role, and flip the runtime guard toggles.
+        A body with only toggles does not touch mysqld (review #12, the orchestrator
+        baseline turns both guards off without recreating containers)."""
+        if self_fence is not None:
+            self.self_fence_on = bool(self_fence)
+            self._sf_reset()
+        if wake_guard is not None:
+            self.wake_guard_on = bool(wake_guard)
+        if self_fence is not None or wake_guard is not None:
+            log.info("configure_guards", reason=reason, **self.guard_toggles())
+            if semisync is None:
+                return {"ok": True, "semisync": self.semisync, **self.guard_toggles()}
         if semisync is not None:
             self.semisync = bool(semisync)
         async with self._role_lock:
@@ -550,7 +569,8 @@ class Agent:
             log.info("configure", reason=reason, semisync=self.semisync, role=role,
                      source_enabled=want_src, replica_enabled=want_rep)
             return {"ok": True, "semisync": self.semisync, "role": role,
-                    "source_enabled": want_src, "replica_enabled": want_rep}
+                    "source_enabled": want_src, "replica_enabled": want_rep,
+                    **self.guard_toggles()}
 
     async def rebuild(self, donor: str) -> dict[str, Any]:
         if not donor or donor == self.s.node:
@@ -693,7 +713,11 @@ class Agent:
     # ------------------------------------------------------------------ wake guard
 
     async def wake_guard(self, reason: str) -> str:
-        """Returns the decision: fence | ok | fence_file | leave | fence_failed."""
+        """Returns the decision: fence | ok | fence_file | leave | fence_failed | disabled."""
+        if not self.wake_guard_on:
+            log.info("wake_guard", reason=reason, decision="disabled")
+            self.m.wake_guard.labels(reason=reason, decision="disabled").inc()
+            return "disabled"
         url = f"{self.s.manager_url.rstrip('/')}/v1/sets/{self.s.rs}/primary" \
             if self.s.manager_url else None
         answer: dict[str, Any] | None = None
@@ -797,7 +821,8 @@ class Agent:
     # ------------------------------------------------------------------ self-fence lease
 
     def self_fence_enabled(self) -> bool:
-        return bool(self.semisync and self.s.self_fence_after_s > 0 and self.s.manager_url)
+        return bool(self.self_fence_on and self.semisync and self.s.self_fence_after_s > 0
+                    and self.s.manager_url)
 
     def manager_unreachable_s(self) -> float:
         since = self._mgr_unreachable_since

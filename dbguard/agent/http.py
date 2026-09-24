@@ -84,10 +84,14 @@ async def rebuild(request: web.Request) -> web.Response:
 
 async def configure(request: web.Request) -> web.Response:
     body = await _body(request)
-    semisync = body.get("semisync")
-    if semisync is not None and not isinstance(semisync, bool):
-        raise AgentError("semisync must be a boolean", status=400)
-    return web.json_response(await request.app[AGENT_KEY].configure(semisync))
+    vals = {}
+    for key in ("semisync", "self_fence", "wake_guard"):
+        v = body.get(key)
+        if v is not None and not isinstance(v, bool):
+            raise AgentError(f"{key} must be a boolean", status=400)
+        vals[key] = v
+    return web.json_response(await request.app[AGENT_KEY].configure(
+        vals["semisync"], self_fence=vals["self_fence"], wake_guard=vals["wake_guard"]))
 
 
 async def kill_mysqld(request: web.Request) -> web.Response:

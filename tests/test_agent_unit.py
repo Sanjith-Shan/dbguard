@@ -737,3 +737,40 @@ async def test_sql_fence_does_not_hold(settings):
     sup = FakeSupervisor()
     code, body = await make_agent(settings, FakeDB(), sup).fence()
     assert body["method"] == "sql" and sup.held_s is None
+
+
+# --------------------------------------------------------------------------- guard toggles
+
+async def test_configure_toggles_guards_without_touching_mysqld(settings, client_factory):
+    """Review #12. The orchestrator baseline turns both DBGuard guards off at runtime."""
+    db = FakeDB()
+    db.sro = 0
+    db.semisync_clients = 0
+    manager = FakeManager("mysql-zz", reachable=False)
+    open(settings.fence_file, "w").close()  # noqa: ASYNC230  would make the guard fence
+    agent = make_agent(settings, db, manager=manager)
+    c = await client_factory(agent)
+    r = await c.post("/configure", json={"self_fence": False, "wake_guard": False})
+    assert r.status == 200
+    assert await r.json() == {"ok": True, "semisync": True, "self_fence": False,
+                              "wake_guard": False}
+    assert db.log == []  # toggles only, no SQL
+    d = await (await c.get("/status")).json()
+    assert d["self_fence"]["enabled"] is False and d["wake_guard"] == {"enabled": False}
+    assert await agent.wake_guard("wake") == "disabled"
+    agent._mgr_unreachable_since = time.monotonic() - 60
+    assert await agent.self_fence_tick() == "disabled"
+    assert "SET GLOBAL super_read_only=1" not in db.executed()
+    r = await c.post("/configure", json={"wake_guard": True, "self_fence": True})
+    assert (await r.json())["wake_guard"] is True
+    d = await (await c.get("/status")).json()
+    assert d["self_fence"]["enabled"] is True and d["wake_guard"] == {"enabled": True}
+    assert await agent.wake_guard("wake") == "fence_file"
+    r = await c.post("/configure", json={"wake_guard": "no"})
+    assert r.status == 400
+
+
+def test_wake_guard_env_default_and_off():
+    assert AgentSettings.from_env({}).wake_guard is True
+    assert AgentSettings.from_env({"DBGUARD_WAKE_GUARD": "0"}).wake_guard is False
+    assert AgentSettings.from_env({"DBGUARD_RESTART_HOLD_S": "5"}).restart_hold_s == 5.0
