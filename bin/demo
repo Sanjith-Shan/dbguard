@@ -71,6 +71,7 @@ def main() -> int:
     pause = not a.no_pause
     rs = a.rs
     fleet = chaos.Fleet(rs, "dbguard")
+    docker.pin_compose_env(chaos.set_nodes(rs))
     run_id = f"demo-{int(time.time())}"
     run_dir = chaos.TMP / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

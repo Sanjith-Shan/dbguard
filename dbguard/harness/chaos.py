@@ -1498,6 +1498,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     verify_mode(a.mode)
+    log(f"compose env pinned to the running fleet: {docker.pin_compose_env(set_nodes(a.rs))}")
     scenarios = ALL_ORDER if a.all else [a.scenario]
     common = dict(runs=a.runs, mode=a.mode, rs=a.rs, clients=a.clients,
                   workload_seconds=a.workload_seconds, inject_after=a.inject_after,

@@ -102,8 +102,36 @@ def exec_(container: str, cmd: list[str] | str, *, check: bool = True, user: str
 exec = exec_
 
 
-def up(*services: str, profiles: tuple[str, ...] = (), wait: bool = False) -> None:
-    extra = ["up", "-d"] + (["--wait"] if wait else []) + list(services)
+def env_of(container: str) -> dict[str, str]:
+    cp = _run(["docker", "inspect", "-f", "{{json .Config.Env}}", container], check=False,
+              mutate=False)
+    if cp.returncode != 0:
+        return {}
+    return dict(e.split("=", 1) for e in json.loads(cp.stdout or "[]") if "=" in e)
+
+
+def pin_compose_env(nodes: list[str], manager: str = "dbguard") -> dict[str, str]:
+    """Make later `docker compose up` calls reproduce the running fleet's mode. Compose
+    interpolates DBGUARD_SEMISYNC and DBGUARD_MODE from the caller's environment, so a node
+    restarted from a shell without them would come back with the defaults (semi-sync on)."""
+    pinned = {}
+    for n in nodes:
+        v = env_of(n).get("DBGUARD_SEMISYNC")
+        if v is not None:
+            pinned["DBGUARD_SEMISYNC"] = v
+            break
+    menv = env_of(manager)
+    if menv.get("DBGUARD_MODE"):
+        pinned["DBGUARD_MODE"] = menv["DBGUARD_MODE"]
+    for k, v in pinned.items():
+        if os.environ.get(k) not in (None, v):
+            log(f"WARNING {k}={os.environ[k]} in the environment but the fleet runs {k}={v}, using {v}")
+        os.environ[k] = v
+    return pinned
+
+
+def up(*services: str, profiles: tuple[str, ...] = (), wait: bool = False, deps: bool = False) -> None:
+    extra = ["up", "-d"] + ([] if deps else ["--no-deps"]) + (["--wait"] if wait else []) + list(services)
     _run(compose_args(*extra, profiles=profiles), timeout=600)
 
 
