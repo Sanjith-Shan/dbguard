@@ -1307,8 +1307,18 @@ def sc_kill(run: Run) -> None:
         run.row["naive_netem_ms"] = float(o.naive_netem_ms)
         run.row["netem_ms"] = float(o.naive_netem_ms)
         run.row["netem_direction"] = "primary->replicas"
+        run.row["host_death"] = True
         note(run, f"{o.mode} kill run with tc netem delay {o.naive_netem_ms} ms on the primary's "
-                  "packets to the replicas")
+                  "packets to the replicas, and host death: the primary's packets to the replicas "
+                  "are dropped at the instant of SIGKILL, so what sat in the delay queue is lost as "
+                  "in a power failure (docker kill alone lets the kernel drain the queue)")
+        rep_ips = [docker.container_ip(r) for r in reps]
+
+        def host_death(p: str) -> None:
+            docker.netns(p, " && ".join(f"iptables -I OUTPUT -d {ip} -j DROP" for ip in rep_ips))
+            docker.kill(p, "KILL")
+        _failover_common(run, host_death)
+        return
     _failover_common(run, lambda p: docker.kill(p, "KILL"))
 
 
