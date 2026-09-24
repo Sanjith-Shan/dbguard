@@ -77,7 +77,7 @@ The measured distribution follows.
 | primary frozen | not yet measured | | |
 | primary partitioned from replicas | 11.58 s | 14.23 s | 30 |
 | planned switchover (client stall) | 1.44 s | 6.03 s | 10 |
-| naive, primary killed | 5.45 s | 5.85 s | 26 |
+| naive, primary killed | 5.45 s | 5.85 s | 30 |
 | naive, primary killed, 2 ms replica delay | pending | | |
 | DBGuard, primary killed, 2 ms replica delay | pending | | |
 | Orchestrator, primary killed | not yet measured | | |

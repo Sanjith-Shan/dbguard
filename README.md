@@ -22,7 +22,7 @@ under the configuration below, and only as measured. With
 `rpl_semi_sync_source_wait_for_replica_count=1`, losing the primary and the one replica
 that acknowledged a write at the same time loses that write, and the `kill-two` experiment
 below publishes exactly that boundary. The naive asynchronous baseline also lost nothing in
-26 kills on this single host, because replication between containers on one machine is
+30 kills on this single host, because replication between containers on one machine is
 faster than the crash window, so the lab shows the async window only once a replica delay is
 added (the 2 ms table below).
 
@@ -48,7 +48,7 @@ under. The sentence under each table says the same.
 |---|---|
 | Primary kills, DBGuard | 30 runs |
 | Acknowledged writes lost by DBGuard across every measured injection | **0** |
-| Acknowledged writes lost by the asynchronous baseline, 0 ms and 2 ms replica delay | **0** of 26 kills at 0 ms, 2 ms rows pending |
+| Acknowledged writes lost by the asynchronous baseline, 0 ms and 2 ms replica delay | **0** of 30 kills at 0 ms, 2 ms rows pending |
 | Failover after a primary kill, median | **8.83 s** |
 | False failovers with the manager partitioned from the primary | **0** of 30 |
 | Commit latency cost of semi-sync at the median, no added delay | +1.6 ms (5.9 ms on vs 4.2 ms off) |
@@ -61,7 +61,7 @@ the first successful write through HAProxy, measured on the clients' clock.
 | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | single-writer violations | converged |
 |---|---|---|---|---|---|---|---|---|
 | dbguard | 30 | 8.83 | 9.75 | 0 | 0 | 0 | 0 | 30/30 |
-| naive | 26 | 5.45 | 5.85 | 0 | 0 | 0 | 0 | 26/26 |
+| naive | 30 | 5.45 | 5.85 | 0 | 0 | 0 | 0 | 30/30 |
 
 The dbguard row ran under the earlier `agent-live-primary-check` configuration (the agent
 answered HAProxy's health check with a live SQL query, HAProxy `fall 1`, before the rejoin
@@ -92,7 +92,7 @@ Rejoin of the killed primary once its container is back.
 | scenario | mode | rejoins | repoint | rebuild | other | phantom GTIDs mean | phantom GTIDs max | rejoin p50 s | rejoin p99 s |
 |---|---|---|---|---|---|---|---|---|---|
 | kill | dbguard | 30 | 5 | 25 | 0 | 3.37 | 8 | 4.46 | 16.55 |
-| kill | naive | 26 | 7 | 19 | 0 | 2.00 | 7 | 6.63 | 8.32 |
+| kill | naive | 30 | 8 | 22 | 0 | 2.33 | 8 | 6.64 | 8.62 |
 
 Same configuration as the table above. Repoint means the old primary's `gtid_executed` was a
 subset of the new primary's after crash recovery, so it rejoined with no data copy. Rebuild
