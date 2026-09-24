@@ -1,15 +1,12 @@
-"""`dbguard`, the manager daemon.
+"""``dbguard``, the manager daemon's entry point.
 
     dbguard --config deploy/fleet.yaml [--mode naive] [--rejoin manual]
             [--state-dir /var/lib/dbguard] [--listen 0.0.0.0:9090] [--host-ports]
 
-Running on the host instead of in the compose network: ``--host-ports`` (or
-``DBGUARD_HOST_PORTS=1``) reaches each node on its published ports (mysql-a1 is
-127.0.0.1:13311 and agent 127.0.0.1:18011), and ``DBGUARD_HOST_MAP`` overrides single
-nodes, ``mysql-a1=127.0.0.1:13311:18011,...``. Stop the in-fleet ``dbguard`` container
-first: two managers acting on one fleet is exactly the split brain this avoids.
-
-SIGTERM and SIGINT stop polling and exit. Shutdown never acts on the fleet.
+``--host-ports`` or ``DBGUARD_HOST_PORTS=1`` runs it on the host against the published ports,
+and ``DBGUARD_HOST_MAP`` overrides single nodes. Stop the in-fleet ``dbguard`` container first,
+because two managers acting on one fleet is exactly the split brain DBGuard exists to avoid.
+SIGTERM and SIGINT stop polling and exit, and shutdown never acts on the fleet.
 """
 
 from __future__ import annotations
@@ -24,14 +21,15 @@ import click
 import structlog
 from aiohttp import web
 
+from dbguard.config import load_config
 from dbguard.manager.api import make_app
 from dbguard.manager.client import Addressing
-from dbguard.manager.config import load_config
 from dbguard.manager.manager import Manager
 from dbguard.manager.replacement import ComposeProvisioner, NullProvisioner
 
 
 def setup_logging(level: str = "INFO") -> None:
+    """structlog JSON lines on stdout, the format every DBGuard process logs in."""
     logging.basicConfig(format="%(message)s", stream=sys.stdout,
                         level=getattr(logging, level.upper(), logging.INFO))
     structlog.configure(
@@ -50,6 +48,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 async def serve(cfg, *, mode, rejoin, state_dir, listen, host_ports, provision) -> None:
+    """Start the API and every set's loop, then run until SIGTERM or SIGINT."""
     log = structlog.get_logger("dbguard.manager.main")
     addr = Addressing.from_env(cfg.agent_port, cfg.mysql.port, host_ports=host_ports)
     prov = ComposeProvisioner() if provision == "compose" else (

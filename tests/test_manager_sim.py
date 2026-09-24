@@ -11,7 +11,7 @@ from dbguard.events import Event
 from dbguard.gtid import GtidSet
 from dbguard.manager.api import make_app
 from dbguard.manager.client import Addressing
-from dbguard.manager.config import FleetConfig
+from dbguard.config import FleetConfig
 from dbguard.manager.fake import FakeFleet, FakeProber
 from dbguard.manager.manager import Manager
 from dbguard.manager.model import State
