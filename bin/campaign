@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Unattended, resumable chaos campaign.
+
+Runs a queue of (scenario, mode, runs, extra args) entries one at a time through bin/chaos,
+appending rows to results/<scenario>_<mode>.jsonl. An entry whose row count already meets
+its target is skipped, so the campaign can be restarted at any point. The fleet is recreated
+(make down, make up or make up-naive) whenever the next entry needs another fleet mode.
+After every entry it rewrites results/SUMMARY.md with bin/report and logs one ENTRY line
+with the key numbers. It stops when free disk drops under --min-free-gib.
+
+  nohup bin/campaign > results/campaign.out 2>&1 &
+  bin/campaign --dry-run          # print the plan and what is left
+
+The queue lives in results/campaign-queue.json (written with the default on first run, edit
+it to change targets or add args such as --naive-netem-ms 2).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+RESULTS = REPO / "results"
+LOG = RESULTS / "campaign.log"
+QUEUE = RESULTS / "campaign-queue.json"
+PY = str(REPO / ".venv" / "bin" / "python") if (REPO / ".venv" / "bin" / "python").exists() else sys.executable
+COST_CELLS = [(ss, n) for ss in ("on", "off") for n in (0, 2, 20)]
+
+DEFAULT_QUEUE = [
+    {"scenario": "kill", "mode": "dbguard", "runs": 30},
+    {"scenario": "partition-manager", "mode": "dbguard", "runs": 30},
+    {"scenario": "kill", "mode": "naive", "runs": 30},
+    {"scenario": "partition-manager", "mode": "naive", "runs": 30},
+    {"scenario": "switchover", "mode": "dbguard", "runs": 30},
+    {"scenario": "hang-container", "mode": "dbguard", "runs": 30},
+    {"scenario": "hang-process", "mode": "dbguard", "runs": 30},
+    {"scenario": "partition-replicas", "mode": "dbguard", "runs": 30},
+    {"scenario": "kill-two", "mode": "dbguard", "runs": 30},
+    {"scenario": "cost", "mode": "dbguard", "runs": 3, "args": ["--cost-seconds", "60"]},
+    {"scenario": "replica-loss", "mode": "dbguard", "runs": 30, "args": ["--data-mb", "200"]},
+    {"scenario": "disk-full", "mode": "dbguard", "runs": 30},
+    {"scenario": "hang-container", "mode": "naive", "runs": 30},
+    {"scenario": "partition-replicas", "mode": "naive", "runs": 30},
+    {"scenario": "kill", "mode": "orchestrator", "runs": 30},
+    {"scenario": "partition-manager", "mode": "orchestrator", "runs": 30},
+    {"scenario": "hang-container", "mode": "orchestrator", "runs": 30},
+]
+
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    with LOG.open("a") as fh:
+        fh.write(line + "\n")
+
+
+def rows(scenario: str, mode: str) -> list[dict]:
+    p = RESULTS / f"{scenario}_{mode}.jsonl"
+    out = []
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def expand(entry: dict) -> list[dict]:
+    """cost becomes one sub-entry per (semi-sync, netem) cell, each with its own target."""
+    if entry["scenario"] != "cost":
+        return [entry]
+    cells = COST_CELLS if entry["mode"] == "dbguard" else [("off", n) for n in (0, 2, 20)]
+    return [dict(entry, cell=(ss, n), args=list(entry.get("args", [])) +
+                 ["--semisync", ss, "--netem", str(n)]) for ss, n in cells]
+
+
+def done_count(e: dict) -> int:
+    rs = rows(e["scenario"], e["mode"])
+    if "cell" in e:
+        ss, n = e["cell"]
+        rs = [r for r in rs if bool(r.get("semisync", True)) == (ss == "on")
+              and float(r.get("netem_ms") or 0) == float(n)]
+    return len(rs)
+
+
+def fleet_mode() -> str | None:
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:19090/v1/status", timeout=3) as r:
+            return json.load(r).get("mode")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ensure_fleet(mode: str) -> None:
+    want = "naive" if mode == "naive" else "dbguard"
+    have = fleet_mode()
+    if have == want:
+        return
+    if mode == "orchestrator" and have is None:
+        # bin/chaos stops the manager during an orchestrator entry; it restarts it at teardown
+        subprocess.run(["docker", "compose", "-f", "deploy/docker-compose.yml", "--profile",
+                        "orchestrator", "stop", "orchestrator"], cwd=REPO)
+        subprocess.run(["docker", "compose", "-f", "deploy/docker-compose.yml", "up", "-d",
+                        "dbguard"], cwd=REPO)
+        time.sleep(10)
+        if fleet_mode() == want:
+            return
+    log(f"FLEET recreate: running {have}, need {want}")
+    subprocess.run(["make", "down"], cwd=REPO, check=False)
+    r = subprocess.run(["make", "up-naive" if want == "naive" else "up"], cwd=REPO)
+    if r.returncode != 0 or fleet_mode() != want:
+        raise SystemExit(f"fleet recreate for {want} failed (rc={r.returncode})")
+    log(f"FLEET ready in {want} mode")
+
+
+def free_gib() -> float:
+    return shutil.disk_usage("/System/Volumes/Data" if Path("/System/Volumes/Data").exists() else "/").free / 2**30
+
+
+def prune_tmp() -> None:
+    tmp = RESULTS / "tmp"
+    if not tmp.exists():
+        return
+    for p in list(tmp.rglob("*.ack.jsonl")) + list(tmp.rglob("*.stdout")) + list(tmp.rglob("*.stderr")):
+        if p.name.startswith("checker"):
+            continue
+        try:
+            if time.time() - p.stat().st_mtime > 600:
+                p.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def summary_line(e: dict) -> str:
+    try:
+        s = json.loads((RESULTS / "summary.json").read_text())
+    except Exception:  # noqa: BLE001
+        return ""
+    sc, mode = e["scenario"], e["mode"]
+    if sc == "cost":
+        c = [x for x in s.get("cost", []) if x["mode"] == mode]
+        return "; ".join(f"ss={'on' if x['semisync'] else 'off'} netem={x['netem_ms']:g}: "
+                         f"p50={x['commit_p50_ms']} p99={x['commit_p99_ms']} w/s={x['writes_per_s']}"
+                         for x in c)
+    if sc == "switchover":
+        x = next((x for x in s.get("switchover", []) if x["mode"] == mode), None)
+        return json.dumps(x) if x else ""
+    if sc == "replica-loss":
+        x = next((x for x in s.get("replica_loss", []) if x["mode"] == mode), None)
+        return json.dumps(x) if x else ""
+    x = next((x for x in s.get("failover", []) if x["scenario"] == sc and x["mode"] == mode), None)
+    if not x:
+        return ""
+    keys = ["runs", "failover_p50_s", "failover_p99_s", "lost_acked_writes", "runs_with_loss",
+            "phantom_writes", "single_writer_violations", "false_failovers", "converged_runs",
+            "writes_on_woken_primary", "stall_p50_s", "stall_p99_s", "rs2_state_changes"]
+    return " ".join(f"{k}={x.get(k)}" for k in keys)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--min-free-gib", type=float, default=5.0)
+    ap.add_argument("--retries", type=int, default=2, help="re-run an entry that fell short")
+    ap.add_argument("--only", default=None, help="comma list of scenario_mode to run")
+    a = ap.parse_args()
+    RESULTS.mkdir(exist_ok=True)
+    if not QUEUE.exists():
+        QUEUE.write_text(json.dumps(DEFAULT_QUEUE, indent=2) + "\n")
+    queue = [x for e in json.loads(QUEUE.read_text()) for x in expand(e)]
+    if a.only:
+        keep = set(a.only.split(","))
+        queue = [e for e in queue if f"{e['scenario']}_{e['mode']}" in keep]
+    left = [(e, max(0, e["runs"] - done_count(e))) for e in queue]
+    total_left = sum(n for _, n in left)
+    for e, n in left:
+        print(f"{e['scenario']:<20} {e['mode']:<13} {str(e.get('cell', '')):<14} target {e['runs']:>3} "
+              f"have {done_count(e):>3} left {n}")
+    print(f"runs left: {total_left}")
+    if a.dry_run:
+        return 0
+    log(f"CAMPAIGN start, {total_left} runs left, free {free_gib():.1f} GiB")
+    t_camp = time.time()
+    runs_done = 0
+    for e, _ in left:
+        for attempt in range(a.retries + 1):
+            need = e["runs"] - done_count(e)
+            if need <= 0:
+                break
+            free = free_gib()
+            if free < a.min_free_gib:
+                log(f"STOP free disk {free:.1f} GiB < {a.min_free_gib} GiB")
+                return 3
+            ensure_fleet(e["mode"])
+            label = f"{e['scenario']}/{e['mode']}" + (f" {e['cell']}" if "cell" in e else "")
+            remaining = sum(max(0, x["runs"] - done_count(x)) for x, _ in left)
+            rate = (time.time() - t_camp) / runs_done if runs_done else None
+            eta = f"{remaining * rate / 3600:.1f} h" if rate else "?"
+            log(f"ENTRY start {label}: {need} runs (attempt {attempt + 1}), campaign left "
+                f"{remaining} runs, ETA {eta}, free {free:.1f} GiB")
+            before = done_count(e)
+            t0 = time.time()
+            cmd = [PY, str(REPO / "bin" / "chaos"), "--scenario", e["scenario"], "--mode", e["mode"],
+                   "--runs", str(need), "--keep-going", *e.get("args", [])]
+            log("$ " + " ".join(cmd[1:]))
+            with (RESULTS / "campaign.chaos.log").open("a") as fh:
+                rc = subprocess.run(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT).returncode
+            got = done_count(e) - before
+            runs_done += got
+            prune_tmp()
+            subprocess.run([PY, str(REPO / "bin" / "report")], cwd=REPO, stdout=subprocess.DEVNULL)
+            per = (time.time() - t0) / got if got else float("nan")
+            log(f"ENTRY done {label}: +{got} rows (have {done_count(e)}/{e['runs']}), rc={rc}, "
+                f"{per:.0f} s/run | {summary_line(e)}")
+    log(f"CAMPAIGN done in {(time.time() - t_camp) / 3600:.1f} h")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
