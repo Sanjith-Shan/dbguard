@@ -1,0 +1,1 @@
+After a reboot, from the repo root: `open -a Docker`, wait for `docker info` to succeed, then `source .venv/bin/activate && make up && nohup bin/campaign-watchdog > results/watchdog.out 2>&1 &` (the watchdog promotes a set left all read-only and restarts `bin/campaign`, which resumes from the rows already in results/).
