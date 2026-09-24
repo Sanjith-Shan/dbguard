@@ -1,4 +1,9 @@
-"""Identifier quoting, ALTER clause parsing and the INSTANT eligibility rule."""
+"""Identifier quoting, ALTER clause parsing and the INSTANT eligibility rule.
+
+``parse_alter`` classifies each top-level clause of ``--alter`` so preflight can refuse the
+ones the copy cannot follow (primary key changes, renames). ``instant_verdict`` is kept
+deliberately narrower than MySQL's own rule, to the case the tool has measured.
+"""
 
 from __future__ import annotations
 
@@ -17,18 +22,22 @@ def q(name: str) -> str:
 
 
 def qt(db: str, table: str) -> str:
+    """Quote ``db.table``."""
     return f"{q(db)}.{q(table)}"
 
 
 def shadow_name(table: str) -> str:
+    """The shadow table the copy fills."""
     return SHADOW_PREFIX + table
 
 
 def old_name(table: str) -> str:
+    """The name the original table gets at the swap."""
     return OLD_PREFIX + table
 
 
 def trigger_names(table: str) -> dict[str, str]:
+    """The three trigger names, by event."""
     return {ev: f"{TRIGGER_PREFIX}{ev.lower()[:3]}_{table}" for ev in ("INSERT", "UPDATE", "DELETE")}
 
 
@@ -95,6 +104,7 @@ def _strip_quoted(text: str) -> str:
 
 
 def _ident(tok: str) -> str:
+    """An identifier token without its backticks."""
     tok = tok.strip()
     if tok.startswith("`") and tok.endswith("`"):
         return tok[1:-1].replace("``", "`")
@@ -106,6 +116,8 @@ _IDENT = r"(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)"
 
 @dataclass
 class Clause:
+    """One top-level ALTER clause and what kind of change it is."""
+
     text: str
     kind: str                 # add_column, add_index, drop_column, drop_pk, drop_index,
                               # modify, change, rename_column, rename_table, other
@@ -116,10 +128,13 @@ class Clause:
 
 @dataclass
 class AlterSpec:
+    """The parsed ``--alter`` text."""
+
     text: str
     clauses: list[Clause] = field(default_factory=list)
 
     def kinds(self) -> set[str]:
+        """The set of clause kinds."""
         return {c.kind for c in self.clauses}
 
 
@@ -183,6 +198,8 @@ def parse_alter(text: str) -> AlterSpec:
 
 @dataclass
 class InstantVerdict:
+    """Whether ALGORITHM=INSTANT will be tried, and why or why not."""
+
     ok: bool
     reason: str
 

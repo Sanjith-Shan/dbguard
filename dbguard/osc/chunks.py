@@ -32,6 +32,7 @@ def _bound(pk: list[str], vals: tuple, lower: bool) -> tuple[str, list[Any]]:
 
 
 def bound_arg_count(k: int) -> int:
+    """How many arguments one bound of a ``k``-column key takes."""
     return 1 if k == 1 else 1 + k * (k + 1) // 2
 
 
@@ -47,6 +48,7 @@ def range_predicate(pk: list[str], lo: tuple | None, hi: tuple | None) -> tuple[
 
 
 def order_by(pk: list[str], desc: bool = False) -> str:
+    """ORDER BY list for the primary key."""
     d = " DESC" if desc else ""
     return ", ".join(q(c) + d for c in pk)
 
@@ -62,11 +64,13 @@ def boundary_sql(db: str, table: str, pk: list[str], lo: tuple | None, max_pk: t
 
 
 def max_pk_sql(db: str, table: str, pk: list[str]) -> str:
+    """The largest primary key, where the copy stops (later rows come through triggers)."""
     return (f"SELECT {', '.join(q(c) for c in pk)} FROM {qt(db, table)} FORCE INDEX (PRIMARY) "
             f"ORDER BY {order_by(pk, desc=True)} LIMIT 1")
 
 
 def row_tuple(row: dict, pk: list[str]) -> tuple:
+    """A row's primary key as a tuple."""
     return tuple(row[c] for c in pk)
 
 
@@ -94,6 +98,7 @@ def checksum_expr(cols: list[str]) -> str:
 
 def checksum_sql(db: str, table: str, cols: list[str], pk: list[str],
                  lo: tuple | None, hi: tuple | None) -> tuple[str, list[Any]]:
+    """COUNT and order-independent CRC of one chunk, read under shared locks."""
     pred, args = range_predicate(pk, lo, hi)
     sql = (f"SELECT COUNT(*) AS cnt, COALESCE({checksum_expr(cols)}, 0) AS crc "
            f"FROM {qt(db, table)} FORCE INDEX (PRIMARY) WHERE {pred} FOR SHARE")
@@ -123,6 +128,7 @@ class ChunkSizer:
     adaptive: bool = True
 
     def update(self, elapsed_s: float, rows: int) -> int:
+        """Resize after a chunk of ``rows`` took ``elapsed_s``, returning the new size."""
         # a short chunk (the last one) says little about speed, keep the size
         if not self.adaptive or rows < self.size * 0.5:
             return self.size

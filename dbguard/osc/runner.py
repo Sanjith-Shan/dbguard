@@ -46,11 +46,13 @@ DUP_KEY_WARNING = 1062
 
 
 class OscError(RuntimeError):
-    pass
+    """The change was refused or aborted. The message says why and what was cleaned up."""
 
 
 @dataclass
 class Options:
+    """What to change and how, from the ``dbgctl osc run`` flags."""
+
     db: str
     table: str
     alter: str
@@ -73,18 +75,22 @@ class Options:
 
 @dataclass
 class Preflight:
+    """Preflight's findings. Any error refuses the change before anything is created."""
+
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     instant: InstantVerdict | None = None
 
     @property
     def ok(self) -> bool:
+        """True when nothing refuses the change."""
         return not self.errors
 
 
 def preflight(t: TableInfo, spec: AlterSpec, *, shadow: TableInfo | None = None,
               old: TableInfo | None = None, read_only: bool = False,
               datadir: str | None = None) -> Preflight:
+    """Check the table and the ALTER against every limit in docs/OSC.md. Pure, no SQL."""
     p = Preflight()
     if read_only:
         p.errors.append("server is read-only (super_read_only or read_only is 1). Point --host "
@@ -144,6 +150,8 @@ def preflight(t: TableInfo, spec: AlterSpec, *, shadow: TableInfo | None = None,
 
 @dataclass
 class ShadowCheck:
+    """What the ALTERed shadow allows. Columns whose type changed are copied, not checksummed."""
+
     errors: list[str]
     copy_cols: list[str]       # columns present and writable in both tables
     checksum_cols: list[str]   # copy_cols whose type did not change
@@ -151,6 +159,7 @@ class ShadowCheck:
 
 
 def validate_shadow(src: TableInfo, shadow: TableInfo, allow_type_change: bool) -> ShadowCheck:
+    """Compare the ALTERed shadow with the source and refuse changes the triggers could fail on."""
     errors = []
     if [c.lower() for c in shadow.pk] != [c.lower() for c in src.pk]:
         errors.append(f"the ALTER changed the primary key from {src.pk} to {shadow.pk}")
@@ -201,12 +210,15 @@ def trigger_sql(db: str, table: str, shadow: str, cols: list[str], pk: list[str]
 
 
 def swap_sql(db: str, table: str) -> str:
+    """The atomic RENAME TABLE that swaps the shadow in."""
     return (f"RENAME TABLE {qt(db, table)} TO {qt(db, old_name(table))}, "
             f"{qt(db, shadow_name(table))} TO {qt(db, table)}")
 
 
 @dataclass
 class ChunkSum:
+    """Row count and CRC of one chunk in the source and in the shadow."""
+
     lo: tuple | None
     hi: tuple | None
     src_cnt: int
@@ -216,10 +228,12 @@ class ChunkSum:
 
     @property
     def match(self) -> bool:
+        """Same count and CRC on both sides."""
         return self.src_cnt == self.dst_cnt and self.src_crc == self.dst_crc
 
 
 def compare_checksums(sums: list[ChunkSum]) -> list[ChunkSum]:
+    """The chunks that differ."""
     return [s for s in sums if not s.match]
 
 
@@ -245,6 +259,7 @@ class Progress:
         self.warned = False
 
     def init(self, alter: str) -> None:
+        """Create the progress table if needed and start this table's row."""
         if not self.enabled:
             return
         try:
@@ -258,6 +273,7 @@ class Progress:
             self._warn(e)
 
     def update(self, **fields: Any) -> None:
+        """Update this table's row, never raising."""
         if not self.enabled or not fields:
             return
         sets = ", ".join(f"{k}=%s" for k in fields) + ", updated=NOW(6)"
@@ -298,10 +314,12 @@ class Throttle:
         return self.throttled_s + extra
 
     def threads_running(self) -> int:
+        """The server's Threads_running now."""
         rows = self.ex.query("SHOW GLOBAL STATUS LIKE 'Threads_running'")
         return int(rows[0].get("Value") or rows[0].get("VALUE") or 0) if rows else 0
 
     def lag(self) -> float | None:
+        """The worst replica lag, asked at most every ``lag_every_s``."""
         if self.lag_fn is None:
             return 0.0
         now = self.clock()
@@ -314,6 +332,7 @@ class Throttle:
         return self._lag
 
     def reason(self) -> str | None:
+        """Why the copy must pause now, or None."""
         tr = self.threads_running()
         if tr > self.max_threads:
             return f"Threads_running {tr} > {self.max_threads}"
@@ -325,6 +344,7 @@ class Throttle:
         return None
 
     def wait(self, tick: Callable[[], None] | None = None) -> float:
+        """Pause until no reason holds, returning the seconds waited."""
         start = self._wait_start = self.clock()
         while True:
             r = self.reason()
@@ -368,6 +388,7 @@ def manager_lag_fn(manager_url: str, rs: str, timeout: float = 1.0) -> Callable[
 # ------------------------------------------------------------------ the runner
 
 def _retry(fn: Callable[[], Any], attempts: int = 10, sleep: Callable = time.sleep) -> Any:
+    """Call ``fn``, retrying lock wait timeouts and deadlocks with a short backoff."""
     for i in range(attempts):
         try:
             return fn()
@@ -379,6 +400,8 @@ def _retry(fn: Callable[[], Any], attempts: int = 10, sleep: Callable = time.sle
 
 
 class Runner:
+    """Runs one online schema change and cleans up whatever it created if it fails."""
+
     def __init__(self, opts: Options, connect: Callable[[], Executor], *,
                  lag_fn: Callable[[], float | None] | None = None,
                  log: Callable[[str], None] = print,
@@ -403,15 +426,18 @@ class Runner:
         self.result["timeline"].append((what, round(self.clock() - self._t0, 3)))
 
     def _server_facts(self) -> tuple[bool, str | None]:
+        """(read-only, datadir) of the server."""
         r = self.ex.query("SELECT @@GLOBAL.super_read_only AS sro, @@GLOBAL.read_only AS ro, "
                           "@@GLOBAL.datadir AS datadir")[0]
         return bool(int(r["sro"]) or int(r["ro"])), r["datadir"]
 
     def _t(self, name: str) -> TableInfo:
+        """Load table ``name`` in the target schema."""
         return load_table(self.ex, self.o.db, name)
 
     # -- entry point
     def run(self) -> dict[str, Any]:
+        """Run the change. Returns the result dict, raising OscError after cleanup on failure."""
         t0 = self._t0 = self.clock()
         self.result["timeline"] = []
         self.ex = self.connect()
@@ -777,6 +803,7 @@ def cleanup(ex: Executor, db: str, table: str, *, drop_old: bool = False,
 
 
 def read_progress(ex: Executor, db: str | None = None) -> list[dict[str, Any]]:
+    """Rows of dbguard.osc_progress, newest first, [] when nothing ever ran."""
     sql = ("SELECT db, tbl, phase, method, rows_copied, rows_est, chunks, chunk_size, "
            "throttled_s, started, updated, owner, note, "
            "TIMESTAMPDIFF(MICROSECOND, updated, NOW(6)) / 1e6 AS age_s "

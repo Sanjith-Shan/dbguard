@@ -1,15 +1,10 @@
-"""`dbgctl osc bench`: what an ALTER costs the foreground, measured on a throwaway server.
+"""``dbgctl osc bench``, what an ALTER costs the foreground, measured on a throwaway server.
 
-For each mode the table is rebuilt from a seed copy, a foreground writer (N threads of
-single-row INSERTs and UPDATEs on the chaos.writes shape, autocommit) runs for phase_s
-before, during and phase_s after the change, and every operation's latency is recorded.
-
-Modes
-  osc          dbgctl osc run with the copy path (INSTANT disabled), default throttle
-  osc-throttled  the same with --max-load-threads set low enough to engage
-  inplace      ALTER TABLE ... ALGORITHM=INPLACE, LOCK=NONE (MySQL's own online DDL)
-  instant      ALTER TABLE ... ALGORITHM=INSTANT with the instant alter
-  osc-instant  dbgctl osc run with the instant alter, to show it picks INSTANT itself
+For each mode the table is rebuilt from a seed copy, and a writer (N threads of single-row
+INSERTs and UPDATEs on the chaos.writes shape) runs before, during and after the change while
+every operation's latency is recorded. Modes are ``osc`` (the copy path), ``osc-throttled``,
+``inplace`` (MySQL's own online DDL), ``instant``, and ``osc-instant``, which shows the tool
+picks INSTANT itself. Afterwards every acknowledged insert must be in the new table.
 """
 
 from __future__ import annotations
@@ -55,6 +50,7 @@ def load_seed(ex, rows: int, log: Callable[[str], None], batch: int = 50_000) ->
 
 
 def reset_table(ex, log: Callable[[str], None]) -> float:
+    """Recreate the bench table from the seed, returning the seconds it took."""
     for t in (TABLE, "__osc_new_" + TABLE, "__osc_old_" + TABLE):
         ex.execute(f"DROP TABLE IF EXISTS {DB}.{t}")
     t = time.monotonic()
@@ -123,21 +119,25 @@ class Writer:
             ex.close()
 
     def start(self) -> None:
+        """Start the writer threads."""
         for i in range(self.threads):
             th = threading.Thread(target=self._loop, args=(i,), daemon=True)
             th.start()
             self._th.append(th)
 
     def join(self) -> None:
+        """Stop the writers and wait for them."""
         self.stop.set()
         for th in self._th:
             th.join(timeout=30)
 
     def all_ops(self) -> list[tuple]:
+        """Every recorded operation, ordered by completion time."""
         return sorted((o for lst in self.ops for o in lst), key=lambda o: o[1])
 
 
 def pct(vals: list[float], p: float) -> float | None:
+    """The ``p``-th percentile by rounded rank, None for no values."""
     if not vals:
         return None
     s = sorted(vals)
@@ -210,6 +210,7 @@ def slow_ops(ops: list[tuple], c0: float, c1: float, timeline: list, threshold_m
 def run_mode(connect, mode: str, *, rows: int, threads: int, phase_s: float, alter: str,
              instant_alter: str, log: Callable[[str], None],
              throttle_threads: int = 4) -> dict[str, Any]:
+    """Rebuild the table, run one mode under load, and report latency by phase."""
     ex = connect()
     try:
         reset_s = reset_table(ex, log)
@@ -321,6 +322,7 @@ def run_mode(connect, mode: str, *, rows: int, threads: int, phase_s: float, alt
 def run_bench(connect, *, rows: int, threads: int, phase_s: float, modes: list[str],
               alter: str, instant_alter: str, log: Callable[[str], None],
               keep: bool = False, repeat: int = 1, throttle_threads: int = 4) -> dict[str, Any]:
+    """Load the seed once, then run every mode ``repeat`` times and report them together."""
     ex = connect()
     try:
         info = ex.query("SELECT VERSION() AS v, @@innodb_buffer_pool_size AS bp, "

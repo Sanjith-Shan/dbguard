@@ -1,5 +1,10 @@
-"""What the tool needs to know about a table, read from information_schema through an
-Executor (anything with query(sql, args) -> list[dict] and execute(sql, args) -> int)."""
+"""What the schema-change tool needs to know about a table, read from information_schema.
+
+Columns, primary key, indexes, triggers, foreign keys, row format and InnoDB's instant row
+version count, which together decide whether preflight refuses the change and whether it can
+run as ALGORITHM=INSTANT. Everything goes through an ``Executor``, anything with
+``query(sql, args) -> list[dict]`` and ``execute(sql, args) -> int``, so tests use a fake.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +15,19 @@ from dbguard.osc.sqlutil import TRIGGER_PREFIX
 
 
 class Executor(Protocol):
-    def query(self, sql: str, args: Any = None) -> list[dict[str, Any]]: ...
-    def execute(self, sql: str, args: Any = None) -> int: ...
+    """One SQL connection, real (osc/db.py) or fake (tests)."""
+
+    def query(self, sql: str, args: Any = None) -> list[dict[str, Any]]:
+        """Rows as dicts."""
+
+    def execute(self, sql: str, args: Any = None) -> int:
+        """Affected row count."""
 
 
 @dataclass
 class Column:
+    """One column as information_schema.COLUMNS describes it."""
+
     name: str
     column_type: str
     nullable: bool
@@ -24,15 +36,19 @@ class Column:
 
     @property
     def generated(self) -> bool:
+        """A generated column, which is computed and never copied."""
         return "GENERATED" in self.extra.upper() and "DEFAULT_GENERATED" not in self.extra.upper()
 
     @property
     def auto_increment(self) -> bool:
+        """An AUTO_INCREMENT column."""
         return "auto_increment" in self.extra.lower()
 
 
 @dataclass
 class TableInfo:
+    """A table's shape. ``exists`` is False when it was not found."""
+
     db: str
     name: str
     exists: bool = True
@@ -50,6 +66,7 @@ class TableInfo:
     total_row_versions: int | None = None
 
     def col(self, name: str) -> Column | None:
+        """The column named ``name``, case-insensitive."""
         for c in self.columns:
             if c.name.lower() == name.lower():
                 return c
@@ -57,6 +74,7 @@ class TableInfo:
 
     @property
     def copyable(self) -> list[str]:
+        """Columns the copy writes, every one except generated columns."""
         return [c.name for c in self.columns if not c.generated]
 
 
@@ -70,6 +88,7 @@ def _v(row: dict, key: str):
 
 
 def load_table(ex: Executor, db: str, table: str) -> TableInfo:
+    """Read ``db.table``'s shape from information_schema."""
     t = TableInfo(db=db, name=table)
     rows = ex.query(
         "SELECT ENGINE AS engine, ROW_FORMAT AS row_format, TABLE_ROWS AS table_rows, "
@@ -125,4 +144,5 @@ def load_table(ex: Executor, db: str, table: str) -> TableInfo:
 
 
 def osc_triggers(t: TableInfo) -> list[str]:
+    """Triggers an earlier run of this tool left on the table."""
     return [n for n in t.triggers if n.startswith(TRIGGER_PREFIX)]
