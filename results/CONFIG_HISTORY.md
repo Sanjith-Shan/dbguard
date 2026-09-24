@@ -24,3 +24,16 @@ were moved to `results/old-config/<tag>/`. The earlier rows are kept as evidence
   campaign.log for the commit.
 - Rerun. The three entries were appended to the end of the queue with the archive tag. The
   first rerun run moves the old rows here.
+
+## Queue after the node deploy (d405ec4)
+
+- hang-container and hang-process run with `--hang-seconds 45` (the pilots used 90). A
+  failover completes in about 10 s, so a 45 s hang still wakes the old primary long after
+  the new one is serving, which is the window the woken-primary measurement needs. It also
+  stays well under `rebuild_after_s` (120), so no spare is provisioned during a hang. Rows
+  record `hang_seconds`.
+- replica-loss/dbguard and disk-full/dbguard run 10 times each, not 30 (each replica-loss
+  run waits out rebuild_after_s and a clone). Their tables are reported as 10 runs.
+- naive runs only kill and partition-manager, the two experiments the spec asks of the
+  baseline. Orchestrator runs kill, hang-container and partition-manager.
+- cost is 6 cells (semi-sync on/off x netem 0/2/20 ms) x 3 runs x 60 s. kill-two is 30.

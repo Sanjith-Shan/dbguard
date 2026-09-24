@@ -1033,6 +1033,7 @@ def base_row(run: Run, env: dict) -> dict:
         "rebuild_after_s": env["knobs"].get("rebuild_after_s"),
         "config": env["knobs"],
         "clients": o.clients, "workload_s": o.workload_seconds, "inject_ts": None,
+        "hang_seconds": o.hang_seconds if o.scenario in ("hang-container", "hang-process") else None,
         "failover_s": None, "first_error_ts": None, "first_ok_after_ts": None,
         "acked_writes": 0, "lost_acked_writes": 0, "lost_list": [], "phantom_writes": 0,
         "single_writer_violations": 0, "converged": False, "converge_s": None,

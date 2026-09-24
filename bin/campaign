@@ -190,6 +190,24 @@ def done_count(e: dict) -> int:
     return len(rs)
 
 
+# seconds per run when no row of that scenario exists yet (workload, injection, heal)
+DEFAULT_RUN_S = {"kill": 50, "partition-manager": 65, "switchover": 45, "hang-container": 110,
+                 "hang-process": 110, "partition-replicas": 90, "kill-two": 90, "cost": 75,
+                 "replica-loss": 330, "disk-full": 240}
+
+
+def estimate_hours(left: list[tuple[dict, int]]) -> float:
+    total = 0.0
+    for e, _ in left:
+        need = max(0, e["runs"] - done_count(e))
+        durs = [float(r["duration_s"]) for r in rows(e["scenario"], e["mode"]) if r.get("duration_s")]
+        per = sum(durs) / len(durs) if durs else DEFAULT_RUN_S.get(e["scenario"], 90)
+        if e["scenario"] in ("hang-container", "hang-process") and "--hang-seconds" in e.get("args", []):
+            per = DEFAULT_RUN_S[e["scenario"]]      # older rows used a 90 s hang
+        total += need * per
+    return total / 3600
+
+
 def fleet_mode() -> str | None:
     import urllib.request
     try:
@@ -301,7 +319,8 @@ def main() -> int:
     except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
         pass
     pidfile.write_text(str(os.getpid()))
-    log(f"CAMPAIGN start, {total_left} runs left, free {free_gib():.1f} GiB")
+    log(f"CAMPAIGN start, {total_left} runs left, free {free_gib():.1f} GiB, "
+        f"estimated {estimate_hours(left):.1f} h")
     t_camp = time.time()
     runs_done = 0
     for e, _ in left:
