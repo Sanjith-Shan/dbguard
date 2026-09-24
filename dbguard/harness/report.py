@@ -71,14 +71,22 @@ def md_table(header: list[str], rows: list[list]) -> str:
     return "\n".join(out)
 
 
+def mode_label(r: dict) -> str:
+    """naive kill runs with an added replica delay are their own row, never merged."""
+    m = r.get("mode", "?")
+    n = r.get("naive_netem_ms")
+    return f"{m} (netem {n:g} ms)" if n else m
+
+
 def _group(rows: list[dict], scenarios: list[str]) -> dict[tuple[str, str], list[dict]]:
     g: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:
         if r.get("scenario") in scenarios:
-            g[(r["scenario"], r.get("mode", "?"))].append(r)
+            g[(r["scenario"], mode_label(r))].append(r)
     order = {s: i for i, s in enumerate(scenarios)}
     morder = {m: i for i, m in enumerate(MODES)}
-    return dict(sorted(g.items(), key=lambda kv: (order.get(kv[0][0], 99), morder.get(kv[0][1], 99))))
+    return dict(sorted(g.items(), key=lambda kv: (order.get(kv[0][0], 99),
+                                                  morder.get(kv[0][1].split(" ")[0], 99), kv[0][1])))
 
 
 def _sum(rows, key) -> int:

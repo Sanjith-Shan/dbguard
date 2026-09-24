@@ -93,3 +93,10 @@ def test_errors_files_are_not_runs(tmp_path):
     s = summarize(rows, load_errors(tmp_path))
     assert s["failover"][0]["runs"] == 1 and s["failed_runs"] == {"kill/dbguard": 1}
     assert "kill/dbguard 1" in render_markdown(s)
+
+
+def test_naive_netem_rows_are_separate():
+    rows = [row(mode="naive"), row(mode="naive", naive_netem_ms=2.0, lost_acked_writes=3)]
+    fo = {(x["scenario"], x["mode"]): x for x in summarize(rows)["failover"]}
+    assert fo[("kill", "naive")]["lost_acked_writes"] == 0
+    assert fo[("kill", "naive (netem 2 ms)")]["lost_acked_writes"] == 3
