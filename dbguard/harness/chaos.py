@@ -1875,6 +1875,18 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
     return run.row
 
 
+def docker_engine_alive() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def infra_log(msg: str) -> None:
+    with (RESULTS / "campaign.log").open("a") as fh:
+        fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFRA chaos: {msg}\n")
+
+
 def cleanup_run_files(run_id: str) -> None:
     """Keep only the JSON row (disk is scarce). DBGUARD_KEEP_ACKS=1 keeps everything."""
     if os.environ.get("DBGUARD_KEEP_ACKS") == "1":
@@ -1912,6 +1924,12 @@ def run_scenario(opts: Opts) -> int:
             try:
                 row = run_once(v, env, i)
             except Exception as e:  # noqa: BLE001
+                if not docker_engine_alive():
+                    # an infrastructure failure, not a run result: never goes to errors.jsonl
+                    infra_log(f"{v.scenario}/{v.mode} run aborted, docker engine unreachable: "
+                              f"{e!r:.300}")
+                    log("docker engine unreachable, stopping this scenario")
+                    return 4
                 failures += 1
                 err = {"scenario": v.scenario, "mode": v.mode, "ts": time.time(), "error": repr(e),
                        "traceback": traceback.format_exc()}

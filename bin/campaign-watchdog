@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Keeps the chaos campaign alive across Docker Desktop crashes.
+
+Every 60 s:
+  1. `docker info`. If it fails: `open -a Docker`, wait for the engine (10 min), `make up`.
+  2. Wait for both sets HEALTHY. A set that stays with every node read-only and none fenced
+     for more than 60 s (a whole-set restart, which the manager does not recover by itself)
+     gets its recorded primary promoted through the agent, but only when that primary's
+     gtid_executed contains every other node's. Logged as INFRA.
+  3. If bin/campaign is not running (results/campaign.pid), start it with nohup.
+Every action is logged to results/campaign.log as an INFRA line. Only one watchdog runs at a
+time (results/campaign-watchdog.pid).
+
+  nohup bin/campaign-watchdog > results/watchdog.out 2>&1 &
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+RESULTS = REPO / "results"
+LOG = RESULTS / "campaign.log"
+PIDFILE = RESULTS / "campaign.pid"
+WD_PIDFILE = RESULTS / "campaign-watchdog.pid"
+PY = str(REPO / ".venv" / "bin" / "python")
+MANAGER = "http://127.0.0.1:19090"
+
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFRA watchdog: {msg}"
+    print(line, flush=True)
+    with LOG.open("a") as fh:
+        fh.write(line + "\n")
+
+
+def pid_alive(pidfile: Path) -> int | None:
+    try:
+        pid = int(pidfile.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def docker_alive() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def get(url: str):
+    with urllib.request.urlopen(url, timeout=3) as r:
+        return json.load(r)
+
+
+def sets_state() -> dict | None:
+    try:
+        return {k: v for k, v in get(MANAGER + "/v1/status")["sets"].items()}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def repair_read_only_sets(stuck_since: dict[str, float]) -> None:
+    from dbguard.harness import chaos
+    sets = sets_state() or {}
+    for rs, st in sets.items():
+        if st.get("state") == "HEALTHY":
+            stuck_since.pop(rs, None)
+            continue
+        nodes = chaos.set_nodes(rs)
+        ss = chaos.Fleet(rs, "dbguard").statuses(nodes)
+        if not all(ss.get(n) for n in nodes):
+            stuck_since.pop(rs, None)
+            continue
+        all_ro = all(ss[n].get("super_read_only") is True and not ss[n].get("fenced") for n in nodes)
+        if not all_ro:
+            stuck_since.pop(rs, None)
+            continue
+        t0 = stuck_since.setdefault(rs, time.time())
+        if time.time() - t0 < 60:
+            continue
+        p = st.get("primary")
+        if p not in nodes:
+            log(f"{rs} all read-only for {time.time() - t0:.0f}s but no recorded primary, not touching it")
+            continue
+        pg = ss[p].get("gtid_executed")
+        if not all(chaos.gtid_subset(ss[n].get("gtid_executed"), pg) for n in nodes):
+            log(f"{rs} all read-only but {p} lacks GTIDs another node has, not promoting (needs a human)")
+            continue
+        code, body = chaos.agent(p).post("/promote", timeout=40)
+        log(f"{rs} every node read-only and unfenced for {time.time() - t0:.0f}s, recorded primary {p} "
+            f"holds every node's GTIDs, promoted it through its agent: HTTP {code} {body}")
+        stuck_since.pop(rs, None)
+
+
+def wait_healthy(timeout: float = 600) -> bool:
+    stuck: dict[str, float] = {}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = sets_state()
+        if st and all(v.get("state") == "HEALTHY" for v in st.values()):
+            return True
+        if st:
+            repair_read_only_sets(stuck)
+        time.sleep(5)
+    return False
+
+
+def recover_engine() -> bool:
+    log("docker info failed, running open -a Docker")
+    subprocess.run(["open", "-a", "Docker"])
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        if docker_alive():
+            log("docker engine is back")
+            break
+        time.sleep(10)
+    else:
+        log("docker engine still down after 10 min")
+        return False
+    time.sleep(10)
+    # up the fleet in the mode the campaign's next entry needs (make up is dbguard; the
+    # campaign itself recreates naive when it gets there)
+    r = subprocess.run(["make", "up"], cwd=REPO, capture_output=True, text=True)
+    log(f"make up rc={r.returncode}")
+    ok = wait_healthy()
+    log("both sets HEALTHY" if ok else "sets not HEALTHY after 10 min")
+    return ok
+
+
+def start_campaign() -> None:
+    if pid_alive(PIDFILE):
+        return
+    out = open(RESULTS / "campaign.out", "a")
+    p = subprocess.Popen(["nohup", PY, str(REPO / "bin" / "campaign")], cwd=REPO, stdout=out,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    log(f"campaign was not running, started it (pid {p.pid})")
+
+
+def disk_stopped() -> bool:
+    """The campaign stopped itself on low disk: restarting it would only stop again."""
+    try:
+        tail = [ln for ln in LOG.read_text().splitlines()[-20:] if "INFRA" not in ln]
+    except FileNotFoundError:
+        return False
+    return bool(tail) and "STOP free disk" in tail[-1]
+
+
+def campaign_finished() -> bool:
+    try:
+        tail = LOG.read_text().splitlines()[-50:]
+    except FileNotFoundError:
+        return False
+    return any(" CAMPAIGN done" in ln for ln in tail)
+
+
+def main() -> int:
+    other = pid_alive(WD_PIDFILE)
+    if other and other != os.getpid():
+        print(f"watchdog already running (pid {other})")
+        return 1
+    WD_PIDFILE.write_text(str(os.getpid()))
+    log(f"started (pid {os.getpid()})")
+    while True:
+        if campaign_finished():
+            log("campaign finished, watchdog exits")
+            return 0
+        if not docker_alive():
+            if not recover_engine():
+                time.sleep(60)
+                continue
+        if not pid_alive(PIDFILE) and disk_stopped():
+            if not getattr(main, "_disk_logged", False):
+                log("campaign stopped on low disk, not restarting it (needs a human)")
+                main._disk_logged = True
+            time.sleep(60)
+            continue
+        if not pid_alive(PIDFILE):
+            st = sets_state()
+            if not st or not all(v.get("state") == "HEALTHY" for v in st.values()):
+                if not wait_healthy(300):
+                    time.sleep(60)
+                    continue
+            start_campaign()
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

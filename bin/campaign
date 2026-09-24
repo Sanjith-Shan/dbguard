@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -266,6 +267,16 @@ def main() -> int:
     print(f"runs left: {total_left}")
     if a.dry_run:
         return 0
+    pidfile = RESULTS / "campaign.pid"
+    try:
+        other = int(pidfile.read_text().strip())
+        os.kill(other, 0)
+        if other != os.getpid():
+            print(f"another campaign is running (pid {other})")
+            return 1
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+    pidfile.write_text(str(os.getpid()))
     log(f"CAMPAIGN start, {total_left} runs left, free {free_gib():.1f} GiB")
     t_camp = time.time()
     runs_done = 0
