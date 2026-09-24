@@ -21,7 +21,7 @@ Same workload and kill as above, with a fixed egress delay on both replicas so a
 
 | scenario | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | single-writer violations | converged | runs with errant GTIDs |
 |---|---|---|---|---|---|---|---|---|---|---|
-| kill | naive (netem 2 ms) | 10 | 5.49 | 5.76 | 0 | 0 | 0 | 0 | 10/10 | 0 |
+| kill | naive (netem 2 ms) | 10 | 5.92 | 7.50 | 1160 | 10 | 0 | 0 | 10/10 | 0 |
 
 ## Manager partitioned from the primary (correct action is none)
 
@@ -35,7 +35,7 @@ Same workload and kill as above, with a fixed egress delay on both replicas so a
 |---|---|---|---|---|---|---|---|---|---|
 | kill | dbguard | 30 | 5 | 25 | 0 | 3.37 | 8 | 4.46 | 16.55 |
 | kill | naive | 30 | 8 | 22 | 0 | 2.33 | 8 | 6.64 | 8.62 |
-| kill | naive (netem 2 ms) | 10 | 5 | 5 | 0 | 2.20 | 6 | 0.18 | 8.66 |
+| kill | naive (netem 2 ms) | 10 | 0 | 10 | 0 | 119.70 | 152 | 8.26 | 13.62 |
 | partition-replicas | dbguard | 30 | 0 | 30 | 0 | 9.93 | 10 | 7.63 | 10.07 |
 
 ## Cost of losslessness
