@@ -98,6 +98,7 @@ def main() -> int:
         "Watch the manager: detect (its own probe AND the replicas' view), fence, choose by "
         "GTID, catch up, promote, repoint.")
     events = EventStream(rs)
+    mark = fleet.mark()
     t_kill = time.time()
     docker.kill(primary, "KILL")
     new, t_new = fleet.wait_new_primary(primary, 90)
@@ -116,7 +117,10 @@ def main() -> int:
         "with CLONE from the new primary and those phantom transactions are discarded.")
     t_up = time.time()
     docker.up(primary)
-    ev = fleet.wait_event(t_up - 1, {"rejoin", "rebuild"}, 180)
+    ev = fleet.wait_event(mark, {"rejoin", "rebuild"}, 180,
+                          lambda e: chaos.rejoin_matches(e, primary))
+    if ev:
+        print(f"   {GREEN}{primary} rejoined in {ev['_seen_host_ts'] - t_up:.1f}s{RESET}")
     time.sleep(1)
     if ev is None:
         print(f"   {RED}no rejoin event within 180 s{RESET}")

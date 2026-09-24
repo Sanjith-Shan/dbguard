@@ -479,14 +479,30 @@ class Fleet:
             return [n for n, v in st["nodes"].items() if v.get("role") != "spare"]
         return self.nodes
 
-    def events(self, since: float, rs: str | None = None) -> list[dict]:
+    def _raw_events(self, rs: str, since: float | None) -> list[dict]:
         if self.mode == "orchestrator":
-            return orch_events(since)
+            return [e for e in orch_events() if e.get("rs") in (rs, None)
+                    and (since is None or float(e.get("ts") or 0) > since)]
         try:
-            return [e for e in self.mc.events(rs or self.rs, since - 0.001)
-                    if float(e.get("ts") or 0) >= since]
+            return self.mc.events(rs, since)
         except ApiError:
             return []
+
+    def mark(self, rs: str | None = None) -> "Mark":
+        """A cursor in the event source's own clock (review #11): the newest event ts and the
+        keys of the events near it. Event ts comes from the manager container (the Docker VM
+        clock), which can drift from the host clock the harness runs on."""
+        rs = rs or self.rs
+        evs = self._raw_events(rs, None)
+        mx = max((float(e.get("ts") or 0) for e in evs), default=None)
+        keys = frozenset(event_key(e) for e in evs
+                         if mx is not None and float(e.get("ts") or 0) >= mx - MARK_MARGIN_S)
+        return Mark(rs=rs, max_ts=mx, keys=keys)
+
+    def events(self, since: "Mark") -> list[dict]:
+        """Every event of since.rs that appeared after the mark was taken."""
+        lo = None if since.max_ts is None else since.max_ts - MARK_MARGIN_S
+        return [e for e in self._raw_events(since.rs, lo) if event_key(e) not in since.keys]
 
     # -- waits
     def wait_new_primary(self, old: str, timeout: float = 90.0) -> tuple[str | None, float | None]:
@@ -507,12 +523,15 @@ class Fleet:
             time.sleep(0.25)
         return None, None
 
-    def wait_event(self, since: float, types: set[str], timeout: float,
+    def wait_event(self, since: "Mark", types: set[str], timeout: float,
                    pred: Callable[[dict], bool] = lambda e: True) -> dict | None:
+        """First matching event after the mark. Sets e["_seen_host_ts"], the host time the
+        harness first saw it (use that, not e["ts"], for host-clock durations)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             for e in self.events(since):
                 if e.get("type") in types and pred(e):
+                    e["_seen_host_ts"] = time.time()
                     return e
             time.sleep(0.5)
         return None
@@ -784,7 +803,7 @@ def orch_discover(*hosts: str) -> None:
         orch_get(f"/api/discover/{h}/3306")
 
 
-def orch_events(since: float) -> list[dict]:
+def orch_events() -> list[dict]:
     """Hook lines written by deploy/orchestrator hooks, shaped like Event rows."""
     cp = docker.exec_(ORCH_CONTAINER, ["cat", HOOKS_FILE], check=False, mutate=False, user=None)
     out = []
@@ -793,9 +812,23 @@ def orch_events(since: float) -> list[dict]:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if float(e.get("ts") or 0) >= since:
-            out.append(e)
+        out.append(e)
     return out
+
+
+MARK_MARGIN_S = 5.0
+
+
+@dataclass(frozen=True)
+class Mark:
+    rs: str
+    max_ts: float | None
+    keys: frozenset
+
+
+def event_key(e: dict) -> str:
+    return json.dumps({k: v for k, v in e.items() if not k.startswith("_")}, sort_keys=True,
+                      default=str)
 
 
 def orch_setup(rs_list: list[str]) -> None:
@@ -863,6 +896,7 @@ class Run:
     commands: list[str] = field(default_factory=list)
     row: dict = field(default_factory=dict)
     sampler: WriterSampler | None = None
+    mark: "Mark | None" = None
     t_start: float = field(default_factory=time.time)
 
 
@@ -962,7 +996,11 @@ def wait_until_writing(wl: Workload, seconds: float) -> None:
         raise RuntimeError("workload acknowledged no writes before injection")
 
 
-def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 240.0) -> None:
+def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 240.0,
+                         mark: "Mark | None" = None) -> None:
+    """Wait for the rejoin event of `old`. `mark` defaults to the run's pre-injection mark
+    (a rejoin of the old primary cannot precede the fault)."""
+    mark = mark or run.mark
     f = run.fleet
     if f.mode == "orchestrator":
         deadline = time.time() + timeout
@@ -978,9 +1016,8 @@ def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 
                                  "duration_s": time.time() - t_restart}
             note(run, "orchestrator does not rejoin a dead primary, the harness did it through the agents")
         return
-    ev = f.wait_event(t_restart - 1, {"rejoin", "rebuild"}, timeout,
-                      lambda e: rejoin_matches(e, old))
-    others = [e for e in f.events(t_restart - 1) if e.get("type") == "rejoin"
+    ev = f.wait_event(mark, {"rejoin", "rebuild"}, timeout, lambda e: rejoin_matches(e, old))
+    others = [e for e in f.events(mark) if e.get("type") == "rejoin"
               and (e.get("rejoin") or {}).get("branch") == "none"]
     if others:
         run.row["second_writer_events"] = others
@@ -990,9 +1027,10 @@ def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 
     rj = dict(ev.get("rejoin") or {})
     rj.setdefault("branch", ev.get("type"))
     rj.setdefault("phantom_gtids", 0)
+    seen = float(ev.pop("_seen_host_ts", time.time()))
     if rj.get("duration_s") is None:
-        rj["duration_s"] = float(ev["ts"]) - t_restart
-    rj["since_restart_s"] = float(ev["ts"]) - t_restart
+        rj["duration_s"] = seen - t_restart
+    rj["since_restart_s"] = seen - t_restart   # host clock, 0.5 s poll resolution
     run.row["rejoin"] = rj
     run.row["rejoin_event"] = ev
 
@@ -1056,6 +1094,7 @@ def _failover_common(run: Run, inject: Callable[[str], None], *, extra_s: float 
     run.row["primary_at_inject"] = old
     wl = start_workload(run, o.workload_seconds + extra_s)
     wait_until_writing(wl, o.inject_after)
+    run.mark = f.mark()
     inject_ts = time.time()
     run.row["inject_ts"] = inject_ts
     inject(old)
@@ -1069,7 +1108,7 @@ def _failover_common(run: Run, inject: Callable[[str], None], *, extra_s: float 
         after_failover(old, new)
     wl.wait()
     apply_acks(run, wl, inject_ts)
-    ev = match_failover(f.events(inject_ts - 1), old)
+    ev = match_failover(f.events(run.mark), old)
     run.row["event"] = ev
     if ev is None and new:
         note(run, "primary changed but no failover event found")
@@ -1224,6 +1263,7 @@ def sc_partition_manager(run: Run) -> None:
     run.row["primary_at_inject"] = p
     wl = start_workload(run, o.inject_after + o.partition_hold_s + 15)
     wait_until_writing(wl, o.inject_after)
+    run.mark = f.mark()
     inject_ts = time.time()
     run.row["inject_ts"] = inject_ts
     docker.iptables_drop(watcher, p, "both")
@@ -1237,12 +1277,13 @@ def sc_partition_manager(run: Run) -> None:
     seen_primaries.update(f.agent_primaries())
     wl.wait()
     apply_acks(run, wl, inject_ts)
-    evs = [e for e in f.events(inject_ts - 1) if e.get("type") in ("failover", "switchover")]
+    all_evs = f.events(run.mark)
+    evs = [e for e in all_evs if e.get("type") in ("failover", "switchover")]
     now_p = f.primary()
     run.row["false_failover"] = bool(evs) or (now_p is not None and now_p != p) or seen_primaries - {p} != set()
     run.row["event"] = evs[0] if evs else None
     run.row["new_primary"] = now_p
-    run.row["states_seen"] = sorted({e.get("type") for e in f.events(inject_ts - 1)})
+    run.row["states_seen"] = sorted({e.get("type") for e in all_evs})
     run.row["failover_s"] = None if not run.row["false_failover"] else run.row["failover_s"]
     check(run, wl)
     if run.row["errors"]:
@@ -1342,6 +1383,7 @@ def sc_replica_loss(run: Run) -> None:
     run.row["killed"] = [r1, r2]
     wl = start_workload(run, o.inject_after + 70 + o.stall_hold_s)
     wait_until_writing(wl, o.inject_after)
+    run.mark = f.mark()
     inject_ts = time.time()
     run.row["inject_ts"] = inject_ts
     # phase 1: one replica down -> DEGRADED, writes continue
@@ -1352,13 +1394,15 @@ def sc_replica_loss(run: Run) -> None:
     oks, _ = read_ack_log(wl.ack_log)
     run.row["writes_while_degraded"] = sum(1 for r in oks if float(r["t_ok"]) > inject_ts + 3)
     # phase 2: survivor down -> writes stall (semi-sync timeout is an hour)
+    m_kill2 = f.mark()
     t_kill2 = time.time()
     run.row["kill2_ts"] = t_kill2
     docker.kill(r2, "KILL")
-    stall_ev = f.wait_event(t_kill2 - 1, {"stall"}, 30)
+    stall_ev = f.wait_event(m_kill2, {"stall"}, 30)
     run.row["stall_event"] = stall_ev is not None
     time.sleep(max(0.0, o.stall_hold_s - (time.time() - t_kill2)))
     # phase 3: restore one replica -> writes resume
+    m_restore = f.mark()
     t_restore = time.time()
     run.row["restore_ts"] = t_restore
     docker.up(r1)
@@ -1384,7 +1428,7 @@ def sc_replica_loss(run: Run) -> None:
     check(run, wl, [n for n in [p, r1] if agent(n).status()])
     # phase 4: stay DEGRADED past rebuild_after_s, the manager provisions and clones the spare
     rebuild_after = float(load_knobs().get("rebuild_after_s") or 60)
-    ev = f.wait_event(t_restore - 1, {"replace"}, rebuild_after + 300,
+    ev = f.wait_event(m_restore, {"replace"}, rebuild_after + 300,
                       lambda e: bool(e.get("clone")) or "failed" in (e.get("note") or ""))
     run.row["event"] = ev
     if ev:
@@ -1396,9 +1440,10 @@ def sc_replica_loss(run: Run) -> None:
     else:
         note(run, "no replace event")
     # restore: bring the original replica back, then drop the spare
+    m_back = f.mark()
     docker.up(r2)
     t_back = time.time()
-    rejoin_after_restart(run, r2, t_back, timeout=120)
+    rejoin_after_restart(run, r2, t_back, timeout=120, mark=m_back)
     spare = spare_node(o.rs)
     if docker.container_status(spare):
         vols = docker.volumes_of(spare)
@@ -1509,14 +1554,10 @@ def verify_mode(mode: str, rs: str = "rs1") -> None:
         raise SystemExit("semi-sync does not match mode " + mode + ": " + "; ".join(bad))
 
 
-def rs2_changes(f: Fleet, since: float, other: str) -> int:
+def rs2_changes(f: Fleet, since: "Mark") -> int:
     if f.mode == "orchestrator":
-        return 0 if len(Fleet(other, "orchestrator").agent_primaries()) == 1 else 1
-    try:
-        return sum(1 for e in f.mc.events(other, since) if e.get("type") in STATE_EVENT_TYPES
-                   and float(e.get("ts") or 0) >= since)
-    except ApiError:
-        return -1
+        return 0 if len(Fleet(since.rs, "orchestrator").agent_primaries()) == 1 else 1
+    return sum(1 for e in f.events(since) if e.get("type") in STATE_EVENT_TYPES)
 
 
 def run_once(opts: Opts, env: dict, i: int) -> dict:
@@ -1529,6 +1570,7 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
     run.row = base_row(run, env)
     other = "rs2" if opts.rs != "rs2" else "rs1"
     other_p = Fleet(other, opts.mode).primary()
+    other_mark = f.mark(other)
     snap = semisync_snapshot(opts.rs)
     run.row["semisync_nodes"] = snap
     problems = semisync_problems(opts.mode, snap)
@@ -1553,7 +1595,7 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
             rs2_wl.stop()
             oks, errs = read_ack_log(rs2_wl.ack_log)
             run.row["rs2_workload"] = {"acked": len(oks), "errors": len(errs)}
-        run.row["rs2_state_changes"] = rs2_changes(f, t0, other)
+        run.row["rs2_state_changes"] = rs2_changes(f, other_mark)
         if Fleet(other, opts.mode).primary() not in (other_p, None) and run.row["rs2_state_changes"] == 0:
             run.row["rs2_state_changes"] = 1
         extra = [MANAGER_CONTAINER] if opts.mode != "orchestrator" and opts.scenario == "partition-manager" else []

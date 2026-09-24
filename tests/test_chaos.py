@@ -215,3 +215,46 @@ def test_semisync_problems():
     bad = semisync_problems("naive", {"a": P, "b": OFF})
     assert len(bad) == 1 and "naive" in bad[0]
     assert semisync_problems("naive", {}) == ["no agent answered /status"]
+
+
+def test_mark_tolerates_clock_skew():
+    """Events stamped by a manager clock 40 s behind the host are still found (review #11)."""
+    from dbguard.harness.chaos import Fleet
+
+    class FakeMC:
+        def __init__(self):
+            self.evs = [{"ts": 1000.0, "rs": "rs1", "type": "healthy"},
+                        {"ts": 1003.0, "rs": "rs1", "type": "suspect"}]
+
+        def events(self, rs, since=None):
+            return [e for e in self.evs if e["rs"] == rs and (since is None or e["ts"] > since)]
+
+    f = Fleet("rs1", "dbguard")
+    f.mc = FakeMC()
+    m = f.mark()
+    assert m.max_ts == 1003.0 and f.events(m) == []
+    # new events, stamped slightly earlier than the newest old one (skew within the VM)
+    f.mc.evs.append({"ts": 1002.5, "rs": "rs1", "type": "failover", "old_primary": "mysql-a1"})
+    f.mc.evs.append({"ts": 1010.0, "rs": "rs1", "type": "rejoin",
+                     "rejoin": {"branch": "repoint", "node": "mysql-a1"}})
+    got = [e["type"] for e in f.events(m)]
+    assert got == ["failover", "rejoin"]
+    ev = f.wait_event(m, {"rejoin"}, 1.0)
+    assert ev and "_seen_host_ts" in ev
+
+
+def test_mark_with_no_prior_events():
+    from dbguard.harness.chaos import Fleet
+
+    class FakeMC:
+        evs: list = []
+
+        def events(self, rs, since=None):
+            return list(self.evs)
+
+    f = Fleet("rs1", "dbguard")
+    f.mc = FakeMC()
+    m = f.mark()
+    assert m.max_ts is None
+    f.mc.evs.append({"ts": 5.0, "rs": "rs1", "type": "failover"})
+    assert len(f.events(m)) == 1
