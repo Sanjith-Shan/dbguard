@@ -567,8 +567,7 @@ class Fleet:
                 docker.thaw(c)
                 _frozen.discard(c)
             if st in ("running", "paused"):
-                docker.iptables_flush(c)
-                docker.netem_clear(c)
+                docker.clear_net(c)
 
     def heal(self, timeout: float = 120.0, extra_fault_containers: list[str] = (),
              clear: bool = True) -> dict:
@@ -1272,7 +1271,7 @@ def sc_replica_loss(run: Run) -> None:
     run.row["failover_s"] = None
     check(run, wl, [n for n in [p, r1] if agent(n).status()])
     # phase 4: stay DEGRADED past rebuild_after_s, the manager provisions and clones the spare
-    rebuild_after = float(f.mc and (load_knobs().get("rebuild_after_s") or 60))
+    rebuild_after = float(load_knobs().get("rebuild_after_s") or 60)
     ev = f.wait_event(t_restore - 1, {"replace"}, rebuild_after + 300,
                       lambda e: bool(e.get("clone")) or "failed" in (e.get("note") or ""))
     run.row["event"] = ev

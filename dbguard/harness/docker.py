@@ -206,6 +206,12 @@ def netem_clear(container: str, dev: str = "eth0") -> None:
     netns(container, f"tc qdisc del dev {dev} root 2>/dev/null; true", check=False)
 
 
+def clear_net(container: str, dev: str = "eth0") -> None:
+    """Flush iptables INPUT/OUTPUT and remove any root qdisc, in one helper run."""
+    netns(container, f"iptables -F INPUT; iptables -F OUTPUT; tc qdisc del dev {dev} root "
+                     "2>/dev/null; true", check=False)
+
+
 def fault_state(container: str) -> str:
     """iptables rules and qdisc, for diagnostics."""
     cp = netns(container, "iptables -S; tc qdisc show dev eth0", check=False)
