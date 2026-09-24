@@ -92,7 +92,7 @@ class Steps(_M):
 class Rejoin(_M):
     """How a node came back, repointed as is or rebuilt by clone, and its phantom count."""
 
-    branch: Literal["repoint", "rebuild", "manual", "none"] = "none"
+    branch: Literal["repoint", "rebuild", "rebuild_after_errant", "manual", "none"] = "none"
     phantom_gtids: int = 0
     duration_s: float = 0.0
     node: str | None = None

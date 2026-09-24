@@ -50,6 +50,9 @@ class FakeNode:
     status_delay: float = 0.0   # a slow /status (loaded agent)
     repoint_delay: float = 0.0  # a slow /repoint (START REPLICA taking seconds)
     fence_delay: float = 0.0    # a slow /fence
+    pending: GtidSet = field(default_factory=GtidSet)   # binlogged, waiting for an ack
+    pending_until: float | None = None  # when the waiting sessions finish committing
+    hide_waiting: bool = False  # waiters invisible to /status and SQL (belt-and-braces test)
     fail_next: dict = field(default_factory=dict)  # path -> times to answer 500 lost link
     partial: GtidSet = field(default_factory=GtidSet)  # in the relay log, never appliable
     calls: list[str] = field(default_factory=list)
@@ -147,6 +150,11 @@ class FakeFleet:
     def step(self) -> None:
         """Advance time one step. Commit, replicate into relay logs, apply."""
         now = time.time()
+        for node in self.nodes.values():
+            if node.pending and node.responsive and node.pending_until is not None \
+                    and now >= node.pending_until:
+                node.executed = node.executed | node.pending
+                node.pending = GtidSet()
         for rs in self.sets:
             for n in self.sets[rs] + [x for x in self.nodes if self.nodes[x].rs == rs
                                       and x not in self.sets[rs]]:
@@ -243,7 +251,8 @@ class FakeFleet:
                          "source_status": node.semisync_source and clients > 0,
                          "replica_status": node.semisync_replica and io == "Yes",
                          "source_clients": clients, "avg_wait_time_us": 150,
-                         "no_tx": 0, "yes_tx": 0},
+                         "no_tx": 0, "yes_tx": 0,
+                         "wait_sessions": 0 if node.hide_waiting else len(node.pending)},
             "source_reachable": (src is not None and src.alive and not src.frozen and
                                  self.can_talk(node.name, src.name)) if node.source else None,
             "heartbeat": {"ts": node.heartbeat_ts,
@@ -423,6 +432,12 @@ class FakeProber:
         self.stopped_io.append(node)
         n.io_stopped = True
         return None
+
+    async def committing_threads(self, node: str, timeout: float = 3.0) -> int | None:
+        n = self.fleet.nodes[node]
+        if not n.responsive:
+            return None
+        return 0 if n.hide_waiting else len(n.pending)
 
     async def gtid_waiter(self, node: str, timeout: float = 3.0):
         """A waiter on the simulated node, None when it is not responsive."""

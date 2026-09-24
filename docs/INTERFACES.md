@@ -306,7 +306,7 @@ and in the API
           "promote":{"duration_s":f},
           "repoint":{"duration_s":f,"nodes":[...]}},
  "total_s":f,"watermark_gtid":str|null,
- "rejoin":{"branch":"repoint|rebuild|manual|none","phantom_gtids":n,"duration_s":f}|null,
+ "rejoin":{"branch":"repoint|rebuild|rebuild_after_errant|manual|none","phantom_gtids":n,"duration_s":f}|null,
  "note":str|null}
 ```
 
@@ -317,6 +317,13 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   reporting loss. The primary is declared dead only with at least one vote and votes
   strictly more than half of the witnesses. Zero witnesses stays SUSPECT. A DEGRADED set
   with one live replica can therefore fail over on that single witness.
+- Rejoin decides only from fresh reads. The node is fenced first when its semi-sync source
+  side is on or it has semi-sync waiters, then it must be quiescent: `semisync.wait_sessions`
+  is 0, no session is waiting for a semi-sync ACK or committing (read over SQL from
+  performance_schema.threads), and two reads of gtid_executed 1 s apart are equal (at most
+  20 s, else it is rebuilt). The primary is read after the node. After a repoint a watcher
+  compares the node with the primary every second for 10 s, and a GTID the primary lacks on
+  two consecutive reads triggers a rebuild recorded with branch `rebuild_after_errant`.
 - `type` may also be `split_brain` (naive mode only: a node other than the primary is
   writable. Naive mode has no fence, so it records the two writable nodes once and leaves
   them alone. dbguard mode fences the second writer instead and records a `rejoin` event with

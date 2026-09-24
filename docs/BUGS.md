@@ -476,3 +476,28 @@ heredocs and cache mounts already).
   replication state at all, only at writability, fencing and GTID containment, and a test
   reproduces this case (one replica's IO thread not started, the other Connecting, both
   answering only after the first polls).
+
+### A woken primary was repointed before its waiting transactions committed
+
+- Symptom. In hang-container runs (the primary's container paused 45 s, then unpaused) the 8
+  clients' in-flight INSERTs had been binlogged on the old primary mysql-a1 and were waiting
+  for the semi-sync ack when it froze. After the unpause the agent's fence killed the waiting
+  sessions and those transactions committed on mysql-a1 as unacknowledged phantoms, which is
+  correct, no client got an OK. But the manager's rejoin said "mysql-a1 not replicating,
+  gtid_executed is a subset of mysql-a2's, repointed", branch repoint, phantom_gtids 0, 5 to
+  30 s after the wake. Two minutes later mysql-a1 held GTIDs mysql-a2 lacked. Silent
+  divergence, in 2 of 2 runs.
+- How found. The chaos campaign's convergence check on hang-container rows.
+- Cause. The subset check read mysql-a1's gtid_executed before the killed waiters finished
+  committing, from a view taken while the node was still settling (the observation passed in
+  from the poll, not a read made for the decision).
+- Fix. Rejoin never decides from a cached view. It fences a node that still looks like a
+  primary, then waits for quiescence: no semi-sync waiters in `/status`, no session waiting
+  for an ACK or committing in performance_schema.threads, and two equal gtid_executed reads
+  1 s apart (up to 20 s, after that the node is rebuilt rather than trusted). Only then does it
+  read the primary and run the subset check. As a second line, a watcher compares the node
+  with the primary every second for 10 s after any repoint and rebuilds it on errant GTIDs,
+  recording branch `rebuild_after_errant` with the count. Simulation tests: a woken primary
+  whose set grows by 8 transactions 2 s after it becomes reachable takes the rebuild branch
+  with phantom_gtids 8, and with the waiters made invisible the watcher catches the errant
+  GTIDs after the repoint and rebuilds.

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from dbguard.events import Clone, Event, Rejoin
+from dbguard.gtid import GtidSet
 from dbguard.manager.client import AgentError
 from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
 from dbguard.manager.model import NodeView, Observation
@@ -107,13 +108,76 @@ async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> Non
               rejoin=Rejoin(branch="none", node=n))
 
 
-async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
-                      why: str = "operator request", wait: bool = False) -> Event | None:
+QUIESCE_DEADLINE_S = 20.0    # longer than this and the node is rebuilt, not trusted
+QUIESCE_INTERVAL_S = 1.0     # two equal gtid_executed reads this far apart
+VERIFY_WINDOW_S = 10.0       # after a repoint, watch for errant GTIDs this long
+
+
+async def quiesce(ctl: SetController, n: str) -> tuple[NodeView | None, str]:
+    """Wait until ``n``'s gtid_executed can be trusted for the subset check.
+
+    A woken primary still has sessions that were binlogged and waiting for a semi-sync ack
+    when it froze. When the fence kills them they commit, seconds after the node became
+    reachable, as unacknowledged phantoms. A gtid_executed read before that is too small, the
+    subset check passes, and the node is repointed with GTIDs the primary never had: silent
+    divergence (hang-container, 2 of 2 runs, docs/BUGS.md). So: fresh /status only, no
+    semi-sync waiters, no committing threads, and two equal reads QUIESCE_INTERVAL_S apart.
+    Returns the last view and "ok", or None and why it never settled.
+    """
+    end = time.monotonic() + QUIESCE_DEADLINE_S
+    prev: NodeView | None = None
+    why = "no status"
+    while time.monotonic() < end:
+        nv = await ctl.agents.status(n)
+        if not nv.usable:
+            why, prev = f"{n} not responsive", None
+        else:
+            waiting = int((nv.raw or {}).get("semisync", {}).get("wait_sessions") or 0)
+            committing = None
+            if ctl.prober is not None and hasattr(ctl.prober, "committing_threads"):
+                committing = await ctl.prober.committing_threads(n)
+            if waiting or committing:
+                why, prev = (f"{n} has {waiting} semi-sync waiters and "
+                             f"{committing or 0} committing threads"), None
+            elif prev is not None and prev.gtid_executed == nv.gtid_executed:
+                return nv, "ok"
+            else:
+                why, prev = f"{n} gtid_executed still changing", nv
+        await asyncio.sleep(QUIESCE_INTERVAL_S)
+    return None, why
+
+
+async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
+                      pv: NodeView | None = None, why: str = "operator request",
+                      wait: bool = False) -> Event | None:
     """Repoint ``n`` if it holds nothing the primary lacks, else rebuild it from a replica.
 
-    A rebuild runs in the background unless ``wait`` is set, and then returns no event."""
+    Never decides from a cached view. The node is fenced first when it looks like a former
+    primary (semi-sync source side on, or waiters), then must be quiescent, then the subset
+    check runs on fresh reads of both sets. ``nv`` and ``pv`` are ignored beyond logging;
+    they stay in the signature for callers. A rebuild runs in the background unless ``wait``
+    is set. After a repoint a watcher checks for errant GTIDs for VERIFY_WINDOW_S."""
     primary = ctl.primary
-    phantom = nv.gtid_executed - pv.gtid_executed
+    fresh = await ctl.agents.status(n)
+    if fresh.usable and (fresh.semisync.source_enabled or
+                         (fresh.raw or {}).get("semisync", {}).get("wait_sessions")):
+        try:
+            await ctl.agents.post(n, "/fence", timeout=ctl.cfg.fence_deadline_s)
+        except AgentError as e:
+            log.warning("rejoin: fence before the subset check failed", rs=ctl.rs, node=n,
+                        error=str(e))
+    stable, qwhy = await quiesce(ctl, n)
+    if stable is None:
+        log.warning("rejoin: node never quiesced, rebuilding instead", rs=ctl.rs, node=n,
+                    why=qwhy)
+        return await _rebuild(ctl, n, GtidSet(), f"{why}; not quiescent ({qwhy})", wait,
+                              branch="rebuild")
+    pnow = await ctl.agents.status(primary)          # read the primary AFTER the node
+    if not pnow.usable:
+        log.warning("rejoin: primary not responsive, retry later", rs=ctl.rs, node=n)
+        ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
+        return None
+    phantom = stable.gtid_executed - pnow.gtid_executed
     if phantom.is_empty:
         t0 = time.monotonic()
         try:
@@ -122,28 +186,73 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
         except AgentError as e:
             log.warning("rejoin repoint failed", rs=ctl.rs, node=n, error=str(e))
             return None
-        return ctl.event(type="rejoin", old_primary=n, new_primary=primary,
-                         rejoin=Rejoin(branch="repoint", phantom_gtids=0, node=n,
-                                       duration_s=round(time.monotonic() - t0, 3)),
-                         note=f"{n} {why}, gtid_executed is a subset of {primary}'s, repointed")
-    views = ctl.last_obs.nodes if ctl.last_obs else {}
+        ev = ctl.event(type="rejoin", old_primary=n, new_primary=primary,
+                       rejoin=Rejoin(branch="repoint", phantom_gtids=0, node=n,
+                                     duration_s=round(time.monotonic() - t0, 3)),
+                       note=f"{n} {why}, quiescent gtid_executed is a subset of {primary}'s, "
+                            f"repointed")
+        verify = verify_after_repoint(ctl, n, primary)
+        if wait:
+            await verify
+        else:
+            asyncio.create_task(verify, name=f"verify-{n}")
+        return ev
+    return await _rebuild(ctl, n, phantom, why, wait, branch="rebuild")
+
+
+async def _rebuild(ctl: SetController, n: str, phantom: GtidSet, why: str, wait: bool,
+                   branch: str) -> Event | None:
+    views = await ctl.fresh_views([m for m in ctl.members if m != n])
     donors = ctl.healthy_replicas(views, exclude=(n,))
     if not donors:
         log.warning("rebuild needed but no healthy replica to clone from", rs=ctl.rs, node=n,
                     phantom=phantom.count())
         ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
         return None
-    donor = donors[0]
-    coro = rebuild_and_join(ctl, n, donor, phantom_count=phantom.count(), phantom=str(phantom),
-                            why=why, event_type="rejoin")
+    coro = rebuild_and_join(ctl, n, donors[0], phantom_count=phantom.count(),
+                            phantom=str(phantom) if phantom else None, why=why,
+                            event_type="rejoin", branch=branch)
     if wait:
         return await coro
     ctl.start_maintenance(coro, [n])
     return None
 
 
+async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None:
+    """Belt and braces: after a repoint, the node must never hold a GTID the primary lacks.
+    Read the node first, then the primary (which only grows), so a transaction the node got
+    by replication is always in the primary's later read. Errant twice in a row means stop
+    trusting it: rebuild, branch rebuild_after_errant."""
+    end = time.monotonic() + VERIFY_WINDOW_S
+    seen = 0
+    while time.monotonic() < end:
+        await asyncio.sleep(1.0)
+        if ctl.primary != primary:
+            return
+        nv = await ctl.agents.status(n)
+        pv = await ctl.agents.status(primary)
+        if not (nv.usable and pv.usable):
+            continue
+        errant = nv.gtid_executed - pv.gtid_executed
+        seen = seen + 1 if errant else 0
+        if seen >= 2:
+            log.error("errant GTIDs after repoint, rebuilding", rs=ctl.rs, node=n,
+                      errant=str(errant))
+            await _wait_maintenance_slot(ctl)
+            await _rebuild(ctl, n, errant,
+                           f"held {errant.count()} GTIDs {primary} lacks after its repoint",
+                           wait=True, branch="rebuild_after_errant")
+            return
+
+
+async def _wait_maintenance_slot(ctl: SetController) -> None:
+    while ctl.maint is not None and not ctl.maint.done():
+        await asyncio.sleep(0.5)
+
+
 async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom_count: int,
-                           phantom: str | None, why: str, event_type: str) -> Event | None:
+                           phantom: str | None, why: str, event_type: str,
+                           branch: str = "rebuild") -> Event | None:
     """Clone ``node`` from ``donor``, wait for mysqld, repoint to the current primary."""
     t0 = time.monotonic()
     log.warning("rebuild", rs=ctl.rs, node=node, donor=donor, phantom=phantom_count)
@@ -179,7 +288,7 @@ async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom
         note += f"; discarded {phantom_count} phantom transactions ({phantom})"
     return ctl.event(
         type=event_type, old_primary=node, new_primary=source,
-        rejoin=Rejoin(branch="rebuild", phantom_gtids=ph, duration_s=dur, node=node),
+        rejoin=Rejoin(branch=branch, phantom_gtids=ph, duration_s=dur, node=node),
         clone=Clone(bytes=nbytes, duration_s=round(clone_s, 3), donor=donor,
                     mb_per_s=round(nbytes / 1e6 / clone_s, 2) if clone_s > 0 and nbytes else None),
         note=note)

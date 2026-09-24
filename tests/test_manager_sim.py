@@ -867,3 +867,59 @@ async def test_cold_start_when_replication_is_not_running_yet(sim_factory):
     assert ev.new_primary == "mysql-b1"
     assert s.fleet.primary_of("rs2") == ["mysql-b1"]
     assert not s.events("rs2", "failover")
+
+
+def _freeze_with_waiters(s, node="mysql-a1", n=8):
+    """The hang-container case: 8 clients' INSERTs are binlogged on the primary and waiting
+    for the semi-sync ack when the container is paused."""
+    p = s.fleet.nodes[node]
+    p.pending = GtidSet.of(p.uuid, (p.next_gno, p.next_gno + n - 1))
+    p.next_gno += n
+    p.frozen = True
+
+
+async def test_woken_primary_waits_for_quiescence_then_rebuilds(sim_factory):
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.2)
+    _freeze_with_waiters(s)
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover")
+    a1 = s.fleet.nodes["mysql-a1"]
+    a1.frozen = False
+    a1.pending_until = time.time() + 2.0      # the killed waiters commit 2 s after the wake
+    await s.until(lambda: any(e.rejoin and e.rejoin.node == "mysql-a1" and
+                              e.rejoin.branch in ("repoint", "rebuild")
+                              for e in s.events("rs1", "rejoin")),
+                  timeout=10, what="rejoin decision")
+    rj = [e for e in s.events("rs1", "rejoin")
+          if e.rejoin and e.rejoin.node == "mysql-a1" and e.rejoin.branch != "none"][0]
+    assert rj.rejoin.branch == "rebuild", rj.note
+    assert rj.rejoin.phantom_gtids == 8
+    new = s.ctl().primary
+    await s.until(lambda: a1.executed.is_subset(s.fleet.nodes[new].executed),
+                  what="no errant GTIDs left")
+
+
+async def test_errant_gtids_after_a_repoint_trigger_a_rebuild(sim_factory):
+    """Belt and braces: the waiters are invisible (no wait_sessions, no committing threads)
+    and commit only after the two equal reads, so the repoint happens; the watcher must see
+    the errant GTIDs and rebuild."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    _freeze_with_waiters(s)
+    a1 = s.fleet.nodes["mysql-a1"]
+    a1.hide_waiting = True
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover")
+    a1.frozen = False
+    a1.pending_until = time.time() + 3.5
+    await s.until(lambda: any(e.rejoin and e.rejoin.branch == "rebuild_after_errant"
+                              for e in s.events("rs1", "rejoin")),
+                  timeout=20, what="rebuild_after_errant")
+    branches = [e.rejoin.branch for e in s.events("rs1", "rejoin")
+                if e.rejoin and e.rejoin.node == "mysql-a1"]
+    assert "repoint" in branches and branches[-1] == "rebuild_after_errant"
+    ev = [e for e in s.events("rs1", "rejoin") if e.rejoin.branch == "rebuild_after_errant"][0]
+    assert ev.rejoin.phantom_gtids == 8
+    new = s.ctl().primary
+    assert a1.executed.is_subset(s.fleet.nodes[new].executed)

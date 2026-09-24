@@ -29,6 +29,12 @@ ER_CANT_CONNECT = 2003
 ER_LOST = 2013
 
 
+COMMITTING_SQL = (
+    "SELECT COUNT(*) AS n FROM performance_schema.threads "
+    "WHERE TYPE='FOREGROUND' AND (PROCESSLIST_STATE LIKE '%semi-sync ACK%' "
+    "OR PROCESSLIST_STATE IN ('waiting for handler commit', 'Waiting for commit lock'))")
+
+
 class Prober(Protocol):
     """What the controller needs from direct SQL. The simulator in fake.py provides one too."""
 
@@ -173,6 +179,15 @@ class MysqlProber:
         except Exception:  # noqa: BLE001
             return None
         return MysqlGtidWaiter(c)
+
+    async def committing_threads(self, node: str, timeout: float = 3.0) -> int | None:
+        """Sessions in the middle of a commit: waiting for a semi-sync ACK, or in the
+        storage engine commit. None when the node cannot be asked."""
+        try:
+            rows = await self._run(node, COMMITTING_SQL, timeout, fetch=True)
+        except Exception:  # noqa: BLE001
+            return None
+        return int(rows[0]["n"]) if rows else 0
 
     async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
         """SHOW REPLICA STATUS row (Replica_SQL_Running_State, sets, threads), or None."""
