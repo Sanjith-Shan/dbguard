@@ -1850,6 +1850,14 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
             oks, errs = read_ack_log(rs2_wl.ack_log)
             run.row["rs2_workload"] = {"acked": len(oks), "errors": len(errs)}
         run.row["rs2_state_changes"] = rs2_changes(f, other_mark)
+        if opts.mode != "orchestrator":
+            by_type: dict[str, int] = {}
+            for e in f.events(other_mark):
+                by_type[e.get("type") or "?"] = by_type.get(e.get("type") or "?", 0) + 1
+            run.row["rs2_events_by_type"] = by_type
+            # failover, switchover, rejoin, rebuild, replace, halt: rs2's topology changed
+            run.row["rs2_role_changes"] = sum(v for k, v in by_type.items() if k in (
+                "failover", "switchover", "rejoin", "rebuild", "replace", "halt"))
         run.row["replacements_during_run"] = sum(
             1 for e in f.events(start_mark) if e.get("type") == "replace")
         if Fleet(other, opts.mode).primary() not in (other_p, None) and run.row["rs2_state_changes"] == 0:

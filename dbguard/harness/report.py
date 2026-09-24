@@ -105,6 +105,7 @@ def failover_summary(rows: list[dict]) -> list[dict]:
             "stall_p99_s": percentile([r.get("stall_s") for r in rs], 99),
             "reconnect_gap_p50_s": percentile([r.get("reconnect_gap_p50_s") for r in rs], 50),
             "rs2_state_changes": _sum(rs, "rs2_state_changes"),
+            "rs2_role_changes": _sum(rs, "rs2_role_changes"),
         })
     return out
 
