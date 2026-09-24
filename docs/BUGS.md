@@ -451,3 +451,10 @@ heredocs and cache mounts already).
   followed another. Doctor says "no node is writable, this looks like a whole-set restart".
   Simulation tests reproduce the restart (source booting last, IO threads Connecting,
   heartbeat minutes old, probe 1290) and see cold_start within about a second.
+- Second data point. After a later reboot the old rule did fire for rs1 (mysql-a1 promoted in
+  place) but not for rs2, which stayed read-only for four minutes until the watchdog promoted
+  mysql-b1 by hand. rs2's replicas were not yet replicating from mysql-b1 when the one-shot
+  check ran, and the old rule required that they were. The new rule does not look at
+  replication state at all, only at writability, fencing and GTID containment, and a test
+  reproduces this case (one replica's IO thread not started, the other Connecting, both
+  answering only after the first polls).

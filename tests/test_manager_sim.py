@@ -844,3 +844,26 @@ async def test_crash_restarted_primary_without_fence_is_promoted_in_place(sim_fa
     assert not s.events("rs1", "failover")
     await s.healthy("rs1", "mysql-a1")
     lossless(s)
+
+
+async def test_cold_start_when_replication_is_not_running_yet(sim_factory):
+    """The rs2 case after the reboot: rs1 got its cold start, rs2 stayed read-only for 4
+    minutes because its replicas were not replicating from mysql-b1 yet (IO thread not
+    started on one, Connecting on the other, and at first not answering at all). No node is
+    writable and every set is contained in mysql-b1's, so it is a cold start, on a later
+    tick if not the first."""
+    s = await sim_factory(sets={"rs2": B}, replicate=False, start=False, detect_window_s=3.0)
+    _whole_set_restart(s.fleet)
+    b2, b3 = s.fleet.nodes["mysql-b2"], s.fleet.nodes["mysql-b3"]
+    b2.io_stopped = True                              # IO thread not started
+    s.fleet.partition("mysql-b1", "mysql-b3")         # IO thread Connecting
+    b2.mysqld_up = b3.mysqld_up = False               # replicas still booting at first
+    await s.mgr.start()
+    await asyncio.sleep(0.4)
+    assert not s.events("rs2", "cold_start")
+    b2.mysqld_up = b3.mysqld_up = True
+    await s.until(lambda: s.events("rs2", "cold_start"), timeout=2, what="cold_start rs2")
+    ev = s.events("rs2", "cold_start")[0]
+    assert ev.new_primary == "mysql-b1"
+    assert s.fleet.primary_of("rs2") == ["mysql-b1"]
+    assert not s.events("rs2", "failover")
