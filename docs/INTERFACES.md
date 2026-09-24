@@ -238,6 +238,11 @@ and in the API
 
 Manager additions to the event row. Extra keys and values only, nothing removed.
 
+- `detect.replica_total` counts witnesses, the replicas the manager could reach that are
+  configured with `source_host` equal to the primary, and `replica_votes` those of them
+  reporting loss. The primary is declared dead only with at least one vote and votes
+  strictly more than half of the witnesses. Zero witnesses stays SUSPECT. A DEGRADED set
+  with one live replica can therefore fail over on that single witness.
 - `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set).
 - `rejoin` also carries `"node"`, the node that rejoined (for a rejoin event `old_primary`
   is that node too, and `new_primary` the primary it now follows).

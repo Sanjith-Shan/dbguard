@@ -8,9 +8,11 @@ replicas see. A primary is DEAD only when both hold, continuously, for detect_wi
    consecutive times. It must be a write. A primary cut off from its replicas still
    answers ``SELECT 1``, but with semi-sync its commits block waiting for an ack, so only
    a write notices (Experiment 3).
-2. Strictly more than half of the set's configured replicas vote that they lost the
-   primary: IO thread not running (while replicating from it), the agent cannot TCP
-   connect to it, or the heartbeat row is older than detect_window_s.
+2. Strictly more than half of the witnesses, and at least one, vote that they lost the
+   primary. A witness is a replica the manager can reach that is configured to replicate
+   from the primary. A vote means its IO thread is not running, its agent cannot TCP
+   connect to the primary, or its heartbeat row is older than detect_window_s. Zero
+   witnesses means nobody can confirm, and the verdict stays SUSPECT.
 
 (1) without (2) is SUSPECT: the manager is probably the partitioned one (Experiment 4),
 and the correct action is none. (2) without (1) is logged and left alone. Naive mode
@@ -30,11 +32,7 @@ class DetectParams:
     mode: str = "dbguard"
     detect_window_s: float = 5.0
     probe_failures: int = 3
-    configured_replicas: int = 2
-
-    @property
-    def quorum_needed(self) -> int:
-        return self.configured_replicas // 2 + 1
+    configured_replicas: int = 2   # reporting only, the majority is over witnesses
 
 
 @dataclass(frozen=True)
@@ -47,7 +45,7 @@ class Verdict:
     probe_error: str | None = None
     write_stalled: bool = False   # SELECT 1 answers, the heartbeat write times out
     replica_votes: int = 0
-    replica_total: int = 0
+    replica_total: int = 0        # witnesses: reachable replicas of this primary
     quorum: bool = False
     quorum_s: float = 0.0         # how long the replica majority has held
     reasons: dict[str, list[str]] = field(default_factory=dict)
@@ -57,6 +55,13 @@ class Verdict:
     @property
     def dead(self) -> bool:
         return self.kind == "DEAD"
+
+
+def is_witness(nv: NodeView | None, primary: str) -> bool:
+    """A replica that can testify about ``primary``: reachable, mysqld answering, and
+    configured to replicate from it."""
+    return (nv is not None and nv.usable and nv.replica.configured
+            and nv.replica.source_host == primary)
 
 
 def replica_vote(nv: NodeView, primary: str, window_s: float) -> list[str]:
@@ -117,27 +122,38 @@ def evaluate(history: Sequence[Observation], members: Sequence[str], p: DetectPa
     probe_failed = streak > 0
     probe_down_s = (now - down_since) if down_since is not None else 0.0
 
-    # (2) the replicas' view
-    def votes_at(ob: Observation) -> tuple[int, dict[str, list[str]]]:
-        rs = {}
+    # (2) the replicas' view. Witnesses are the replicas the manager can reach right now
+    # (agent and mysqld answer) that are configured to replicate from this primary. The
+    # majority is over witnesses, not over configured replicas, so a DEGRADED set whose
+    # other replica already died (Experiment 6, kill-two) can still fail over.
+    # Trade-off: with one live replica, that replica is a single witness, and one
+    # replica's broken IO thread plus a manager partition is enough to fail over. Zero
+    # witnesses means nobody can confirm, so the verdict stays SUSPECT.
+    def votes_at(ob: Observation) -> tuple[int, int, dict[str, list[str]]]:
+        rs: dict[str, list[str]] = {}
+        witnesses = 0
         for m in replicas:
             nv = ob.nodes.get(m)
-            if nv is None:
+            if not is_witness(nv, primary):
                 continue
+            witnesses += 1
             why = replica_vote(nv, primary, p.detect_window_s)
             if why:
                 rs[m] = why
-        return len(rs), rs
+        return len(rs), witnesses, rs
 
-    votes, reasons = votes_at(last)
-    quorum = votes >= p.quorum_needed
+    def has_quorum(votes: int, witnesses: int) -> bool:
+        return witnesses > 0 and votes >= 1 and votes * 2 > witnesses
+
+    votes, witnesses, reasons = votes_at(last)
+    quorum = has_quorum(votes, witnesses)
     quorum_since = None
     if quorum:
         for ob in reversed(history):
             if ob.primary != primary:
                 break
-            n, _ = votes_at(ob)
-            if n < p.quorum_needed:
+            n, w, _ = votes_at(ob)
+            if not has_quorum(n, w):
                 break
             quorum_since = ob.ts
     quorum_s = (now - quorum_since) if quorum_since is not None else 0.0
@@ -148,7 +164,7 @@ def evaluate(history: Sequence[Observation], members: Sequence[str], p: DetectPa
         probe_down_s=probe_down_s,
         probe_error=last.probe.error if last.probe and not last.probe.ok else None,
         write_stalled=bool(last.probe and last.probe.write_stalled),
-        replica_votes=votes, replica_total=p.configured_replicas, quorum=quorum,
+        replica_votes=votes, replica_total=witnesses, quorum=quorum,
         quorum_s=quorum_s, reasons=reasons,
     )
     enough_probes = streak >= p.probe_failures

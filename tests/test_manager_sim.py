@@ -459,3 +459,18 @@ async def test_doctor_sentence_for_a_dead_primary(sim_factory):
     assert d["verdict"] == "HALTED"
     assert any("HALTED" in line and "operator wants to look first" in line
                for line in d["lines"])
+
+
+async def test_degraded_set_fails_over_to_its_last_replica(sim_factory):
+    """kill-two: a replica dies, then the primary. The survivor is the only witness."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    s.fleet.kill("mysql-a3")
+    await s.until(lambda: s.ctl().st.state == State.DEGRADED, what="DEGRADED")
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    ev = s.events("rs1", "failover")[0]
+    assert ev.new_primary == "mysql-a2"
+    assert ev.detect.replica_votes == 1 and ev.detect.replica_total == 1
+    lossless(s)

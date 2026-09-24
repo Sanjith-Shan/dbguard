@@ -111,16 +111,46 @@ def test_one_of_two_replicas_is_not_a_majority():
     assert v.kind == "SUSPECT" and v.replica_votes == 1
 
 
-def test_unreachable_replica_does_not_vote():
+def test_degraded_set_with_one_live_replica_can_fail_over():
+    """Experiment 6 and kill-two: r2 died first, so r1 is the only witness. Its vote is a
+    majority of one. This is the trade-off: a single live replica is a single witness."""
     h = history(20, bad_probe, lambda t: replica("r1", io="Connecting"),
-                lambda t: replica("r2", up=False))
-    assert evaluate(h, MEMBERS, P).kind == "SUSPECT"
+                lambda t: replica("r2", up=False), p=lambda: primary(reachable=False))
+    v = evaluate(h, MEMBERS, P)
+    assert v.dead and v.replica_votes == 1 and v.replica_total == 1
 
 
-def test_replica_of_another_source_does_not_vote():
-    h = history(20, bad_probe, lambda t: replica("r1", io="Connecting", hb=99),
+def test_one_live_replica_that_sees_the_primary_blocks_failover():
+    h = history(20, bad_probe, lambda t: replica("r1"), lambda t: replica("r2", up=False))
+    v = evaluate(h, MEMBERS, P)
+    assert v.kind == "SUSPECT" and v.replica_total == 1 and v.replica_votes == 0
+
+
+def test_zero_witnesses_stays_suspect():
+    h = history(30, bad_probe, lambda t: replica("r1", up=False),
+                lambda t: replica("r2", up=False), p=lambda: primary(reachable=False))
+    v = evaluate(h, MEMBERS, P)
+    assert v.kind == "SUSPECT" and v.replica_total == 0 and not v.quorum
+
+
+def test_half_is_not_a_majority():
+    members = ["p", "r1", "r2", "r3", "r4"]
+    obs = []
+    for i in range(30):
+        t = i * 0.5
+        obs.append(Observation(ts=t, primary="p", probe=bad_probe(t), nodes={
+            "p": primary(reachable=False), "r1": replica("r1", io="Connecting"),
+            "r2": replica("r2", io="Connecting"), "r3": replica("r3"),
+            "r4": replica("r4")}))
+    v = evaluate(obs, members, DetectParams(detect_window_s=W, configured_replicas=4))
+    assert v.kind == "SUSPECT" and v.replica_votes == 2 and v.replica_total == 4
+
+
+def test_replica_of_another_source_is_not_a_witness():
+    h = history(20, bad_probe, lambda t: replica("r1", hb=0.2),
                 lambda t: replica("r2", io="Connecting", hb=99, src="r1"))
-    assert evaluate(h, MEMBERS, P).kind == "SUSPECT"
+    v = evaluate(h, MEMBERS, P)
+    assert v.kind == "SUSPECT" and v.replica_total == 1
 
 
 def test_flapping_probe_resets_the_window():
