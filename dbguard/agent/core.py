@@ -90,11 +90,17 @@ def _s(v: Any) -> str | None:
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
+class ManagerUnknown(Exception):
+    """The manager answered but does not know the primary yet (503, e.g. before discovery)."""
+
+
 async def default_manager_get(url: str, timeout: float) -> dict[str, Any]:
     import aiohttp
 
     async with (aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s,
                 s.get(url) as r):
+        if r.status == 503:
+            raise ManagerUnknown(f"manager answered 503: {(await r.text())[:200]}")
         if r.status != 200:
             raise AgentError(f"manager answered {r.status}", status=502)
         return await r.json()
@@ -722,9 +728,12 @@ class Agent:
             if self.s.manager_url else None
         answer: dict[str, Any] | None = None
         err: str | None = None
+        unknown = False
         if url:
             try:
                 answer = await self.manager_get(url, self.s.manager_timeout_s)
+            except ManagerUnknown as e:
+                unknown, err = True, str(e)
             except Exception as e:  # noqa: BLE001  any failure means unreachable
                 err = f"{type(e).__name__}: {e}"
         else:
@@ -736,7 +745,14 @@ class Agent:
         except DbError as e:
             err = (err + "; " if err else "") + f"mysqld: {e}"
         fence_file = os.path.exists(self.s.fence_file)
-        if answer is not None:
+        if answer is not None and answer.get("primary") == "unknown":
+            unknown = True
+        if unknown:
+            # The manager is up but has no opinion yet (still discovering). Fencing a
+            # healthy primary on that would be wrong, so leave state alone (review #16).
+            primary = (answer or {}).get("primary")
+            decision = "leave"
+        elif answer is not None:
             primary = answer.get("primary")
             if primary != self.s.node and writable is not False:
                 # writable None means mysqld did not answer; fencing is the safe choice.
@@ -747,6 +763,7 @@ class Agent:
             primary = None
             decision = "fence_file" if fence_file else "leave"
         log.info("wake_guard", reason=reason, decision=decision, manager_primary=primary,
+                 manager_unknown=unknown,
                  manager_state=(answer or {}).get("state"), writable=writable,
                  fence_file=fence_file, error=err)
         self.m.wake_guard.labels(reason=reason, decision=decision).inc()
@@ -876,6 +893,8 @@ class Agent:
         try:
             await self.manager_get(url, self.s.manager_timeout_s)
             reachable = True
+        except ManagerUnknown:
+            reachable = True  # it answered, it is just still discovering
         except Exception as e:  # noqa: BLE001  any failure means unreachable
             reachable = False
             err = f"{type(e).__name__}: {e}"

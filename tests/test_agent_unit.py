@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from dbguard.agent.core import Agent, AgentError
+from dbguard.agent.core import Agent, AgentError, ManagerUnknown, default_manager_get
 from dbguard.agent.db import DbError
 from dbguard.agent.gtidcount import _interval_count, _parse, subtract_count
 from dbguard.agent.http import make_app
@@ -807,3 +807,53 @@ async def test_heartbeat_waits_for_wake_guard_after_a_freeze(settings):
     assert "SET GLOBAL super_read_only=1" in db.log
     assert not any(s.startswith("INSERT INTO dbguard.heartbeat") for s in db.log)
     assert agent.fenced
+
+
+
+# --------------------------------------------------------------------------- manager unknown
+
+class UnknownManager(FakeManager):
+    async def __call__(self, url, timeout):
+        self.urls.append(url)
+        raise ManagerUnknown("manager answered 503")
+
+
+@pytest.mark.parametrize("manager", [UnknownManager(), FakeManager("unknown")],
+                         ids=["http_503", "primary_unknown"])
+async def test_wake_guard_leaves_state_when_manager_does_not_know(settings, manager):
+    """Review #16. Right after a manager restart it answers 503 or "unknown" until
+    discovery ran. A healthy writable primary must not fence itself on that, even with a
+    leftover fence file."""
+    db = FakeDB()
+    db.sro = 0
+    open(settings.fence_file, "w").close()  # noqa: ASYNC230
+    agent = make_agent(settings, db, manager=manager)
+    assert await agent.wake_guard("startup") == "leave"
+    assert "SET GLOBAL super_read_only=1" not in db.executed()
+
+
+async def test_self_fence_counts_a_503_manager_as_reachable(settings):
+    db = FakeDB()
+    db.sro, db.semisync_clients = 0, 0
+    agent = make_agent(settings, db, manager=UnknownManager())
+    agent._mgr_unreachable_since = time.monotonic() - 60
+    assert await agent.self_fence_tick() == "ok"
+    assert not agent.fenced
+
+
+async def test_default_manager_get_maps_503_to_unknown():
+    from aiohttp import web
+
+    async def h503(request):
+        return web.json_response({"primary": None, "state": "DISCOVERING"}, status=503)
+
+    async def h200(request):
+        return web.json_response({"primary": "mysql-a1", "state": "HEALTHY"})
+    app = web.Application()
+    app.router.add_get("/v1/sets/rs1/primary", h503)
+    app.router.add_get("/v1/sets/rs2/primary", h200)
+    async with TestServer(app) as srv:
+        with pytest.raises(ManagerUnknown):
+            await default_manager_get(str(srv.make_url("/v1/sets/rs1/primary")), 1.0)
+        got = await default_manager_get(str(srv.make_url("/v1/sets/rs2/primary")), 1.0)
+        assert got["primary"] == "mysql-a1"
