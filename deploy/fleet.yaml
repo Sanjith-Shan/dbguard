@@ -1,0 +1,17 @@
+# DBGuard manager config, mounted at /etc/dbguard/fleet.yaml in the manager container.
+# Schema: docs/INTERFACES.md "Config, deploy/fleet.yaml". Env DBGUARD_MODE overrides mode.
+mode: dbguard            # or naive
+detect_window_s: 5
+probe_timeout_s: 1
+probe_failures: 3
+fence_deadline_s: 3
+catchup_deadline_s: 30
+rebuild_after_s: 60
+cooldown_s: 20           # no second automatic failover of the same set within this window
+rejoin: auto             # or manual
+poll_interval_s: 0.5
+mysql: {user: dbguard, password: dbguard, repl_user: repl, repl_password: repl, port: 3306}
+agent_port: 8080
+sets:
+  rs1: {nodes: [mysql-a1, mysql-a2, mysql-a3], spare: mysql-a4}
+  rs2: {nodes: [mysql-b1, mysql-b2, mysql-b3], spare: mysql-b4}
