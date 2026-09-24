@@ -629,3 +629,17 @@ def test_cleanup_command_is_idempotent():
     done = cleanup(ex, "d", "t", log=lambda m: None)
     assert done == ["trigger __osc_ins_t", "trigger __osc_upd_t", "table __osc_new_t"]
     assert cleanup(ex, "d", "t", log=lambda m: None) == []
+
+
+def test_throttle_total_includes_pause_in_progress():
+    clock = FakeClock()
+    seen = []
+
+    class Ex:
+        def query(self, sql, args=None):
+            return [{"Variable_name": "Threads_running", "Value": "50" if clock.t < 1 else "1"}]
+
+    th = Throttle(Ex(), 20, 2.0, None, lambda m: None, sleep=clock.sleep, clock=clock)
+    th.wait(tick=lambda: seen.append(th.total_s()))
+    assert seen[0] == 0.0 and seen[-1] == pytest.approx(0.75)
+    assert th.total_s() == pytest.approx(1.0) and th.throttled_s == pytest.approx(1.0)

@@ -37,9 +37,14 @@ def _err(msg: str) -> None:
     click.echo(msg, err=True)
 
 
-def _sigterm_to_interrupt() -> None:
+def _interrupts() -> None:
+    """SIGINT and SIGTERM both raise KeyboardInterrupt, so the runner cleans up. SIGINT is
+    set explicitly because a job started with `&` from a non-interactive shell inherits
+    SIGINT as ignored, and Python then never installs its own handler (found when a
+    backgrounded bench ignored `kill -INT`)."""
     def h(signum, frame):  # noqa: ARG001
         raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, h)
 
 
@@ -94,7 +99,7 @@ def run(host, port, user, password, tls, db, table, alter_text, chunk_size, chun
                         log=lambda m: _err(f"[{datetime.now():%H:%M:%S}] {m}"))
     except ValueError as e:
         raise click.UsageError(str(e)) from e
-    _sigterm_to_interrupt()
+    _interrupts()
     code = 0
     try:
         runner.run()
@@ -192,6 +197,7 @@ def bench(host, port, user, password, tls, rows, threads, phase_s, modes, repeat
     Loads its own table in schema osc_bench. For a throwaway server only."""
     from dbguard.osc.bench import run_bench
 
+    _interrupts()
     res = run_bench(connector(host, port, user, password, tls=tls), rows=rows,
                     threads=threads, phase_s=phase_s,
                     modes=[m.strip() for m in modes.split(",") if m.strip()],

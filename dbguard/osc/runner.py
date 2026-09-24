@@ -290,6 +290,12 @@ class Throttle:
         self._lag_at, self._lag = -1e9, 0.0
         self.throttled_s = 0.0
         self.last_reason: str | None = None
+        self._wait_start: float | None = None
+
+    def total_s(self) -> float:
+        """Paused time so far, including a pause still in progress."""
+        extra = self.clock() - self._wait_start if self._wait_start is not None else 0.0
+        return self.throttled_s + extra
 
     def threads_running(self) -> int:
         rows = self.ex.query("SHOW GLOBAL STATUS LIKE 'Threads_running'")
@@ -319,7 +325,7 @@ class Throttle:
         return None
 
     def wait(self, tick: Callable[[], None] | None = None) -> float:
-        start = self.clock()
+        start = self._wait_start = self.clock()
         while True:
             r = self.reason()
             if r is None:
@@ -335,6 +341,7 @@ class Throttle:
         self.last_reason = None
         waited = self.clock() - start
         self.throttled_s += waited
+        self._wait_start = None
         return waited
 
 
@@ -607,9 +614,9 @@ class Runner:
             pct = min(100.0, 100.0 * copied / est)
             eta = (est - copied) / rate if rate > 0 and copied < est else 0
             self.log(f"copy: {copied}/{est} rows (~{pct:.1f}%) chunk={sizer.size} "
-                     f"{rate:.0f} rows/s eta ~{eta:.0f}s throttled {throttle.throttled_s:.1f}s")
+                     f"{rate:.0f} rows/s eta ~{eta:.0f}s throttled {throttle.total_s():.1f}s")
             self.progress.update(phase="copy", rows_copied=copied, chunks=len(boundaries),
-                                 chunk_size=sizer.size, throttled_s=round(throttle.throttled_s, 2))
+                                 chunk_size=sizer.size, throttled_s=round(throttle.total_s(), 2))
 
         while True:
             throttle.wait(tick)
