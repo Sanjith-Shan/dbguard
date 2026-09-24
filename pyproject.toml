@@ -31,6 +31,7 @@ include = ["dbguard*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["integration: needs the docker fleet, skips when it is not up"]
 
 [tool.ruff]
 line-length = 100
