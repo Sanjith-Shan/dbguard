@@ -614,7 +614,7 @@ class Fleet:
             deadline = time.time() + 120
             while time.time() < deadline and not all(agent(n).status() for n in self.nodes):
                 time.sleep(2)
-            subprocess.run([sys.executable, str(bootstrap), "--rs", self.rs], cwd=REPO, check=False)
+            subprocess.run([sys.executable, str(bootstrap), "--sets", self.rs], cwd=REPO, check=False)
         deadline = time.time() + timeout
         why = ""
         while time.time() < deadline:
