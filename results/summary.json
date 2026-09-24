@@ -1,0 +1,193 @@
+{
+  "cost": [
+    {
+      "commit_p50_ms": 5.877,
+      "commit_p99_ms": 43.14,
+      "mode": "dbguard",
+      "netem_ms": 0.0,
+      "runs": 3,
+      "semisync": true,
+      "semisync_avg_wait_us": 457.0,
+      "writes_per_s": 953.2078616814316
+    },
+    {
+      "commit_p50_ms": 9.75,
+      "commit_p99_ms": 52.102,
+      "mode": "dbguard",
+      "netem_ms": 2.0,
+      "runs": 3,
+      "semisync": true,
+      "semisync_avg_wait_us": 1127.0,
+      "writes_per_s": 615.1149249791165
+    },
+    {
+      "commit_p50_ms": 23.941,
+      "commit_p99_ms": 56.648,
+      "mode": "dbguard",
+      "netem_ms": 20.0,
+      "runs": 3,
+      "semisync": true,
+      "semisync_avg_wait_us": 2267.0,
+      "writes_per_s": 297.74295866973006
+    },
+    {
+      "commit_p50_ms": 4.234,
+      "commit_p99_ms": 26.481,
+      "mode": "dbguard",
+      "netem_ms": 0.0,
+      "runs": 3,
+      "semisync": false,
+      "semisync_avg_wait_us": 2713.0,
+      "writes_per_s": 1389.1374690680302
+    },
+    {
+      "commit_p50_ms": 4.414,
+      "commit_p99_ms": 43.643,
+      "mode": "dbguard",
+      "netem_ms": 2.0,
+      "runs": 3,
+      "semisync": false,
+      "semisync_avg_wait_us": 2775.0,
+      "writes_per_s": 1215.84243557781
+    },
+    {
+      "commit_p50_ms": 4.366,
+      "commit_p99_ms": 29.555,
+      "mode": "dbguard",
+      "netem_ms": 20.0,
+      "runs": 3,
+      "semisync": false,
+      "semisync_avg_wait_us": 2886.0,
+      "writes_per_s": 1309.0344269101845
+    }
+  ],
+  "environment": [
+    "Apple M3 Pro, Docker Desktop 4.71.0 (225177) (engine 29.4.1), 12 cpu 18GB, VM 12 cpu 7.7GB | MySQL 8.4.11"
+  ],
+  "failed_runs": {},
+  "failover": [
+    {
+      "converged_runs": 30,
+      "failed_over_runs": 30,
+      "failover_p50_s": 8.831288814544678,
+      "failover_p99_s": 9.749638080596924,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 8.845661878585815,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 24,
+      "runs": 30,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "kill",
+      "single_writer_violations": 0,
+      "stall_p50_s": 8.728108882904053,
+      "stall_p99_s": 9.592817068099976,
+      "writes_on_woken_primary": null
+    },
+    {
+      "converged_runs": 30,
+      "failed_over_runs": 30,
+      "failover_p50_s": 11.583947896957397,
+      "failover_p99_s": 14.233891248703003,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 10.038109064102173,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 0,
+      "runs": 30,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "partition-replicas",
+      "single_writer_violations": 0,
+      "stall_p50_s": 9.975942134857178,
+      "stall_p99_s": 10.535916090011597,
+      "writes_on_woken_primary": null
+    },
+    {
+      "converged_runs": 11,
+      "failed_over_runs": 0,
+      "failover_p50_s": null,
+      "failover_p99_s": null,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": null,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 0,
+      "runs": 11,
+      "runs_with_errant_gtids": 9,
+      "runs_with_loss": 0,
+      "scenario": "kill-two",
+      "single_writer_violations": 0,
+      "stall_p50_s": 0.01569509506225586,
+      "stall_p99_s": 0.09448981285095215,
+      "writes_on_woken_primary": null
+    },
+    {
+      "converged_runs": 30,
+      "failed_over_runs": 0,
+      "failover_p50_s": null,
+      "failover_p99_s": null,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 1.5736157894134521,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 30,
+      "runs": 30,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "partition-manager",
+      "single_writer_violations": 0,
+      "stall_p50_s": 0.5344541072845459,
+      "stall_p99_s": 4.887235164642334,
+      "writes_on_woken_primary": null
+    }
+  ],
+  "rejoin": [
+    {
+      "mode": "dbguard",
+      "other": 0,
+      "phantom_gtids_max": 8,
+      "phantom_gtids_mean": 3.3666666666666667,
+      "rebuild": 25,
+      "rejoin_p50_s": 4.457,
+      "rejoin_p99_s": 16.553,
+      "rejoins": 30,
+      "repoint": 5,
+      "scenario": "kill"
+    },
+    {
+      "mode": "dbguard",
+      "other": 0,
+      "phantom_gtids_max": 10,
+      "phantom_gtids_mean": 9.933333333333334,
+      "rebuild": 30,
+      "rejoin_p50_s": 7.627,
+      "rejoin_p99_s": 10.067,
+      "rejoins": 30,
+      "repoint": 0,
+      "scenario": "partition-replicas"
+    }
+  ],
+  "replica_loss": [],
+  "rows": 149,
+  "switchover": [
+    {
+      "errors": 264,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "runs": 30,
+      "runs_with_errors": 30,
+      "stall_p50_s": 2.0575931072235107,
+      "stall_p99_s": 24.016018867492676
+    }
+  ]
+}
