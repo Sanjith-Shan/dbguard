@@ -222,6 +222,34 @@ and in the API
  "note":str|null}
 ```
 
+Manager additions to the event row. Extra keys and values only, nothing removed.
+
+- `type` may also be `bootstrap` (the manager promoted `nodes[0]` of a brand new set).
+- `rejoin` also carries `"node"`, the node that rejoined (for a rejoin event `old_primary`
+  is that node too, and `new_primary` the primary it now follows).
+- `"clone":{"bytes":n,"duration_s":f,"mb_per_s":f|null,"donor":str}|null` on events whose
+  work included a `/rebuild` (a `rejoin` with branch `rebuild`, and `replace`). The donor
+  is always a replica, never the primary.
+- A `stall` event is written when writes stall on the primary (semi-sync source enabled
+  with no replica connected, or the manager's heartbeat write blocks while `SELECT 1`
+  answers) and another when they resume, with the stall length in `note`.
+- A failover that ends HALTED is still recorded as `type:"failover"` with
+  `new_primary:null`, the steps done so far, and `note` starting with the halt reason. A
+  `halt` event follows.
+
+Manager additions to the HTTP API. `POST /v1/sets/{rs}/halt` accepts an optional body
+`{"reason":str}`. `POST /v1/sets/{rs}/failover` answers 409 `{"error":str,"state":str}` when
+the switchover is refused or aborted (the old primary is made writable again on abort).
+`POST /v1/sets/{rs}/rejoin` answers `{"event":<Event>|null,"state":str,"note":str|null}`,
+where a rebuild runs in the background and its event lands in `/v1/events` when done.
+
+Running the manager on the host (outside compose), `dbguard --host-ports` or
+`DBGUARD_HOST_PORTS=1` reaches every node on its published ports (mysql-a1 at
+127.0.0.1:13311 and its agent at 127.0.0.1:18011), and
+`DBGUARD_HOST_MAP="mysql-a1=127.0.0.1:13311:18011,..."` overrides single nodes. Names sent to
+agents (repoint source, clone donor) stay container names. Stop the `dbguard` container
+first, two managers on one fleet is a split brain.
+
 ## Chaos result row (results/<scenario>_<mode>.jsonl), one per run
 
 ```
