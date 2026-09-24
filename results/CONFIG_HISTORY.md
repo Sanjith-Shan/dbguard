@@ -83,3 +83,25 @@ were moved to `results/old-config/<tag>/`. The earlier rows are kept as evidence
   of a failover time, so `failover_s` is null in every row. The table reports it as a stall
   that needs an operator, which is the honest boundary of `wait_for_replica_count=1`.
 - orchestrator hang-container reduced to 15 runs.
+
+## Deadline cut (14:39 on 2026-09-24)
+
+The campaign was cut to fit a one-hour deadline. The final queue was switchover/dbguard 10
+(rerun under the final configuration, the 30 old-agent rows archived), naive kill 30 and
+naive partition-manager 10.
+
+Configuration each table in SUMMARY.md ran under:
+
+- Final configuration (node 97d68f6 with d405ec4, fleet fe17789, manager 8465b68 then
+  fd6a9db): partition-replicas/dbguard 30, kill-two/dbguard 11, cost/dbguard 18,
+  replica-loss/dbguard 1, switchover/dbguard 10, naive kill, naive partition-manager.
+- Earlier configuration agent-live-primary-check (live SQL /primary, HAProxy fall 1, manager
+  156c49e): kill/dbguard 30 and partition-manager/dbguard 30. Their planned reruns were
+  dropped by the deadline, so these two tables stand as measured under that configuration.
+  kill and partition-manager did not depend on the spurious-DOWN issue for correctness (0 lost,
+  0 false failovers), but their client error counts and stalls include spurious HAProxy cuts
+  (partition-manager: 9 of 30 runs with 8 or more client errors).
+
+Not run in this campaign: hang-container (dbguard and orchestrator), hang-process,
+replica-loss beyond 1 run, disk-full, every orchestrator entry, the kill and partition-manager
+reruns, and kill-two stall-recovery. The rows in results/old-config/ are kept as evidence.

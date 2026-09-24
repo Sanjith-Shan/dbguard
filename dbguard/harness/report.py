@@ -205,6 +205,10 @@ def render_markdown(s: dict) -> str:
     for env in s["environment"]:
         parts.append(f"- {env}")
     parts.append("")
+    parts.append("Configuration per table, reruns and archived rows: see results/CONFIG_HISTORY.md. "
+                 "kill/dbguard and partition-manager/dbguard ran under the earlier "
+                 "agent-live-primary-check configuration, every other table under the final one.")
+    parts.append("")
     if s.get("failed_runs"):
         parts.append("Runs that raised and wrote no row (results/*.errors.jsonl): " +
                      ", ".join(f"{k} {v}" for k, v in s["failed_runs"].items()) + ".")
