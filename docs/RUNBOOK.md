@@ -11,6 +11,8 @@ dbgctl doctor rs1
 
 `doctor` prints the verdict, the evidence behind it, what the manager would do next, and the GTID gap between the primary and every other node. If it and the rest of this runbook disagree, believe the raw SQL and file a bug in `docs/BUGS.md`.
 
+State names, in one place. Every set starts `DISCOVERING` after a manager start and stays there until it finds a writable primary. `HEALTHY` means a reachable writable primary and every other member streaming from it with both threads `Yes`. Fewer streaming replicas is `DEGRADED`. A failing probe that the replicas do not confirm is `SUSPECT`. `HALTED` needs a human and only `dbgctl resume` leaves it.
+
 Fields that come up everywhere, in `SHOW REPLICA STATUS\G` on a replica.
 
 | Field | Meaning |
@@ -41,7 +43,7 @@ SELECT @@super_read_only, @@read_only, @@gtid_executed;
 
 ## 1. A set is HALTED because replicas diverged
 
-**Symptom.** `dbgctl status` shows `HALTED` with a reason starting `replicas diverged`. There is no writable primary, or the old one is fenced. HAProxy shows the backend with no server up. Writes to that set fail. The other set is unaffected.
+**Symptom.** `dbgctl status` shows `HALTED` with a reason starting `replicas diverged` (or `no promotable replica`, which is entry 1b below). The last `failover` event has `new_primary: null` and a note starting with the halt reason. There is no writable primary. HAProxy shows the backend with no server up. Writes to that set fail. The other set is unaffected.
 
 **Confirm.**
 
@@ -59,7 +61,7 @@ SELECT GTID_SUBTRACT('<set of a2>', '<set of a3>') AS only_on_a2,
 
 Look at which UUID the extra GTIDs carry. `SELECT @@server_uuid` on each node. A GTID with a replica's own UUID means someone wrote directly to that replica. A GTID with an old primary's UUID means one replica received more from it than the other, which is the normal case and should never halt, so check whether the chosen winner was the one with the larger retrieved set.
 
-**What DBGuard did.** Fenced the old primary, found that no candidate's set contained every other candidate's, and stopped rather than pick one. It will not act on this set again until `dbgctl resume rs1`.
+**What DBGuard did.** Fenced the old primary, stopped every candidate's IO thread, compared each candidate's `gtid_executed` union `Retrieved_Gtid_Set`, found that no candidate contained every other candidate's, and stopped rather than pick one. The IO threads are left stopped, so nothing moves while you look. It will not act on this set again until `dbgctl resume rs1`, which returns it to `DISCOVERING` if no primary is known.
 
 **What the human does.**
 
@@ -69,6 +71,8 @@ Look at which UUID the extra GTIDs carry. `SELECT @@server_uuid` on each node. A
 4. Rebuild the other node with the agent's `/rebuild` from a healthy donor. Repointing it would either error or keep the extra transactions.
 5. `dbgctl resume rs1`, then confirm `doctor` shows every gap empty.
 6. Write down who wrote to the replica. `super_read_only` should have made that impossible, so find out how.
+
+**1b. `no promotable replica`.** Every candidate was excluded, and the halt reason lists why per node (`agent unreachable`, `mysqld not responsive`, `not replicating`, `semi-sync replica was not enabled`). A node with no replication configured is never a candidate, because its empty set would pass every subset check. Bring a real replica back (or its agent), then `dbgctl resume rs1`. Do not promote an unconfigured node by hand to get writes flowing, since it has none of the set's data.
 
 ---
 
@@ -87,7 +91,7 @@ SHOW PROCESSLIST;   -- client sessions sitting in a semi-sync ACK wait state
 
 On each replica, `SHOW REPLICA STATUS\G` for the IO thread state and `SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_replica_status'`. If a replica is up but `Rpl_semi_sync_replica_status` is OFF, its IO thread was started before semi-sync was enabled. The manual says a replica enabled at runtime keeps using asynchronous replication until the IO thread is restarted.
 
-**What DBGuard did or will do.** Nothing that would unblock the commits by weakening the guarantee. The timeout is one hour on purpose, so the primary does not quietly fall back to asynchronous replication. If the replicas are down, the manager replaces one after `rebuild_after_s`. If the primary is partitioned from replicas that are otherwise healthy, the replicas vote, the probe write fails, and the manager fails over.
+**What DBGuard did or will do.** Nothing that would unblock the commits by weakening the guarantee. The timeout is one hour on purpose, so the primary does not quietly fall back to asynchronous replication, and the agent's `/configure` refuses to switch the source side off while sessions are waiting, because that would acknowledge them. The manager writes a `stall` event when it starts and another when it ends. If the replicas are down, it replaces one after `rebuild_after_s` (120 s in the lab). If the primary is partitioned from replicas that are otherwise healthy, the replicas vote, the probe write fails, and the manager fails over. If the manager is also unreachable from the primary for 10 s, the agent's self-fence lease fences the primary, and writes fail fast instead of hanging (look for a `self_fence` line in its log).
 
 **What the human does.**
 
@@ -101,7 +105,7 @@ On each replica, `SHOW REPLICA STATUS\G` for the IO thread state and `SHOW GLOBA
 
 **Symptom.** `dbgctl status` shows a lag for one replica, or `doctor` reports a growing gap. Commits are unaffected as long as the other replica acks.
 
-**Confirm.** On the replica, `SHOW REPLICA STATUS\G`. If `Retrieved_Gtid_Set` is close to the primary's `gtid_executed` but `Executed_Gtid_Set` is behind, the applier is slow (receipt is fine, applying is not). If `Retrieved_Gtid_Set` is behind too, the IO thread or the network is the problem. The heartbeat row gives lag independent of `Seconds_Behind_Source`.
+**Confirm.** On the replica, `SHOW REPLICA STATUS\G`. If `Retrieved_Gtid_Set` is close to the primary's `gtid_executed` but `Executed_Gtid_Set` is behind, the applier is slow (receipt is fine, applying is not). If `Retrieved_Gtid_Set` is behind too, the IO thread or the network is the problem. The heartbeat row gives lag independent of `Seconds_Behind_Source`. Check the applier parallelism, since this fleet has already hit the limit (`docs/BUGS.md`). With the default 4 workers the replicas fell 44 s behind in five minutes of 8-client load.
 
 ```
 SELECT TIMESTAMPDIFF(MICROSECOND, ts, NOW(6))/1e6 AS hb_age_s FROM dbguard.heartbeat WHERE rs='rs1';
@@ -110,9 +114,9 @@ SELECT GTID_SUBTRACT('<primary gtid_executed>', @@gtid_executed) AS missing;
 
 Then on the replica host, `docker stats`, and inside the container `top -H -p $(pidof mysqld)` to see whether the SQL thread is CPU bound, and `df -h /var/lib/mysql`.
 
-**What DBGuard did or will do.** Nothing, as long as the replica is receiving. A lagging replica is still a valid failover candidate, because selection uses the retrieved set and step 3 waits for it to apply. It does extend failover time if it wins, up to `catchup_deadline_s`.
+**What DBGuard did or will do.** Nothing, as long as the replica is receiving. A lagging replica is still a valid failover candidate, because selection uses executed union retrieved and the catch-up step waits for it to apply. It does extend failover time if it wins, and past `catchup_deadline_s` (30 s) the failover gives up. Lag also no longer looks like a dead primary. Heartbeat age votes only after subtracting `Seconds_Behind_Source`, because on the real fleet two replicas 94 and 98 s behind once voted a healthy primary dead.
 
-**What the human does.** Find the cause (a large transaction, a missing index on a row-based apply, a starved container). If it is chronic, it belongs in the capacity plan, not in a tweak.
+**What the human does.** Find the cause (a large transaction, a missing index on a row-based apply, a starved container, too few applier workers). If it is workers, raise `replica_parallel_workers` with `replica_preserve_commit_order=ON`, and raise the container memory with it. Each worker costs memory, and 16 workers in a 700 MiB container got `mysqld` OOM-killed at `START REPLICA`. `docs/CAPACITY.md` has the sizing rule. Chronic lag belongs in the capacity plan, not in a tweak.
 
 ---
 
@@ -140,8 +144,10 @@ The usual causes, each from the manual's prerequisites.
 | Another clone running | only one clone may run at a time |
 | `max_allowed_packet` | at least 2 MB on both |
 | Error 3707 | not a failure. The clone completed and `mysqld` was not restarted by a supervisor. The agent should have restarted it, so check `supervisor` lines in the agent log |
+| Error 1290 on `CLONE INSTANCE` | the recipient was `super_read_only`. The agent clears it just before the clone under a `rebuilding` flag, so seeing this means an agent older than that fix |
+| Clone threads stuck in `starting` | the donor is a primary stalled on semi-sync. Clone from a replica, which is what the manager does |
 
-**What DBGuard did or will do.** Retries a rebuild on the next loop, choosing a donor among healthy replicas. It never falls back to cloning from the primary without a human saying so.
+**What DBGuard did or will do.** Retries a rebuild on a later loop, choosing a donor among replicas that are streaming from the primary. It never clones from the primary. No replacement starts while the set is `FAILING_OVER`, `SUSPECT` or `HALTED`, or within the cooldown after a failover.
 
 **What the human does.** Fix the mismatch. Plugin mismatches usually mean someone ran `INSTALL PLUGIN` on one node by hand, and the fix is to make `my.cnf` the only source of plugin loading. Then trigger `POST /v1/sets/rs1/rejoin` or wait for the next replacement attempt.
 
@@ -153,9 +159,9 @@ The usual causes, each from the manual's prerequisites.
 
 **Confirm.** `docker compose ps dbguard`, `docker compose logs --tail 200 dbguard`. Under systemd, `systemctl status dbguard` and `journalctl -u dbguard -n 200`.
 
-**What DBGuard did or will do.** Nothing, and that is the safe state. Every set behaves as if `HALTED`. Replication and semi-sync keep running without the manager, so a healthy set keeps serving and keeps its guarantee. The agents keep answering HAProxy on their own. A woken primary whose agent cannot reach the manager fences itself only if its fence file already exists.
+**What DBGuard did or will do.** Nothing, and that is the safe state. Every set behaves as if `HALTED`. Replication and semi-sync keep running without the manager, so a healthy set keeps serving and keeps its guarantee. The agents keep answering HAProxy on their own. Two agent rules still act. A woken primary whose agent cannot reach the manager fences itself only if its fence file already exists. And a primary whose agent has not reached the manager for 10 s and has zero semi-sync replicas connected fences itself (the self-fence lease). So a manager outage plus a replica outage turns a stall into a fenced primary with no writes, which is intended.
 
-**What the human does.** Restart the manager. Before relying on it, check `dbgctl status` shows every set in the state you expect. If a primary died while the manager was down, the manager handles it on its first loops after start. If you must fail over by hand while it is down, use the agents directly in the documented order, fence first (`POST :80XX/fence` on the old primary), compare retrieved sets with `GTID_SUBSET`, wait for the winner to apply its relay log, `/promote` the winner, `/repoint` the others. Never skip the fence or the subset check because you are in a hurry.
+**What the human does.** Restart the manager. It comes up with every set in `DISCOVERING`, and while it is discovering it answers the agents' wake guard with `primary: unknown`, which they treat as "leave state alone". Wait until `dbgctl status` shows each set with a primary before relying on it. If a whole set is read-only after a fleet restart, the manager promotes the replicas' common source in place (a `cold_start` event) rather than failing over. If you must fail over by hand while it is down, drive the agents in the manager's order. Fence the old primary (`POST /fence` on its agent), run `STOP REPLICA IO_THREAD` on every candidate, compare `gtid_executed` union `Retrieved_Gtid_Set` with `GTID_SUBSET`, wait for the winner to apply its relay log, `/repoint` the others to the still read-only winner, then `/promote` it. Never skip the fence or the subset check because you are in a hurry.
 
 ---
 
@@ -163,14 +169,14 @@ The usual causes, each from the manual's prerequisites.
 
 **Symptom.** A node's role flips to `fenced` repeatedly, or a newly promoted primary is fenced shortly after promotion.
 
-**Confirm.** The agent's log for `fence_flag`, `wake_gap` and `fence` lines, with their `reason`. `cat /var/lib/dbguard/fenced` in the container to see whether the flag file exists. `dbgctl status` for what the manager thinks the primary is.
+**Confirm.** The agent's log for `fence_flag`, `wake_gap`, `self_fence` and `fence` lines, with their `reason`. `cat /var/lib/dbguard/fenced` in the container to see whether the flag file exists. `curl localhost:180XX/status` for `self_fence.manager_unreachable_s`, `self_fence.semisync_clients` and `mysqld_restart_hold_s`. `dbgctl status` for what the manager thinks the primary is.
 
 ```
 docker compose logs mysql-a2 | grep -E 'wake_gap|fence|guard'
 curl -s localhost:19090/v1/sets/rs1/primary
 ```
 
-Common causes. `wake_gap` lines mean the agent's loop is stalling for more than 3 s, from a starved container or the host sleeping, and the wake guard is asking the manager and being told another node is primary. A manager whose view of the primary is stale after a manual change will tell a legitimate primary to fence itself. A stale flag file from a previous fence survives restarts by design.
+Common causes. `wake_gap` lines mean the agent's loop is stalling for more than 3 s, from a starved container or the host sleeping, and the wake guard is asking the manager and being told another node is primary, or `null` because a failover is running. `self_fence` lines mean the agent lost the manager for 10 s while no semi-sync replica was connected. The manager also fences any member that is writable while it is not the primary (a rejoin event with branch `none`). A stale flag file from a previous fence survives restarts by design. After a kill fence, `mysqld` stays down for up to 20 s (`mysqld_restart_hold_s`), so the old primary does not serve its unacknowledged binlog tail to replicas, and `/promote`, `/repoint` or `/rebuild` end the hold early.
 
 **What DBGuard did or will do.** Each fence is the agent doing its job given what the manager told it. The manager does not unfence nodes except through `/promote`.
 
@@ -186,12 +192,12 @@ Common causes. `wake_gap` lines mean the agent's loop is stalling for more than 
 
 ```
 for p in 18011 18012 18013; do curl -s -w ' %{http_code}\n' localhost:$p/primary; done
-curl -s 'localhost:18404/<stats uri from haproxy.cfg>;csv' | cut -d, -f1,2,18,37   # pxname, svname, status, check_status
+curl -s 'localhost:18404/;csv' | cut -d, -f1,2,18,37   # pxname, svname, status, check_status
 ```
 
 Every agent answering 503 means no node believes it is the unfenced writable primary. The `role` in each body says why (`replica`, `fenced`, `unknown`).
 
-**What DBGuard did or will do.** This is the expected state during a failover, between fence and promote, and during `HALTED`. It is not expected in `HEALTHY`.
+**What DBGuard did or will do.** This is the expected state during a failover, between fence and promote, during `HALTED`, and while a set is `DISCOVERING` after a fleet start. It is not expected in `HEALTHY`. A promote that ran out of its 30 s agent budget answers 504 with the step it was on and leaves the fence flag set, so `/primary` stays 503 even if the node became writable. The manager waits 35 s for that answer.
 
 **What the human does.** If the set is `HEALTHY` and still no server is up, check whether HAProxy can reach the agents at all (`docker compose exec haproxy wget -qO- mysql-a1:8080/primary`), whether the primary's `mysqld` is answering its agent within 1 s, and whether `super_read_only` was set on the primary by hand. If the set is `FAILING_OVER` for more than the failover budget in `docs/CAPACITY.md`, read the last event to see which step it is in.
 
@@ -203,7 +209,7 @@ Every agent answering 503 means no node believes it is the unfenced writable pri
 
 **Confirm.** On the old node, `SELECT @@super_read_only`. In its agent log, a `wake_gap` line followed by a guard decision. On HAProxy, confirm the node is down. The checker's `writes_on_woken_primary` counts rows written to it after the failover.
 
-**What DBGuard did or will do.** The agent sees the monotonic clock gap on its next tick, asks the manager who the primary is, and fences itself before answering HAProxy. HAProxy's `on-marked-down shutdown-sessions` cuts any client connections that survived the freeze. The manager then runs the rejoin logic, repoint if its `gtid_executed` is a subset of the new primary's, rebuild otherwise.
+**What DBGuard did or will do.** The agent sees the monotonic clock gap on its next tick, asks the manager who the primary is, and fences itself before answering HAProxy. The heartbeat writer also waits for that check, so it cannot add a phantom GTID. While the manager is still failing over it answers `primary: null`, which also makes the woken node fence. If the manager answers `unknown` (just restarted), the agent leaves state alone, and the manager's own second-writer fence catches the node once discovery finds the real primary. HAProxy's `on-marked-down shutdown-sessions` cuts client connections that survived the freeze. The manager then runs the rejoin logic, repoint if its `gtid_executed` is a subset of the new primary's, rebuild otherwise.
 
 **What the human does.** Verify there were no writes on the woken node after the failover timestamp (`GTID_SUBTRACT` of its `gtid_executed` against the new primary's, restricted to its own UUID). If there were, they are writes that clients may have seen acknowledged and that the set does not have. Export them with `mysqlbinlog --include-gtids` before the rebuild destroys them, and raise it as a bug.
 
@@ -213,7 +219,7 @@ Every agent answering 503 means no node believes it is the unfenced writable pri
 
 **Symptom.** Writes stall or the primary restarts. `df` shows the data volume at 100 percent.
 
-**Confirm.** `df -h /var/lib/mysql` in the container, the MySQL error log for disk-full messages, `dmesg | tail` on the host for filesystem errors, and `du -sh /var/lib/mysql/*binlog*` to see how much is binary log.
+**Confirm.** `df -h /var/lib/mysql` in the container (and `df -h /var/lib/mysql-binlog` if the node runs the lab's opt-in binlog tmpfs overlay), the MySQL error log for disk-full messages, `dmesg | tail` on the host for filesystem errors, and `du -sh /var/lib/mysql/*binlog*` to see how much is binary log. In the lab, only the disk-full experiment puts a binlog on a 256 MB tmpfs. It is never on by default, because a tmpfs is wiped when the container stops, and a killed primary would lose its binlog and the phantoms the kill experiments measure.
 
 **On the primary.** Per the manual, MySQL waits on a full disk and rechecks every minute, and this also applies to binlog writes. If a binlog write, flush or sync fails outright, `binlog_error_action=ABORT_SERVER` (the default) shuts the server down. Either way commits stop. The manager's probe write fails, and because the agent's heartbeat write stalls too, the replicas see the heartbeat go stale and vote once it is older than `detect_window_s`. Expect a failover. Which of the two behaviours the lab showed is `[[N: disk-full primary behaviour and failover outcome, results/disk-full_dbguard.jsonl]]`.
 
@@ -231,11 +237,11 @@ Every agent answering 503 means no node believes it is the unfenced writable pri
 
 1. `dbgctl status`. The set must be `HEALTHY` with both replicas at `Replica_IO_Running: Yes` and `Rpl_semi_sync_source_clients` at least 1.
 2. `dbgctl doctor rs1`. Every gap should be small or empty.
-3. `dbgctl failover rs1 --to mysql-a2` (or without `--to` to let the manager choose). The manager sets `super_read_only` on the old primary, waits for the candidate to apply everything, promotes it, and repoints the old primary and the other replica.
+3. `dbgctl failover rs1 --to mysql-a2` (or without `--to` to let the manager choose). The manager quiesces the old primary with the same fence, repoints the other nodes to the candidate while it is still read-only, waits for it to apply everything, checks against the final `gtid_executed` the fence returned that the candidate holds nothing extra, and promotes it. Repointing first means the new primary has an acking replica the moment it becomes writable. Before that reorder a switchover stalled clients for 3.8 s, after it 0.89 s (`docs/BUGS.md`).
 4. `dbgctl status` shows the new primary and `HEALTHY`. The event row has the stall duration.
 5. Clients see one short stall, `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` median, and a single retry covers it.
 
-**Abort.** If step 3 fails before promotion, the old primary is read-only and nothing is promoted. Calling `/promote` on the old primary's agent clears its fence flag and `super_read_only` and puts it back in service. Then `dbgctl resume rs1`.
+**Abort.** If step 3 fails before promotion, the manager promotes the old primary back itself and answers 409 with the reason and the state. Check `dbgctl status` shows the old primary writable and `HEALTHY`. If it does not (the abort itself failed and the set `HALTED`), call `/promote` on the old primary's agent, which clears its fence flag and `super_read_only`, then `dbgctl resume rs1`.
 
 ---
 
@@ -247,7 +253,7 @@ Every agent answering 503 means no node believes it is the unfenced writable pri
 4. On the new node's agent, `POST /rebuild {"donor":"mysql-a3"}` using a healthy replica as donor.
 5. `POST /repoint {"source":"<current primary>"}`.
 6. Confirm `SHOW REPLICA STATUS\G` shows both threads `Yes`, `Auto_Position: 1`, and `Rpl_semi_sync_replica_status` ON.
-7. Update `fleet.yaml` if the node name changed, restart the manager, `dbgctl resume rs1`.
+7. Update `fleet.yaml` if the node name changed, restart the manager, `dbgctl resume rs1`. A spare that replicates from a member is adopted into the set automatically, including after a manager restart.
 
 ---
 
@@ -264,6 +270,6 @@ In order. Stop at the first step that explains it.
 7. **Replication.** `SHOW REPLICA STATUS\G` on each replica. IO thread state, `Last_IO_Error`, `Source_Host` pointing at the right node.
 8. **Agent logs.** `docker compose logs --since 10m mysql-a1` for `fence`, `wake_gap`, `sql=` lines with long `duration_ms`.
 9. **Connections on the primary.** Inside the container, `ss -tnp` to see who is connected to 3306. Many connections from HAProxy in `ESTAB` with nothing moving, or none at all. `ss -tn state syn-recv` for a full backlog. `SHOW PROCESSLIST` for what those sessions are waiting on.
-10. **The kernel.** `dmesg | tail -50` on the host for OOM kills of `mysqld`, filesystem errors, dropped packets.
+10. **The kernel.** `dmesg | tail -50` on the host (in the Docker Desktop VM) for OOM kills of `mysqld`, filesystem errors, dropped packets. `docker inspect -f '{{.State.OOMKilled}}' mysql-a1` and a `mysqld_exited` line with returncode -9 in the agent log are the same story from two sides. This fleet has already had `mysqld` OOM-killed at `START REPLICA` with 16 applier workers in 700 MiB.
 11. **Disk.** `df -h` and `df -i` on the primary and each replica. Entry 9.
 12. **Still nothing.** Take a snapshot of the evidence (`doctor`, `SHOW REPLICA STATUS` from every node, the last events) before changing anything, then `dbgctl halt` the set so automation does not act on a situation you do not understand, and fix by hand using the entries above.
