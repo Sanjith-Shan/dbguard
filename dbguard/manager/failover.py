@@ -33,7 +33,11 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger("dbguard.manager.failover")
 
-ROLE_CHANGE_TIMEOUT_S = 30.0
+# The agent bounds a whole role change (/promote, /repoint) to 30 s. The manager waits a
+# little longer so it never declares a promote failed while the agent is still finishing
+# it (docs/REVIEW_2026-09-23.md #17, INTERFACES.md).
+ROLE_CHANGE_TIMEOUT_S = 35.0
+SQL_STATE_DONE = "Replica has read all relay log"
 
 
 async def fence(ctl: SetController, node: str) -> tuple[FenceStep, dict | None]:
@@ -51,28 +55,64 @@ async def fence(ctl: SetController, node: str) -> tuple[FenceStep, dict | None]:
     return step, resp
 
 
-async def wait_caught_up(ctl: SetController, node: str, deadline_s: float,
+async def wait_caught_up(ctl: "SetController", node: str, deadline_s: float,
                          target=None) -> tuple[bool, str]:
-    """Poll until the node applied its whole relay log (and holds ``target`` if given)."""
+    """Poll until the node applied its whole relay log (and holds ``target`` if given).
+
+    Caught up means Retrieved_Gtid_Set is a subset of what is applied. When the source died
+    mid-send the relay log can end in a partial transaction whose GTID is in the retrieved
+    set but can never be applied, so with the IO thread stopped a SQL thread in state
+    "Replica has read all relay log" also counts as caught up, and the unapplied GTIDs are
+    reported (docs/REVIEW_2026-09-23.md #9).
+    """
+    from dbguard.manager.client import STATUS_TIMEOUT_S
+
     end = time.monotonic() + deadline_s
     why = "no status"
     while True:
-        nv = await ctl.agents.status(node, timeout=1.0)
+        nv = await ctl.agents.status(node, timeout=STATUS_TIMEOUT_S)
         if nv.usable:
             applied = nv.gtid_executed | nv.replica.executed
             if nv.replica.last_sql_error:
                 return False, f"SQL thread error on {node}: {nv.replica.last_sql_error}"
-            if nv.relay_applied and (target is None or target.is_subset(applied)):
+            if target is not None and not target.is_subset(applied | nv.replica.retrieved):
+                miss = (target - applied).count()
+                why = f"{node} lacks {miss} of the old primary's transactions"
+            elif nv.relay_applied:
                 return True, "ok"
-            lag = (nv.replica.retrieved - applied).count()
-            miss = (target - applied).count() if target is not None else 0
-            why = f"{node} still has {lag} relay-log transactions unapplied" + (
-                f" and lacks {miss} of the old primary's" if miss else "")
+            else:
+                pending = nv.replica.retrieved - applied
+                why = f"{node} still has {pending.count()} relay-log transactions unapplied"
+                if nv.replica.io_running != "Yes" and ctl.prober is not None and \
+                        hasattr(ctl.prober, "replica_state"):
+                    rs = await ctl.prober.replica_state(node)
+                    state = (rs or {}).get("Replica_SQL_Running_State") or ""
+                    if state.startswith(SQL_STATE_DONE) and (
+                            target is None or target.is_subset(applied)):
+                        return True, (f"SQL thread read all relay log, {pending.count()} "
+                                      f"retrieved but unapplied GTIDs are a partial "
+                                      f"transaction ({pending})")
         else:
             why = f"{node} not responsive ({nv.error or 'mysqld down'})"
         if time.monotonic() >= end:
             return False, why
         await asyncio.sleep(min(0.1, max(0.02, ctl.cfg.poll_interval_s / 5)))
+
+
+async def stop_io_threads(ctl: "SetController", nodes: list[str]) -> dict[str, str | None]:
+    """STOP REPLICA IO_THREAD on every candidate before comparing their sets.
+
+    A fence by kill restarts the old primary at once, read-only but still serving its
+    binlog, including transactions crash recovery committed that were never acknowledged.
+    Replicas with SOURCE_CONNECT_RETRY=1 would reconnect and fetch them while the manager
+    compares, so the snapshot the subset check passed on would not hold. Orchestrator stops
+    the IO threads for the same reason. /repoint and /promote restart or reset them.
+    """
+    if ctl.prober is None or not hasattr(ctl.prober, "stop_io"):
+        return {}
+    res = await asyncio.gather(*(ctl.prober.stop_io(n) for n in nodes),
+                               return_exceptions=True)
+    return {n: (None if r is None else str(r)) for n, r in zip(nodes, res)}
 
 
 async def repoint_all(ctl: SetController, nodes: list[str], source: str) -> RepointStep:
@@ -133,11 +173,22 @@ async def failover(ctl: SetController, v: Verdict) -> None:
     # 2. choose --------------------------------------------------------------------
     tc = time.monotonic()
     others = [n for n in ctl.members if n != old]
+    io_stop: dict[str, str | None] = {}
+    if mode == "dbguard":
+        pre = ctl.last_obs.nodes if ctl.last_obs else {}
+        io_stop = await stop_io_threads(
+            ctl, [n for n in others if n in pre and pre[n].usable and
+                  pre[n].replica.configured])
+        failed_stop = {n: e for n, e in io_stop.items() if e}
+        if failed_stop:
+            notes.append("STOP REPLICA IO_THREAD failed on " + "; ".join(
+                f"{n} ({e})" for n, e in failed_stop.items()))
     views = await ctl.fresh_views(others)
     choice = choose([views[n] for n in others], mode=mode, old_primary=old)
     steps.choose = ChooseStep(duration_s=round(time.monotonic() - tc, 3),
                               candidates=choice.candidates, winner=choice.winner,
-                              subset_ok=choice.subset_ok)
+                              subset_ok=choice.subset_ok,
+                              io_stopped=sorted(n for n, e in io_stop.items() if e is None))
     if choice.excluded:
         notes.append("not candidates: " + "; ".join(f"{n} {w}" for n, w in
                                                      choice.excluded.items()))
@@ -158,6 +209,8 @@ async def failover(ctl: SetController, v: Verdict) -> None:
         tk = time.monotonic()
         ok, why = await wait_caught_up(ctl, winner, ctl.cfg.catchup_deadline_s)
         steps.catchup = CatchupStep(duration_s=round(time.monotonic() - tk, 3), ok=ok)
+        if ok and why != "ok":
+            notes.append(why)
         if not ok:
             finish(None, "halted", halt_reason=f"catch-up deadline "
                    f"{ctl.cfg.catchup_deadline_s:.0f} s passed, {why}")

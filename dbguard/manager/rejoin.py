@@ -24,6 +24,7 @@ import structlog
 
 from dbguard.events import Clone, Event, Rejoin
 from dbguard.manager.client import AgentError
+from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
 from dbguard.manager.model import NodeView, Observation
 
 if TYPE_CHECKING:
@@ -56,21 +57,14 @@ async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
         return
     now = time.time()
     for n in ctl.members:
-        if n == primary or n in ctl.busy:
+        if n == primary or ctl.node_busy(n):
             continue
         nv = ob.nodes.get(n)
         if nv is None or not nv.usable:
             continue
         if nv.writable:
             # A second writer. Fence first, think later (woken primary, stale manager).
-            log.error("second writable node, fencing", rs=ctl.rs, node=n, primary=primary)
-            try:
-                await ctl.agents.post(n, "/fence", timeout=ctl.cfg.fence_deadline_s)
-                note = f"{n} was writable while {primary} is primary, fenced it"
-            except AgentError as e:
-                note = f"{n} is writable while {primary} is primary and fencing failed: {e}"
-            ctl.event(type="rejoin", old_primary=n, new_primary=primary, note=note,
-                      rejoin=Rejoin(branch="none", node=n))
+            ctl.spawn_node_task(n, fence_second_writer(ctl, n, primary))
             continue
         why = needs_rejoin(nv, primary)
         if why is None:
@@ -88,7 +82,20 @@ async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
                                         .count()),
                           note=f"{n} {why}, rejoin is manual, waiting for an operator")
             continue
-        await rejoin_node(ctl, n, nv, pv, why)
+        ctl.spawn_node_task(n, rejoin_node(ctl, n, nv, pv, why))
+
+
+async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> None:
+    log.error("second writable node, fencing", rs=ctl.rs, node=n, primary=primary)
+    try:
+        await ctl.agents.post(n, "/fence", timeout=ctl.cfg.fence_deadline_s)
+        note = f"{n} was writable while {primary} is primary, fenced it"
+    except AgentError as e:
+        note = f"{n} is writable while {primary} is primary and fencing failed: {e}"
+    if ctl.mode == "naive":
+        note += " (naive mode borrows this safety net from dbguard mode)"
+    ctl.event(type="rejoin", old_primary=n, new_primary=primary, note=note,
+              rejoin=Rejoin(branch="none", node=n))
 
 
 async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
@@ -98,7 +105,8 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
     if phantom.is_empty:
         t0 = time.monotonic()
         try:
-            await ctl.agents.post(n, "/repoint", {"source": primary}, timeout=30.0)
+            await ctl.agents.post(n, "/repoint", {"source": primary},
+                                  timeout=ROLE_CHANGE_TIMEOUT_S)
         except AgentError as e:
             log.warning("rejoin repoint failed", rs=ctl.rs, node=n, error=str(e))
             return None
@@ -143,7 +151,8 @@ async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom
         await asyncio.sleep(0.5)
     source = ctl.primary
     try:
-        await ctl.agents.post(node, "/repoint", {"source": source}, timeout=30.0)
+        await ctl.agents.post(node, "/repoint", {"source": source},
+                              timeout=ROLE_CHANGE_TIMEOUT_S)
     except AgentError as e:
         log.warning("repoint after rebuild failed", rs=ctl.rs, node=node, error=str(e))
     nbytes = int(resp.get("bytes") or 0) if isinstance(resp, dict) else 0
