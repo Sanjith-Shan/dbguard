@@ -1,13 +1,5 @@
-"""Config access for the manager: the shared dbguard.config when present, else the shim."""
+"""Config access for the manager (models live in dbguard/config.py)."""
 
-from __future__ import annotations
+from dbguard.config import FleetConfig, MysqlCreds, SetConfig, load_config
 
-try:  # the fleet agent owns dbguard/config.py
-    from dbguard.config import FleetConfig, MysqlCreds, SetConfig, load_config
-except ImportError:  # pragma: no cover - only before dbguard/config.py exists
-    from dbguard.manager._config_shim import (  # noqa: F401
-        FleetConfig,
-        MysqlCreds,
-        SetConfig,
-        load_config,
-    )
+__all__ = ["FleetConfig", "MysqlCreds", "SetConfig", "load_config"]
