@@ -1,0 +1,95 @@
+[
+  {
+    "scenario": "kill",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-manager",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "switchover",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "hang-container",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "hang-process",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-replicas",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "kill-two",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "cost",
+    "mode": "dbguard",
+    "runs": 3,
+    "args": [
+      "--cost-seconds",
+      "60"
+    ]
+  },
+  {
+    "scenario": "replica-loss",
+    "mode": "dbguard",
+    "runs": 30,
+    "args": [
+      "--data-mb",
+      "200"
+    ]
+  },
+  {
+    "scenario": "disk-full",
+    "mode": "dbguard",
+    "runs": 30
+  },
+  {
+    "scenario": "kill",
+    "mode": "naive",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-manager",
+    "mode": "naive",
+    "runs": 30
+  },
+  {
+    "scenario": "hang-container",
+    "mode": "naive",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-replicas",
+    "mode": "naive",
+    "runs": 30
+  },
+  {
+    "scenario": "kill",
+    "mode": "orchestrator",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-manager",
+    "mode": "orchestrator",
+    "runs": 30
+  },
+  {
+    "scenario": "hang-container",
+    "mode": "orchestrator",
+    "runs": 30
+  }
+]
