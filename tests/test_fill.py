@@ -21,7 +21,8 @@ def row(**kw):
 
 def ev(choose, promote):
     return {"type": "failover", "steps": {"choose": {"duration_s": choose},
-                                          "promote": {"duration_s": promote}}}
+                                          "promote": {"duration_s": promote},
+                                          "repoint": {"duration_s": promote * 3}}}
 
 
 KILL = [
@@ -49,7 +50,7 @@ A tag of the form `[[N: what, source file]]` marks a number. Cells are `[[N: ...
 |---|---|
 | killed | `[[N: kill failover p99, results/kill_dbguard.jsonl]]` |
 
-Median **`[[N: kill failover p50]]` s** and `[[N: choose step p99, results/kill_dbguard.jsonl]]` to choose.
+Median **`[[N: kill failover p50]]` s** and `[[N: choose step p99, results/kill_dbguard.jsonl]]` to choose, repoint `[[N: repoint step p50, results/kill_dbguard.jsonl]]`.
 Cost `[[N: commit p50 semisync on vs off at 0 ms netem, results/cost_dbguard.jsonl]]`, p50 on was `[[N: cost p50 on 0ms]]` and wps `[[N: cost wps off 0ms]]`.
 Split `[[N: rejoin repoint count vs rebuild count, results/kill_dbguard.jsonl]]`, rebuild p50 `[[N: rejoin rebuild duration p50, results/kill_dbguard.jsonl]]`.
 Lost `[[N: dbguard lost acked writes total all scenarios except kill-two, results/*_dbguard.jsonl]]`, rs2 `[[N: rs2 state changes total across all rs1 injections, results/*.jsonl]]` over `[[N: total rs1 injections, results/*.jsonl]]`.
@@ -102,6 +103,7 @@ def test_resolution_and_formatting(tmp_path):
     assert w["kill failover p99"][0].rendered == "9.50 s"
     assert w["kill dbguard converged runs"][0].rendered == "2/3"
     assert w["choose step p99"][0].rendered == "0.30 s"
+    assert w["repoint step p50"][0].rendered == "1.80 s"
     assert w["commit p50 semisync on vs off at 0 ms netem"][0].rendered == \
         "+2.8 ms (4.0 ms on vs 1.2 ms off)"
     assert w["cost p50 on 0ms"][0].rendered == "4.0 ms"
@@ -131,7 +133,7 @@ def test_write_is_idempotent(tmp_path):
     once = doc.read_text()
     assert "| dbguard | 3 | 8.25 | 2/3 |" in once
     assert "| killed | 9.50 s |" in once
-    assert "Median **8.25 s** and 0.30 s to choose." in once
+    assert "Median **8.25 s** and 0.30 s to choose, repoint 1.80 s." in once
     assert "`[[N: what, source file]]`" in once and "`[[N: ...]]`" in once
     assert "`[[N: node mem idle MB, docker stats]]`" in once
     assert "`[[N: switchover stall p50]]`" in once
@@ -147,3 +149,16 @@ def test_cli_check_changes_nothing(tmp_path):
                         capture_output=True, text=True, check=True)
     assert "unmapped:" in cp.stdout and "made up metric" in cp.stdout
     assert doc.read_text() == DOC
+
+
+def test_switchover_event_fields(tmp_path):
+    res_dir, _ = setup(tmp_path)
+    rows = [row(scenario="switchover", failover_s=None, stall_s=st,
+                event={"type": "switchover", "steps": {"prepare": {"duration_s": pr}}})
+            for st, pr in [(1.0, 0.4), (2.0, 0.6), (3.0, 0.5)]]
+    (res_dir / "switchover_dbguard.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    ctx = fill.Ctx(res_dir, tmp_path)
+    assert fill.MAP["switchover prepare p50"].fn(ctx) == 0.5
+    assert fill.MAP["switchover prepare p99"].fn(ctx) == 0.6
+    assert fill.MAP["switchover stall_s p50"].fn(ctx) == 2.0
+    assert fill.MAP["switchover stall_s p99"].fn(ctx) == 3.0

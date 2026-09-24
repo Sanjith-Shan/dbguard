@@ -164,12 +164,12 @@ def _nonempty(xs):
     return xs if xs else None
 
 
-def _step_p99(step: str) -> Spec:
+def _step(step: str, q: float, glob: str = "kill_dbguard.jsonl") -> Spec:
     def fn(c: Ctx):
         ds = [((e.get("steps") or {}).get(step) or {}).get("duration_s")
-              for e in _events(c.rows("kill_dbguard.jsonl"))]
-        return _p(ds, 99)
-    return Spec("kill_dbguard.jsonl", "s", fn, note=f"event.steps.{step}.duration_s")
+              for e in _events(c.rows(glob))]
+        return _p(ds, q)
+    return Spec(glob, "s", fn, note=f"event.steps.{step}.duration_s")
 
 
 def _phantom_per_rebuild(sc, mode, agg):
@@ -414,13 +414,18 @@ def build_map() -> dict[str, Spec]:
     m["switchover run count"] = _sw("runs", "count")
     m["switchover stall p50"] = _sw("stall_p50_s", "s")
     m["switchover stall p99"] = _sw("stall_p99_s", "s")
+    m["switchover stall_s p50"] = m["switchover stall p50"]
+    m["switchover stall_s p99"] = m["switchover stall p99"]
     m["switchover client errors"] = _sw("errors", "count")
     m["switchover runs with errors"] = _sw("runs_with_errors", "count")
     m["switchover lost acked writes"] = _sw("lost_acked_writes", "count")
 
     # 6. from raw rows, not tabulated by bin/report
-    m["choose step p99"] = _step_p99("choose")
-    m["promote step p99"] = _step_p99("promote")
+    m["choose step p99"] = _step("choose", 99)
+    m["promote step p99"] = _step("promote", 99)
+    m["repoint step p50"] = _step("repoint", 50)
+    m["switchover prepare p50"] = _step("prepare", 50, "switchover_dbguard.jsonl")
+    m["switchover prepare p99"] = _step("prepare", 99, "switchover_dbguard.jsonl")
     m["rejoin rebuild duration p50"] = _rejoin_duration("rebuild")
     m["rejoin repoint duration p50"] = _rejoin_duration("repoint")
     m["rejoin repoint count vs rebuild count"] = Spec("kill_dbguard.jsonl", "text", _rejoin_split,
