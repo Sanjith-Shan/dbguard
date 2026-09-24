@@ -1,8 +1,10 @@
-"""Fleet configuration (deploy/fleet.yaml), pydantic v2 models.
+"""Fleet configuration, the pydantic models behind deploy/fleet.yaml.
 
-The schema is fixed by docs/INTERFACES.md ("Config, deploy/fleet.yaml").
-The environment variable ``DBGUARD_MODE`` overrides ``mode`` so the same file serves
-both the dbguard fleet and the naive baseline.
+Every knob the detector, the failover and replacement read comes from here (detection window,
+probe budget, fence and catch-up deadlines, cooldown, rejoin policy). The schema is fixed by
+docs/INTERFACES.md ("Config, deploy/fleet.yaml") and unknown keys are rejected, so a typo in
+the file fails at startup instead of silently keeping a default. ``DBGUARD_MODE`` in the
+environment overrides ``mode``, so one file serves the dbguard fleet and the naive baseline.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ Mode = Literal["dbguard", "naive"]
 
 
 class MysqlCreds(BaseModel):
+    """Accounts the manager uses for SQL and hands to agents for replication."""
+
     model_config = ConfigDict(extra="forbid")
 
     user: str = "dbguard"
@@ -28,6 +32,9 @@ class MysqlCreds(BaseModel):
 
 
 class SetConfig(BaseModel):
+    """One replica set, its members in bootstrap order (``nodes[0]`` is the first primary)
+    and an optional spare for replacement."""
+
     model_config = ConfigDict(extra="forbid")
 
     nodes: list[str] = Field(min_length=1)
@@ -35,6 +42,7 @@ class SetConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_nodes(self) -> SetConfig:
+        """Reject a node listed twice or used as both member and spare."""
         if len(set(self.nodes)) != len(self.nodes):
             raise ValueError(f"duplicate node in set: {self.nodes}")
         if self.spare is not None and self.spare in self.nodes:
@@ -43,6 +51,8 @@ class SetConfig(BaseModel):
 
 
 class FleetConfig(BaseModel):
+    """The whole fleet.yaml. Defaults follow the spec, and the lab file overrides some of them."""
+
     model_config = ConfigDict(extra="forbid")
 
     mode: Mode = "dbguard"
@@ -61,6 +71,7 @@ class FleetConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_sets(self) -> FleetConfig:
+        """Reject a node that belongs to two sets."""
         seen: dict[str, str] = {}
         for rs, sc in self.sets.items():
             for n in [*sc.nodes, *([sc.spare] if sc.spare else [])]:
