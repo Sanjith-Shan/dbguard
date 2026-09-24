@@ -701,6 +701,74 @@ def thaw(c: str) -> None:
     _frozen.discard(c)
 
 
+class WriterSampler(threading.Thread):
+    """Single-writer at every checkpoint, not only at the end (review #5).
+
+    Every `interval` s it reads every node's agent /status (the set plus the spare) and
+    counts checkpoints where more than one node is writable (super_read_only=0 with a
+    responsive mysqld) or more than one agent reports role primary. A frozen or dead node
+    cannot be judged and is not counted."""
+
+    def __init__(self, fleet: "Fleet", interval: float = 1.0):
+        super().__init__(daemon=True, name="writer-sampler")
+        self.fleet = fleet
+        self.interval = interval
+        self.stop_ev = threading.Event()
+        self.samples = 0
+        self.violations = 0
+        self.examples: list[dict] = []
+
+    def run(self) -> None:
+        while not self.stop_ev.is_set():
+            try:
+                ss = self.fleet.statuses()
+            except Exception:  # noqa: BLE001
+                ss = {}
+            writable = sorted(n for n, s in ss.items() if s and s.get("super_read_only") is False
+                              and s.get("mysqld_responsive"))
+            prim = sorted(n for n, s in ss.items() if s and s.get("role") == "primary")
+            self.samples += 1
+            if len(writable) > 1 or len(prim) > 1:
+                self.violations += 1
+                if len(self.examples) < 5:
+                    self.examples.append({"ts": time.time(), "writable": writable, "primary": prim})
+            self.stop_ev.wait(self.interval)
+
+    def stop(self) -> dict:
+        self.stop_ev.set()
+        self.join(timeout=5)
+        return {"samples": self.samples, "violations": self.violations, "examples": self.examples}
+
+
+def probe_writable(node: str) -> dict | None:
+    """Direct single-writer probe of one node: read_only flags and a rolled-back INSERT."""
+    import pymysql
+    try:
+        conn = pymysql.connect(host="127.0.0.1", port=mysql_port(node), user="root",
+                               password="root", connect_timeout=3, read_timeout=5,
+                               ssl=insecure_tls())
+    except Exception as e:  # noqa: BLE001
+        return {"node": node, "reachable": False, "error": str(e)[:200]}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT @@GLOBAL.super_read_only, @@GLOBAL.read_only")
+            sro, ro = cur.fetchone()
+            accepted = False
+            try:
+                conn.begin()
+                cur.execute("INSERT INTO chaos.writes (client_id, seq, ts, run_id, payload) "
+                            "VALUES (-2, -2, NOW(6), 'harness-probe', NULL)")
+                accepted = True
+            except Exception:  # noqa: BLE001
+                accepted = False
+            finally:
+                conn.rollback()
+        return {"node": node, "reachable": True, "super_read_only": int(sro), "read_only": int(ro),
+                "insert_accepted": accepted}
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- orchestrator helpers
 
 def orch_get(path: str, timeout: float = 5.0) -> Any:
@@ -793,6 +861,7 @@ class Run:
     dir: Path
     commands: list[str] = field(default_factory=list)
     row: dict = field(default_factory=dict)
+    sampler: WriterSampler | None = None
     t_start: float = field(default_factory=time.time)
 
 
@@ -835,14 +904,34 @@ def apply_acks(run: Run, wl: Workload, inject_ts: float | None, window_end: floa
 
 
 def check(run: Run, wl: Workload, nodes: list[str] | None = None) -> None:
+    """Run the checker on the set, then add single-writer evidence the checker cannot see:
+    the old primary (left out of the checker because it has not rejoined yet, so its
+    convergence would fail) is probed directly, and the in-run samples are added."""
     nodes = nodes or [n for n in run.fleet.members() if agent(n).status()]
+    sampled = run.sampler.stop() if run.sampler else None
+    run.sampler = None
     try:
         v = run_checker(run.run_id, wl.ack_log, nodes, run.dir)
+        run.row.update(checker_fields(v))
     except Exception as e:  # noqa: BLE001
         note(run, f"checker failed: {e}")
-        return
-    run.row.update(checker_fields(v))
     run.row["checker_nodes"] = nodes
+    sw = {"checker": run.row.get("single_writer_violations", 0), "sampled": sampled,
+          "outside_checker": []}
+    extra = 0
+    others = [n for n in run.fleet.nodes + [spare_node(run.opts.rs)]
+              if n not in nodes and docker.is_running(n)]
+    writable_in = [n for n in nodes if (probe_writable(n) or {}).get("insert_accepted")] if others else []
+    for n in others:
+        pr = probe_writable(n)
+        if not pr or not pr.get("reachable"):
+            continue
+        sw["outside_checker"].append(pr)
+        if pr.get("insert_accepted") and writable_in:
+            extra += 1
+    run.row["single_writer"] = sw
+    run.row["single_writer_violations"] = int(sw["checker"] or 0) + extra + \
+        int((sampled or {}).get("violations") or 0)
 
 
 def match_failover(evs: list[dict], old: str | None) -> dict | None:
@@ -855,6 +944,9 @@ def match_failover(evs: list[dict], old: str | None) -> dict | None:
 def start_workload(run: Run, duration: float) -> Workload:
     wl = Workload(run.dir, run.run_id, haproxy_port(run.opts.rs), run.opts.clients, duration)
     wl.start()
+    if run.sampler is None:
+        run.sampler = WriterSampler(run.fleet)
+        run.sampler.start()
     return wl
 
 
@@ -1398,6 +1490,9 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
             rs2_wl.start()
         SCENARIO_FN[opts.scenario](run)
     finally:
+        if run.sampler:
+            run.sampler.stop()
+            run.sampler = None
         if rs2_wl:
             rs2_wl.stop()
             oks, errs = read_ack_log(rs2_wl.ack_log)

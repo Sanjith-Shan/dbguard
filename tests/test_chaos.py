@@ -177,3 +177,26 @@ def test_ok_start_falls_back_to_latency():
     from dbguard.harness.chaos import ok_start
     assert ok_start({"t_ok": 10.0, "latency_ms": 500}) == pytest.approx(9.5)
     assert ok_start({"t_ok": 10.0, "t_start": 9.9}) == 9.9
+
+
+def test_writer_sampler_counts_two_writers():
+    from dbguard.harness.chaos import WriterSampler
+
+    class FakeFleet:
+        def __init__(self):
+            self.n = 0
+
+        def statuses(self):
+            self.n += 1
+            two = self.n in (2, 3)
+            w = {"super_read_only": False, "mysqld_responsive": True, "role": "primary"}
+            r = {"super_read_only": True, "mysqld_responsive": True, "role": "replica"}
+            return {"mysql-a1": w, "mysql-a2": w if two else r, "mysql-a3": None}
+
+    s = WriterSampler(FakeFleet(), interval=0.01)
+    s.start()
+    import time as _t
+    _t.sleep(0.2)
+    res = s.stop()
+    assert res["samples"] >= 4 and res["violations"] == 2
+    assert res["examples"][0]["writable"] == ["mysql-a1", "mysql-a2"]
