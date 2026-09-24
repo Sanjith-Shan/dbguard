@@ -3,6 +3,8 @@
 Thin handlers over ``Agent``. The middleware maps an ``AgentError`` to its status and a
 ``DbError`` to 500 with ``sql_code``, or 503 when mysqld timed out. The manager retries a role
 change once on ``sql_code`` 2006 or 2013, the link a fence on the same node killed.
+With ``DBGUARD_AGENT_TOKEN`` set, the ``auth`` middleware answers 401 to any call but the
+three open reads (dbguard/auth.py) that lacks ``Authorization: Bearer <token>``.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 
 from dbguard.agent.core import Agent, AgentError
 from dbguard.agent.db import DbError
+from dbguard.auth import check_bearer, is_open
 
 log = structlog.get_logger("dbguard.agent.http")
 
@@ -51,6 +54,20 @@ async def errors(request: web.Request, handler):
         log.warning("request_failed", path=request.path, error=str(e), sql_code=e.code)
         return web.json_response({"error": str(e), "sql_code": e.code,
                                   "timeout": e.timeout}, status=503 if e.timeout else 500)
+
+
+def auth_middleware(agent: Agent, token: str):
+    """Require the shared bearer token on every route but GET /health, /metrics, /primary."""
+    @web.middleware
+    async def auth(request: web.Request, handler):
+        if is_open(request.method, request.path) or check_bearer(
+                request.headers.get("Authorization"), token):
+            return await handler(request)
+        agent.m.unauthorized.inc()
+        log.warning("unauthorized", path=request.path, method=request.method,
+                    remote=request.remote)
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return auth
 
 
 async def primary(request: web.Request) -> web.Response:
@@ -137,8 +154,10 @@ async def metrics(request: web.Request) -> web.Response:
 
 
 def make_app(agent: Agent) -> web.Application:
-    """The aiohttp application serving ``agent``."""
-    app = web.Application(middlewares=[errors])
+    """The aiohttp application serving ``agent``, token-checked when its settings carry one."""
+    token = agent.s.agent_token
+    middlewares = [auth_middleware(agent, token)] if token else []
+    app = web.Application(middlewares=[*middlewares, errors])
     app[AGENT_KEY] = agent
     app.router.add_get("/primary", primary)
     app.router.add_get("/status", status)

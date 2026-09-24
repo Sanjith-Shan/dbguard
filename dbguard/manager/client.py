@@ -17,6 +17,7 @@ from typing import Any
 
 import aiohttp
 
+from dbguard.auth import bearer_headers
 from dbguard.manager.model import NodeView
 
 
@@ -116,11 +117,16 @@ class AgentError(Exception):
 
 
 class AgentClient:
-    """Every call is bounded. A hung agent costs at most its timeout, never the loop."""
+    """Every call is bounded. A hung agent costs at most its timeout, never the loop.
 
-    def __init__(self, addressing: Addressing, status_timeout_s: float = STATUS_TIMEOUT_S):
+    ``token`` (fleet.yaml ``agent_token`` or ``DBGUARD_AGENT_TOKEN``) is sent as
+    ``Authorization: Bearer`` on every call. None sends no header, the agents' default."""
+
+    def __init__(self, addressing: Addressing, status_timeout_s: float = STATUS_TIMEOUT_S,
+                 token: str | None = None):
         self.addr = addressing
         self.status_timeout_s = status_timeout_s
+        self.headers = bearer_headers(token)
         self._session: aiohttp.ClientSession | None = None
 
     async def session(self) -> aiohttp.ClientSession:
@@ -153,7 +159,7 @@ class AgentClient:
         s = await self.session()
         try:
             async def go():
-                async with s.request(method, url, json=body,
+                async with s.request(method, url, json=body, headers=self.headers,
                                      timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                     try:
                         data = await r.json(content_type=None)

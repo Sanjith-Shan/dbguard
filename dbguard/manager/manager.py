@@ -12,6 +12,7 @@ from pathlib import Path
 
 import structlog
 
+from dbguard.auth import token_from_env
 from dbguard.events import EventLog
 from dbguard.manager.client import Addressing, AgentClient
 from dbguard.manager.controller import SetController
@@ -34,7 +35,8 @@ class Manager:
         self.mode = mode or cfg.mode
         self.addr = addressing or Addressing(agent_port=cfg.agent_port,
                                              mysql_port=cfg.mysql.port)
-        self.agents = agents or AgentClient(self.addr)
+        self.agents = agents or AgentClient(
+            self.addr, token=getattr(cfg, "agent_token", None) or token_from_env())
         self.prober = prober if prober is not None else MysqlProber(
             self.addr, cfg.mysql.user, cfg.mysql.password, cfg.probe_timeout_s)
         path = Path(state_dir) / "events.jsonl" if state_dir else None

@@ -48,6 +48,9 @@ class AgentMetrics:
         self.fenced = Gauge("dbguard_agent_fenced", "Fence flag", registry=r)
         self.mysqld_alive = Gauge("dbguard_agent_mysqld_alive", "mysqld process alive",
                                   registry=r)
+        self.unauthorized = Counter("dbguard_agent_unauthorized_total",
+                                    "Requests refused for a missing or wrong agent token",
+                                    registry=r)
 
     def set_role(self, role: str) -> None:
         """Set the one-hot role gauge."""

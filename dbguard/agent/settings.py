@@ -12,6 +12,8 @@ import os
 import shlex
 from dataclasses import dataclass, field
 
+from dbguard.auth import token_from_env
+
 
 def _bool(value: str | None, default: bool) -> bool:
     """An env flag (1, true, yes, on), ``default`` when unset."""
@@ -57,6 +59,7 @@ class AgentSettings:
     primary_stale_s: float = 0.5
     primary_sample_interval_s: float = 0.1
     primary_sample_timeout_s: float = 0.3
+    agent_token: str | None = field(default=None, repr=False)
 
     @property
     def fence_file(self) -> str:
@@ -87,4 +90,5 @@ class AgentSettings:
             restart_hold_s=float(e.get("DBGUARD_RESTART_HOLD_S", "20")),
             self_fence_after_s=float(e.get("DBGUARD_SELF_FENCE_AFTER_S", "10")),
             mysqld_cmd=shlex.split(e.get("DBGUARD_MYSQLD_CMD", "docker-entrypoint.sh mysqld")),
+            agent_token=token_from_env(e),
         )

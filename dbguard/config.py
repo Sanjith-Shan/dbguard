@@ -5,6 +5,7 @@ probe budget, fence and catch-up deadlines, cooldown, rejoin policy). The schema
 docs/INTERFACES.md ("Config, deploy/fleet.yaml") and unknown keys are rejected, so a typo in
 the file fails at startup instead of silently keeping a default. ``DBGUARD_MODE`` in the
 environment overrides ``mode``, so one file serves the dbguard fleet and the naive baseline.
+``DBGUARD_AGENT_TOKEN``, when non-empty, overrides ``agent_token`` (dbguard/auth.py).
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from dbguard.auth import token_from_env
 
 Mode = Literal["dbguard", "naive"]
 
@@ -67,6 +70,7 @@ class FleetConfig(BaseModel):
     poll_interval_s: float = 0.5
     mysql: MysqlCreds = Field(default_factory=MysqlCreds)
     agent_port: int = 8080
+    agent_token: str | None = Field(default=None, repr=False)
     sets: dict[str, SetConfig]
 
     @model_validator(mode="after")
@@ -89,7 +93,8 @@ class FleetConfig(BaseModel):
 
 
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> FleetConfig:
-    """Load and validate fleet.yaml. ``DBGUARD_MODE`` in the environment wins over the file."""
+    """Load and validate fleet.yaml. ``DBGUARD_MODE`` and a non-empty ``DBGUARD_AGENT_TOKEN``
+    in the environment win over the file."""
     env = os.environ if env is None else env
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
@@ -98,4 +103,7 @@ def load_config(path: str | Path, env: dict[str, str] | None = None) -> FleetCon
     mode = env.get("DBGUARD_MODE")
     if mode:
         raw["mode"] = mode
+    token = token_from_env(env)
+    if token:
+        raw["agent_token"] = token
     return FleetConfig.model_validate(raw)

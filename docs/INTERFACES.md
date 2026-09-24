@@ -257,7 +257,46 @@ state alone and logs, whatever the fence file says. The heartbeat writer does no
 a gap until the guard has run. Env `DBGUARD_MANAGER_URL=http://dbguard:9090`.
 
 Env for the agent container: `DBGUARD_NODE`, `DBGUARD_RS`, `DBGUARD_SERVER_ID`,
-`DBGUARD_SEMISYNC`, `DBGUARD_MANAGER_URL`, `MYSQL_ROOT_PASSWORD`.
+`DBGUARD_SEMISYNC`, `DBGUARD_MANAGER_URL`, `MYSQL_ROOT_PASSWORD`, and optionally `DBGUARD_AGENT_TOKEN`.
+
+Authentication (optional, dbguard/auth.py): with `DBGUARD_AGENT_TOKEN` unset or empty (the
+default, and what every published measurement ran with) the API is open as above. With it
+set, every route except `GET /health`, `GET /metrics` and `GET /primary` (HAProxy's check and
+the compose healthcheck stay unauthenticated) requires `Authorization: Bearer <token>`,
+compared in constant time. A missing or wrong token gets 401 `{"error":"unauthorized"}` and
+increments `dbguard_agent_unauthorized_total`. The manager sends the header on every call,
+with the token from `agent_token` in fleet.yaml or `DBGUARD_AGENT_TOKEN` (a non-empty env
+value wins). deploy/docker-compose.yml is to pass `DBGUARD_AGENT_TOKEN=${DBGUARD_AGENT_TOKEN:-}`
+to the nodes and the manager, so empty means off (not applied yet, see the TODO below). Every other caller of an agent must send the same header
+when a token is set: the chaos harness (dbguard/harness/chaos.py through
+`dbguard.cli.client.AgentClient`, which dbgctl also uses) and the Orchestrator hook
+(deploy/orchestrator/hooks/hook.sh). Until they do, a token breaks the harness and the
+Orchestrator baseline, so leave it unset for chaos runs.
+
+TODO (harness owner), call sites that must send `Authorization: Bearer $DBGUARD_AGENT_TOKEN`
+when it is set:
+
+- [ ] `dbguard/cli/client.py` `AgentClient.get` / `AgentClient.post` (via `request()`): add an
+  optional `token` (default `dbguard.auth.token_from_env()`) and pass
+  `dbguard.auth.bearer_headers(token)`. This one change covers every harness call below.
+- [ ] `dbguard/harness/chaos.py:103-104` `agent(node)` builds `AgentClient(f"http://127.0.0.1:{agent_port(node)}")`.
+  Callers that need the token (anything but `/primary`):
+  - `/status` via `agent(n).status()`: lines 507, 641, 643, 672, 744, 782, 1114, 1177, 1247,
+    1286, 1357, 1374, 1394, 1420, 1424, 1495, 1500, 1610, 1757
+  - `POST /promote` 812, `POST /repoint` 831 and 837, `POST /rebuild` 836
+  - `POST /configure` 990 (self_fence, wake_guard) and 1472 (semisync)
+  - open, no change needed: `agent(n).primary_code()` (`GET /primary`) at 521, 1226, 1252, 1698
+- [ ] `deploy/orchestrator/hooks/hook.sh`: `http_post()` (curl line 22, wget line 24) used by
+  `POST http://$failed:8080/fence` (line 37) and `POST http://$successor:8080/promote`
+  (line 43). Add `-H "Authorization: Bearer $DBGUARD_AGENT_TOKEN"` (curl) /
+  `--header="Authorization: Bearer $DBGUARD_AGENT_TOKEN"` (wget) when the variable is
+  non-empty, and pass the variable into the orchestrator container in docker-compose.yml.
+- [ ] `deploy/docker-compose.yml`: add `DBGUARD_AGENT_TOKEN: ${DBGUARD_AGENT_TOKEN:-}` to
+  `x-node-env` and to the `dbguard` service's `environment`. Held back while a campaign runs:
+  any change to a service's environment changes its compose config hash, so the harness's
+  next `docker compose up -d <node>` would recreate the container instead of starting it.
+- [ ] Line numbers are as of commit a31663f plus this change; re-grep `:8080`, `/fence` and
+  `agent(` in dbguard/harness and deploy/orchestrator before editing.
 
 ## Manager HTTP API (`:9090`, JSON)
 
@@ -562,6 +601,8 @@ rejoin: auto             # or manual
 poll_interval_s: 0.5
 mysql: {user: dbguard, password: dbguard, repl_user: repl, repl_password: repl, port: 3306}
 agent_port: 8080
+# agent_token: change-me  # optional; sent as "Authorization: Bearer" to every agent. Env
+#                        # DBGUARD_AGENT_TOKEN (non-empty) wins. Unset: agents run without auth.
 sets:
   rs1: {nodes: [mysql-a1, mysql-a2, mysql-a3], spare: mysql-a4}
   rs2: {nodes: [mysql-b1, mysql-b2, mysql-b3], spare: mysql-b4}
