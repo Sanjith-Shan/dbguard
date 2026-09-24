@@ -1,0 +1,40 @@
+# dbguard-manager: the manager daemon. Build from the repo root:
+#   docker build -f deploy/Dockerfile.manager -t dbguard-manager .
+FROM python:3.12-slim
+
+ARG TARGETARCH
+ARG DOCKER_VERSION=27.5.1
+ARG COMPOSE_VERSION=v2.32.4
+
+# docker CLI + compose plugin (static binaries), so the manager can bring up a spare node
+# through the mounted /var/run/docker.sock (`docker compose --profile spare up -d mysql-a4`).
+RUN set -eux; \
+    case "$TARGETARCH" in arm64) A=aarch64 ;; amd64) A=x86_64 ;; *) A="$TARGETARCH" ;; esac; \
+    python - "$A" <<'PY'
+import io, sys, tarfile, urllib.request, os
+a = sys.argv[1]
+v = os.environ["DOCKER_VERSION"]; c = os.environ["COMPOSE_VERSION"]
+url = f"https://download.docker.com/linux/static/stable/{a}/docker-{v}.tgz"
+with tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen(url).read())) as t:
+    m = t.getmember("docker/docker"); m.name = "docker"; t.extract(m, "/usr/local/bin")
+os.makedirs("/usr/local/lib/docker/cli-plugins", exist_ok=True)
+dst = "/usr/local/lib/docker/cli-plugins/docker-compose"
+urllib.request.urlretrieve(
+    f"https://github.com/docker/compose/releases/download/{c}/docker-compose-linux-{a}", dst)
+os.chmod(dst, 0o755)
+PY
+RUN docker --version && docker compose version
+
+# Python deps layer: only pyproject changes invalidate it.
+COPY pyproject.toml /src/pyproject.toml
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib;d=tomllib.load(open('/src/pyproject.toml','rb'));print('\n'.join(d['project']['dependencies']+['PyMySQL>=1.1']))" > /tmp/req.txt \
+ && pip install -r /tmp/req.txt
+
+COPY dbguard /src/dbguard
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps /src
+
+RUN mkdir -p /var/lib/dbguard /etc/dbguard
+EXPOSE 9090
+CMD ["dbguard", "--config", "/etc/dbguard/fleet.yaml"]
