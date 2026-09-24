@@ -1,0 +1,39 @@
+# DBGuard agent. One per MySQL host. It starts mysqld as its child and is the only thing
+# that changes the local instance's role, so it replaces mysql.service on the host.
+# Install: see deploy/systemd/README.md
+[Unit]
+Description=DBGuard agent (mysqld supervisor, fence, role changes)
+Documentation=https://github.com/Sanjith-Shan/dbguard/blob/main/docs/DESIGN.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+Conflicts=mysql.service mysqld.service
+
+[Service]
+Type=simple
+# root, because it supervises mysqld, SIGKILLs it when a fence cannot be applied in SQL,
+# and restarts it. mysqld itself drops to the mysql user (--user=mysql).
+User=root
+EnvironmentFile=/etc/dbguard/agent.env
+ExecStart=/opt/dbguard/venv/bin/dbguard-agent
+Restart=on-failure
+RestartSec=2
+# SIGTERM goes to the agent alone. It shuts mysqld down cleanly (mysqld needs time to flush
+# InnoDB) and exits. After TimeoutStopSec every remaining process in the unit gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=30
+StateDirectory=dbguard
+LimitNOFILE=65535
+
+# Hardening that does not get in the way of mysqld. ProtectSystem=full makes /usr, /boot
+# and /etc read-only. /var/lib/mysql, /var/log/mysql and /run/mysqld stay writable.
+# PrivateTmp gives mysqld and the agent a private /tmp, which mysqld only uses for temp tables.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelModules=true
+RuntimeDirectory=mysqld
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

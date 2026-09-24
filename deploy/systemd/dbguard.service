@@ -1,0 +1,41 @@
+# DBGuard manager daemon. One per fleet.
+# Install: see deploy/systemd/README.md
+[Unit]
+Description=DBGuard MySQL replica-set manager
+Documentation=https://github.com/Sanjith-Shan/dbguard/blob/main/docs/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dbguard
+Group=dbguard
+EnvironmentFile=-/etc/dbguard/dbguard.env
+ExecStart=/opt/dbguard/venv/bin/dbguard --config ${DBGUARD_CONFIG} --state-dir /var/lib/dbguard --listen ${DBGUARD_LISTEN}
+Environment=DBGUARD_CONFIG=/etc/dbguard/fleet.yaml
+Environment=DBGUARD_LISTEN=0.0.0.0:9090
+Environment=DBGUARD_PROVISION=null
+Restart=on-failure
+RestartSec=2
+# SIGTERM to the daemon only, it finishes the step in flight and exits.
+# Anything left after TimeoutStopSec gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=30
+StateDirectory=dbguard
+StateDirectoryMode=0750
+
+# Hardening. The manager only talks HTTP and MySQL over the network and writes its
+# event log under /var/lib/dbguard.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dbguard
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
