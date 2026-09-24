@@ -52,6 +52,9 @@ class FakeNode:
     fence_delay: float = 0.0    # a slow /fence
     pending: GtidSet = field(default_factory=GtidSet)   # binlogged, waiting for an ack
     pending_until: float | None = None  # when the waiting sessions finish committing
+    rebuild_delay: float = 0.05  # how long a clone takes
+    active_ops: int = 0          # /rebuild and /repoint requests in flight on this node
+    max_active_ops: int = 0
     hide_waiting: bool = False  # waiters invisible to /status and SQL (belt-and-braces test)
     fail_next: dict = field(default_factory=dict)  # path -> times to answer 500 lost link
     partial: GtidSet = field(default_factory=GtidSet)  # in the relay log, never appliable
@@ -320,6 +323,14 @@ class FakeFleet:
 
         async def repoint(request):
             body = await request.json()
+            node.active_ops += 1
+            node.max_active_ops = max(node.max_active_ops, node.active_ops)
+            try:
+                return await _repoint(body)
+            finally:
+                node.active_ops -= 1
+
+        async def _repoint(body):
             if node.repoint_delay:
                 await asyncio.sleep(node.repoint_delay)
             if not node.responsive:
@@ -339,7 +350,13 @@ class FakeFleet:
             body = await request.json()
             donor = fleet.nodes[body["donor"]]
             phantom = (node.executed - donor.executed).count()
-            await asyncio.sleep(0.05)
+            node.active_ops += 1
+            node.max_active_ops = max(node.max_active_ops, node.active_ops)
+            node.source = None                    # replication is gone while cloning
+            try:
+                await asyncio.sleep(node.rebuild_delay)
+            finally:
+                node.active_ops -= 1
             node.executed = donor.executed
             node.retrieved = GtidSet()
             node.source = None

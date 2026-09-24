@@ -118,7 +118,7 @@ async def set_rejoin(request):
         if node not in ctl.members:
             ctl.members.append(node)
         ev = await rejoin_node(ctl, node, nv, pv, why=needs_rejoin(nv, ctl.primary) or
-                               "operator request", wait=False)
+                               "operator request", wait=False, inline_verify=False)
     return web.json_response({"event": ev.row() if ev else None,
                               "state": ctl.st.state.value,
                               "note": None if ev else "rebuild started in the background"})

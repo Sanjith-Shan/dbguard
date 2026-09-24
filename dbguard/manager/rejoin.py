@@ -150,7 +150,7 @@ async def quiesce(ctl: SetController, n: str) -> tuple[NodeView | None, str]:
 
 async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
                       pv: NodeView | None = None, why: str = "operator request",
-                      wait: bool = False) -> Event | None:
+                      wait: bool = False, inline_verify: bool = True) -> Event | None:
     """Repoint ``n`` if it holds nothing the primary lacks, else rebuild it from a replica.
 
     Never decides from a cached view. The node is fenced first when it looks like a former
@@ -194,10 +194,12 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView | None = None,
                        note=f"{n} {why}, quiescent gtid_executed is a subset of {primary}'s, "
                             f"repointed")
         verify = verify_after_repoint(ctl, n, primary)
-        if wait:
+        if inline_verify:
+            # Called from the node's own background task (rejoin_actions): watching inline
+            # keeps the node marked busy for the whole watch, so no second rejoin starts.
             await verify
-        else:
-            asyncio.create_task(verify, name=f"verify-{n}")
+        elif not ctl.spawn_node_task(n, verify):
+            log.warning("errant watch not started, node busy", rs=ctl.rs, node=n)
         return ev
     return await _rebuild(ctl, n, phantom, why, wait, branch="rebuild")
 
@@ -241,11 +243,31 @@ async def verify_after_repoint(ctl: SetController, n: str, primary: str) -> None
         if seen >= 2:
             log.error("errant GTIDs after repoint, rebuilding", rs=ctl.rs, node=n,
                       errant=str(errant))
-            await _wait_maintenance_slot(ctl)
-            await _rebuild(ctl, n, errant,
-                           f"held {errant.count()} GTIDs {primary} lacks after its repoint",
-                           wait=True, branch="rebuild_after_errant")
+            await start_rebuild_when_free(
+                ctl, n, errant, f"held {errant.count()} GTIDs {primary} lacks after its repoint",
+                branch="rebuild_after_errant")
             return
+
+
+async def start_rebuild_when_free(ctl: SetController, n: str, phantom: GtidSet, why: str,
+                                  branch: str) -> None:
+    """Start the rebuild through start_maintenance, like every other clone, so the node is
+    marked busy and rejoin_actions never starts a second rejoin or rebuild of it. Waits for
+    the maintenance slot and for a donor, retrying until the manager stops."""
+    while True:
+        await _wait_maintenance_slot(ctl)
+        views = await ctl.fresh_views([m for m in ctl.members if m != n])
+        donors = ctl.healthy_replicas(views, exclude=(n,))
+        if donors:
+            coro = rebuild_and_join(ctl, n, donors[0], phantom_count=phantom.count(),
+                                    phantom=str(phantom), why=why, event_type="rejoin",
+                                    branch=branch)
+            if ctl.start_maintenance(coro, [n]):
+                return
+        else:
+            log.warning("rebuild needed but no healthy replica to clone from", rs=ctl.rs,
+                        node=n, phantom=phantom.count())
+        await asyncio.sleep(ctl.quiesce_interval_s)
 
 
 async def _wait_maintenance_slot(ctl: SetController) -> None:

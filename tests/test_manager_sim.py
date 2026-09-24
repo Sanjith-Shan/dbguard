@@ -926,3 +926,46 @@ async def test_errant_gtids_after_a_repoint_trigger_a_rebuild(sim_factory):
     assert ev.rejoin.phantom_gtids == 8
     new = s.ctl().primary
     assert a1.executed.is_subset(s.fleet.nodes[new].executed)
+
+
+async def test_rebuild_after_errant_never_overlaps_a_rejoin_of_the_same_node(sim_factory):
+    """The watcher's rebuild goes through start_maintenance, so while the clone runs (and
+    the node shows no replication) rejoin_actions must not start a second rejoin of it."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    _freeze_with_waiters(s)
+    a1 = s.fleet.nodes["mysql-a1"]
+    a1.hide_waiting = True
+    a1.rebuild_delay = 1.5
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover")
+    a1.frozen = False
+    await s.until(lambda: a1.source is not None, timeout=10, what="repoint of mysql-a1")
+    a1.pending_until = time.time()
+    await s.until(lambda: "mysql-a1" in s.ctl().busy, timeout=10, what="rebuild started")
+    assert "/rebuild" in a1.calls
+    n_repoints = a1.calls.count("/repoint")
+    await asyncio.sleep(1.0)                        # the clone is running, source is None
+    assert a1.calls.count("/repoint") == n_repoints, "a rejoin started during the rebuild"
+    assert a1.calls.count("/rebuild") == 1
+    await s.until(lambda: any(e.rejoin and e.rejoin.branch == "rebuild_after_errant"
+                              for e in s.events("rs1", "rejoin")), timeout=10, what="event")
+    assert a1.max_active_ops == 1
+    await asyncio.sleep(0.5)
+    assert a1.calls.count("/rebuild") == 1
+    branches = [e.rejoin.branch for e in s.events("rs1", "rejoin")
+                if e.rejoin and e.rejoin.node == "mysql-a1"]
+    assert branches.count("rebuild_after_errant") == 1 and "rebuild" not in branches
+
+
+async def test_stop_cancels_the_errant_watch(sim_factory):
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.ctl().quiesce_interval_s = 1.0               # a 10 s watch
+    s.fleet.nodes["mysql-a3"].source = "mysql-a2"   # straggler: repoint, then the watch
+    await s.until(lambda: any(e.rejoin and e.rejoin.node == "mysql-a3"
+                              for e in s.events("rs1", "rejoin")), timeout=10, what="repoint")
+    task = s.ctl().node_tasks.get("mysql-a3")
+    assert task is not None and not task.done(), "the watch runs as the node's task"
+    await s.mgr.stop()
+    await asyncio.sleep(0)
+    assert task.cancelled() or task.done()
