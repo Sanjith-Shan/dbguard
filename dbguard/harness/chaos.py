@@ -144,6 +144,24 @@ def gtid_equal(a: str | None, b: str | None) -> bool:
     return parse_gtid(a) == parse_gtid(b)
 
 
+def gtid_subset(a: str | None, b: str | None) -> bool:
+    """Every GTID of a is in b."""
+    pb = parse_gtid(b)
+    for u, ivs in parse_gtid(a).items():
+        bivs = pb.get(u, [])
+        for lo, hi in ivs:
+            if not any(blo <= lo and hi <= bhi for blo, bhi in bivs):
+                return False
+    return True
+
+
+def caught_up(before: str | None, replica: str | None, after: str | None) -> bool:
+    """A replica read between two reads of a primary that keeps writing (the agent's
+    heartbeat commits every 500 ms) has caught up and holds nothing errant when
+    before <= replica <= after. Exact equality with one snapshot almost never holds."""
+    return gtid_subset(before, replica) and gtid_subset(replica, after)
+
+
 # ---------------------------------------------------------------- ack log analysis
 
 @dataclass
@@ -599,8 +617,10 @@ class Fleet:
                 return False, f"original nodes not yet rejoined: {missing}"
         else:
             members = self.nodes
-        ss = self.statuses(members)
-        pg = (ss.get(p) or {}).get("gtid_executed")
+        before = (agent(p).status() or {}).get("gtid_executed")
+        ss = self.statuses([n for n in members if n != p])
+        after = (agent(p).status() or {}).get("gtid_executed")
+        ss[p] = {"gtid_executed": after}
         for n in members:
             s = ss.get(n)
             if not s:
@@ -610,8 +630,10 @@ class Fleet:
             r = s.get("replica") or {}
             if r.get("source_host") != p or r.get("io_running") != "Yes" or r.get("sql_running") != "Yes":
                 return False, f"{n} not replicating from {p}: {r.get('source_host')} io={r.get('io_running')} sql={r.get('sql_running')}"
-            if not gtid_equal(s.get("gtid_executed"), pg):
-                return False, f"{n} gtid differs from {p}"
+            if not caught_up(before, s.get("gtid_executed"), after):
+                if not gtid_subset(s.get("gtid_executed"), after):
+                    return False, f"{n} has GTIDs {p} lacks (errant)"
+                return False, f"{n} not caught up with {p}"
         return True, "ok"
 
     def clear_faults(self, extra_containers: list[str] = ()) -> None:

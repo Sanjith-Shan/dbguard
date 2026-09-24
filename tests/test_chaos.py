@@ -280,7 +280,17 @@ def _rep(src):
     return {"gtid_executed": G, "replica": {"source_host": src, "io_running": "Yes", "sql_running": "Yes"}}
 
 
+class _StubAgent:
+    def __init__(self, n):
+        self.n = n
+
+    def status(self):
+        return {"gtid_executed": G}
+
+
 def test_healthy_requires_every_original_node(monkeypatch):
+    from dbguard.harness import chaos as c
+    monkeypatch.setattr(c, "agent", _StubAgent)
     roles = {"mysql-a1": "primary", "mysql-a2": "replica", "mysql-a3": "down", "mysql-a4": "replica"}
     st = {"mysql-a1": {"gtid_executed": G}, "mysql-a2": _rep("mysql-a1"), "mysql-a4": _rep("mysql-a1")}
     ok, why = _fleet_with(monkeypatch, roles, st).healthy_now()
@@ -362,3 +372,12 @@ def test_reconnect_gap_per_client():
     st = analyze_acks(oks, errs, inject_ts=105.0)
     assert st.reconnect_gaps == 2
     assert st.reconnect_gap_p50_s == pytest.approx(108.0 - 104.9)
+
+
+def test_caught_up_between_two_primary_reads():
+    from dbguard.harness.chaos import caught_up, gtid_subset
+    assert gtid_subset(f"{U1}:1-5", f"{U1}:1-9") and not gtid_subset(f"{U1}:1-9", f"{U1}:1-5")
+    assert gtid_subset("", f"{U1}:1-5") and not gtid_subset(f"{U2}:1", f"{U1}:1-5")
+    assert caught_up(f"{U1}:1-100", f"{U1}:1-101", f"{U1}:1-102")
+    assert not caught_up(f"{U1}:1-100", f"{U1}:1-99", f"{U1}:1-102")          # behind
+    assert not caught_up(f"{U1}:1-100", f"{U1}:1-101,{U2}:1", f"{U1}:1-102")  # errant
