@@ -152,3 +152,11 @@ def test_disk_full_is_explicitly_blocked(tmp_path):
                     run_id="r", dir=tmp_path)
     with pytest.raises(NotImplementedError):
         chaos.sc_disk_full(run)
+
+
+def test_rejoin_matches():
+    from dbguard.harness.chaos import rejoin_matches
+    e = {"type": "rejoin", "old_primary": "mysql-a1", "rejoin": {"branch": "repoint", "node": "mysql-a1"}}
+    assert rejoin_matches(e, "mysql-a1")
+    assert not rejoin_matches(e, "mysql-a2")
+    assert not rejoin_matches({"type": "rejoin", "rejoin": {"branch": "none", "node": "mysql-a1"}}, "mysql-a1")

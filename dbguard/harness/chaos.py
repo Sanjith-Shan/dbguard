@@ -878,7 +878,11 @@ def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 
             note(run, "orchestrator does not rejoin a dead primary, the harness did it through the agents")
         return
     ev = f.wait_event(t_restart - 1, {"rejoin", "rebuild"}, timeout,
-                      lambda e: e.get("old_primary") in (old, None) or old in json.dumps(e))
+                      lambda e: rejoin_matches(e, old))
+    others = [e for e in f.events(t_restart - 1) if e.get("type") == "rejoin"
+              and (e.get("rejoin") or {}).get("branch") == "none"]
+    if others:
+        run.row["second_writer_events"] = others
     if ev is None:
         note(run, f"no rejoin event for {old} within {timeout:.0f}s")
         return
@@ -890,6 +894,14 @@ def rejoin_after_restart(run: Run, old: str, t_restart: float, timeout: float = 
     rj["since_restart_s"] = float(ev["ts"]) - t_restart
     run.row["rejoin"] = rj
     run.row["rejoin_event"] = ev
+
+
+def rejoin_matches(e: dict, node: str) -> bool:
+    """A finished rejoin of `node`: branch repoint, rebuild or manual (branch none is the
+    manager fencing a second writer, not a rejoin)."""
+    rj = e.get("rejoin") or {}
+    who = rj.get("node") or e.get("old_primary")
+    return who == node and rj.get("branch") in ("repoint", "rebuild", "manual")
 
 
 def woken_writes(run: Run, woken: str, new_primary: str, t_wake: float, watch_s: float = 15.0) -> None:
@@ -1261,13 +1273,15 @@ def sc_replica_loss(run: Run) -> None:
     check(run, wl, [n for n in [p, r1] if agent(n).status()])
     # phase 4: stay DEGRADED past rebuild_after_s, the manager provisions and clones the spare
     rebuild_after = float(f.mc and (load_knobs().get("rebuild_after_s") or 60))
-    ev = f.wait_event(t_restore - 1, {"replace"}, rebuild_after + 300)
+    ev = f.wait_event(t_restore - 1, {"replace"}, rebuild_after + 300,
+                      lambda e: bool(e.get("clone")) or "failed" in (e.get("note") or ""))
     run.row["event"] = ev
     if ev:
-        b = _find_bytes(ev)
-        dur = ((ev.get("rejoin") or {}).get("duration_s") or ev.get("total_s"))
-        run.row["clone"] = {"bytes": b, "duration_s": dur,
-                            "mb_per_s": (b / 1e6 / dur) if (b and dur) else None}
+        c = ev.get("clone") or {}
+        b = c.get("bytes") or _find_bytes(ev)
+        dur = c.get("duration_s") or (ev.get("rejoin") or {}).get("duration_s") or ev.get("total_s")
+        run.row["clone"] = {"bytes": b, "duration_s": dur, "donor": c.get("donor"),
+                            "mb_per_s": c.get("mb_per_s") or ((b / 1e6 / dur) if (b and dur) else None)}
     else:
         note(run, "no replace event")
     # restore: bring the original replica back, then drop the spare
