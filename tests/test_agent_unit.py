@@ -387,9 +387,13 @@ async def test_rebuild_counts_phantoms_before_clone(settings):
     agent = Agent(settings, db, FakeSupervisor(), manager_get=FakeManager("mysql-a2"),
                   donor_db=lambda host: donor)
 
+    during: list = []
+
     def after_clone(sql, args):
         if sql.startswith("CLONE INSTANCE"):
+            during.append((agent.rebuilding, db.sro))
             db.gtid = donor.gtid
+            db.sro = 1  # the restarted mysqld boots read-only
             raise DbError("Lost connection", code=2013)
     db.hooks.append(after_clone)
     body = await agent.rebuild("mysql-a2")
@@ -398,6 +402,9 @@ async def test_rebuild_counts_phantoms_before_clone(settings):
     assert ex.index("SET GLOBAL clone_valid_donor_list=%s") < \
         next(i for i, s in enumerate(ex) if s.startswith("CLONE INSTANCE"))
     assert ex[-3:] == ["STOP REPLICA", "RESET REPLICA ALL", "SET GLOBAL super_read_only=1"]
+    # CLONE needs a writable recipient, and /primary must stay 503 meanwhile.
+    assert during == [(True, 0)]
+    assert not agent.rebuilding
 
 
 def test_subtract_count():
@@ -630,3 +637,12 @@ async def test_self_fence_ignores_replicas(settings):
     db.sro = 1
     assert await agent.self_fence_tick() == "not_primary"
     assert not agent.fenced
+
+
+async def test_primary_is_503_while_rebuilding(settings):
+    db = FakeDB()
+    db.sro = 0
+    agent = make_agent(settings, db)
+    agent.startup_done.set()
+    agent.rebuilding = True
+    assert await agent.primary_check() == (503, {"role": "unknown"})

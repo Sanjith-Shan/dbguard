@@ -135,6 +135,7 @@ class Agent:
         self._hb_inflight_since: float | None = None
         self._hb_session: Session | None = None
         self._role = "unknown"
+        self.rebuilding = False
         self._mgr_unreachable_since: float | None = None
         self._sf_clients: int | None = None
         self.m.fenced.set(1 if self.fenced else 0)
@@ -215,7 +216,7 @@ class Agent:
         await self.ensure_awake()
         if self.fenced:
             return 503, {"role": "fenced"}
-        if not self.startup_done.is_set():
+        if not self.startup_done.is_set() or self.rebuilding:
             return 503, {"role": "unknown"}
         try:
             rows = await self._sql(lambda s: s.query(
@@ -538,10 +539,16 @@ class Agent:
             gen = self.sup.generation
             s = await self.db.connect(self.s.sql_timeout_s)
             restarting = False
+            # CLONE refuses to run on a super_read_only recipient (ER 1290 on 8.4), so the
+            # node is briefly writable. While `rebuilding` is set /primary answers 503, and
+            # neither the heartbeat nor the guards treat the node as a primary. Anything
+            # written in that window is wiped by the clone itself.
+            self.rebuilding = True
             try:
                 await self._role_sql(s, "STOP REPLICA")
                 await self._role_sql(s, "SET GLOBAL clone_valid_donor_list=%s",
                                      (f"{donor}:{self.s.source_port}",))
+                await self._role_sql(s, "SET GLOBAL super_read_only=0")
                 try:
                     await self._role_sql(
                         s, "CLONE INSTANCE FROM %s@%s:%s IDENTIFIED BY %s REQUIRE SSL",
@@ -554,44 +561,57 @@ class Agent:
                         log.info("rebuild_clone_done_restart_pending", code=e.code, error=str(e))
                     else:
                         self.m.rebuilds.labels(outcome="clone_failed").inc()
+                        with contextlib.suppress(DbError):
+                            await self._role_sql(s, "SET GLOBAL super_read_only=1")
+                        self.rebuilding = False
                         raise AgentError(f"clone failed: {e}", status=500) from e
+            except BaseException:
+                self.rebuilding = False
+                raise
             finally:
                 s.close()
             self.db_drop_idle()
-            if self.sup.supervised:
-                if not await self.sup.wait_exit(60.0):
-                    # mysqld did not stop on its own after the clone. Make it.
-                    self.sup.kill(signal.SIGTERM)
-                    await self.sup.wait_exit(120.0)
-                if not await self.sup.wait_generation(gen, self.s.restart_wait_s):
-                    self.m.rebuilds.labels(outcome="restart_timeout").inc()
-                    raise AgentError("mysqld did not come back after clone", status=500)
-            if not await self.wait_responsive(self.s.restart_wait_s):
+            try:
+                return await self._rebuild_finish(donor, gen, t0, phantom, restarting)
+            finally:
+                self.rebuilding = False
+
+    async def _rebuild_finish(self, donor: str, gen: int, t0: float, phantom: int,
+                              restarting: bool) -> dict[str, Any]:
+        if self.sup.supervised:
+            if not await self.sup.wait_exit(60.0):
+                # mysqld did not stop on its own after the clone. Make it.
+                self.sup.kill(signal.SIGTERM)
+                await self.sup.wait_exit(120.0)
+            if not await self.sup.wait_generation(gen, self.s.restart_wait_s):
                 self.m.rebuilds.labels(outcome="restart_timeout").inc()
-                raise AgentError("mysqld not responsive after clone", status=500)
+                raise AgentError("mysqld did not come back after clone", status=500)
+        if not await self.wait_responsive(self.s.restart_wait_s):
+            self.m.rebuilds.labels(outcome="restart_timeout").inc()
+            raise AgentError("mysqld not responsive after clone", status=500)
 
-            async def post(sess: Session) -> dict[str, Any]:
-                await self._role_sql(sess, "STOP REPLICA")
-                await self._role_sql(sess, "RESET REPLICA ALL")
-                await self._role_sql(sess, "SET GLOBAL super_read_only=1")
-                g = (await sess.query("SELECT @@GLOBAL.gtid_executed AS g"))[0]["g"]
-                b = None
-                try:
-                    rows = await sess.query(
-                        "SELECT SUM(DATA) AS b FROM performance_schema.clone_progress")
-                    b = _i(rows[0]["b"]) if rows else None
-                except DbError:
-                    pass
-                return {"g": _gtid(g), "b": b}
+        async def post(sess: Session) -> dict[str, Any]:
+            await self._role_sql(sess, "STOP REPLICA")
+            await self._role_sql(sess, "RESET REPLICA ALL")
+            await self._role_sql(sess, "SET GLOBAL super_read_only=1")
+            g = (await sess.query("SELECT @@GLOBAL.gtid_executed AS g"))[0]["g"]
+            b = None
+            try:
+                rows = await sess.query(
+                    "SELECT SUM(DATA) AS b FROM performance_schema.clone_progress")
+                b = _i(rows[0]["b"]) if rows else None
+            except DbError:
+                pass
+            return {"g": _gtid(g), "b": b}
 
-            res = await self._sql(post, timeout=5.0)
-            dur = round((time.monotonic() - t0) * 1000, 2)
-            self.m.rebuilds.labels(outcome="ok").inc()
-            self.m.phantom_gtids.inc(phantom)
-            log.info("rebuild", donor=donor, phantom_gtids=phantom, duration_ms=dur,
-                     bytes=res["b"], gtid_executed=res["g"], restarted=restarting)
-            return {"ok": True, "phantom_gtids": phantom, "duration_ms": dur,
-                    "bytes": res["b"] or 0, "gtid_executed": res["g"]}
+        res = await self._sql(post, timeout=5.0)
+        dur = round((time.monotonic() - t0) * 1000, 2)
+        self.m.rebuilds.labels(outcome="ok").inc()
+        self.m.phantom_gtids.inc(phantom)
+        log.info("rebuild", donor=donor, phantom_gtids=phantom, duration_ms=dur,
+                 bytes=res["b"], gtid_executed=res["g"], restarted=restarting)
+        return {"ok": True, "phantom_gtids": phantom, "duration_ms": dur,
+                "bytes": res["b"] or 0, "gtid_executed": res["g"]}
 
     # ------------------------------------------------------------------ test hooks
 
@@ -650,7 +670,7 @@ class Agent:
         writable: bool | None = None
         try:
             rows = await self._sql(lambda s: s.query("SELECT @@GLOBAL.super_read_only AS sro"))
-            writable = _b(rows[0]["sro"]) is False
+            writable = _b(rows[0]["sro"]) is False and not self.rebuilding
         except DbError as e:
             err = (err + "; " if err else "") + f"mysqld: {e}"
         fence_file = os.path.exists(self.s.fence_file)
@@ -712,7 +732,7 @@ class Agent:
         while not self._stopping:
             await asyncio.sleep(self.s.heartbeat_interval_s)
             self.m.heartbeat_stalled.set(0)
-            if self.fenced:
+            if self.fenced or self.rebuilding:
                 continue
             try:
                 if self._hb_session is None or self._hb_session.closed:
@@ -720,7 +740,7 @@ class Agent:
                 sess = self._hb_session
                 rows = await sess.query("SELECT @@GLOBAL.super_read_only AS sro",
                                         timeout=self.s.sql_timeout_s)
-                if _b(rows[0]["sro"]) is not False or self.fenced:
+                if _b(rows[0]["sro"]) is not False or self.fenced or self.rebuilding:
                     continue
                 self._hb_inflight_since = time.monotonic()
                 # A semi-sync stall blocks this for as long as the source timeout. That
@@ -762,7 +782,7 @@ class Agent:
         if not self.self_fence_enabled():
             self._sf_reset()
             return "disabled"
-        if self.fenced:
+        if self.fenced or self.rebuilding:
             self._sf_reset()
             return "not_primary"
         try:
