@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Three-minute narrated DBGuard demo for a screen share.
+
+Acts
+  1. The fleet: dbgctl status
+  2. Load: 8 clients writing through HAProxy, every acknowledged write logged
+  3. Crash: SIGKILL the primary's container, watch the manager's events live
+  4. Diagnose: dbgctl doctor on the set while it runs on two nodes
+  5. Heal: restart the old primary, watch it rejoin (repoint or clone rebuild)
+  6. Verdict: the checker compares every acknowledged write with the database
+
+Pauses for Enter between acts unless --no-pause.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from dbguard.harness import chaos, docker  # noqa: E402
+
+BOLD, DIM, GREEN, RED, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[0m"
+if not sys.stdout.isatty():
+    BOLD = DIM = GREEN = RED = RESET = ""
+
+
+def say(text: str) -> None:
+    print(f"\n{BOLD}>> {text}{RESET}", flush=True)
+
+
+def act(n: int, title: str, pause: bool) -> None:
+    print(f"\n{BOLD}{'=' * 70}\n  Act {n}. {title}\n{'=' * 70}{RESET}", flush=True)
+    if pause:
+        input(f"{DIM}(press Enter){RESET}")
+
+
+def dbgctl(*args: str) -> None:
+    print(f"{DIM}$ dbgctl {' '.join(args)}{RESET}", flush=True)
+    subprocess.run([sys.executable, "-m", "dbguard.cli.dbgctl", *args], cwd=REPO)
+
+
+class EventStream:
+    """`dbgctl events --follow` in the background, printed as it arrives."""
+
+    def __init__(self, rs: str):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "dbguard.cli.dbgctl", "events", "--rs", rs, "--since", "1s",
+             "--follow", "--interval", "0.5"], cwd=REPO, stdout=subprocess.PIPE, text=True)
+        self.t = threading.Thread(target=self._pump, daemon=True)
+        self.t.start()
+
+    def _pump(self) -> None:
+        for line in self.proc.stdout:
+            print(f"   {GREEN}event{RESET} {line.rstrip()}", flush=True)
+
+    def stop(self) -> None:
+        self.proc.terminate()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rs", default="rs1")
+    ap.add_argument("--no-pause", action="store_true")
+    ap.add_argument("--clients", type=int, default=8)
+    a = ap.parse_args()
+    pause = not a.no_pause
+    rs = a.rs
+    fleet = chaos.Fleet(rs, "dbguard")
+    run_id = f"demo-{int(time.time())}"
+    run_dir = chaos.TMP / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    act(1, "The fleet", pause)
+    say("Two replica sets, one primary and two semi-sync replicas each. The manager polls "
+        "every mysqld and every agent. HAProxy sends writes to whichever agent says 'primary'.")
+    dbgctl("status")
+    primary = fleet.primary()
+    if not primary:
+        print(f"{RED}no primary for {rs}, is the fleet up?{RESET}")
+        return 1
+
+    act(2, "Load", pause)
+    say(f"{a.clients} clients insert rows through HAProxy (127.0.0.1:{chaos.haproxy_port(rs)}). "
+        "A write is logged as acknowledged only when MySQL returned OK.")
+    wl = chaos.Workload(run_dir, run_id, chaos.haproxy_port(rs), a.clients, 60)
+    wl.start()
+    time.sleep(6)
+    print(f"   acknowledged so far: {wl.acks_so_far()}")
+
+    act(3, "Crash", pause)
+    say(f"SIGKILL the primary {primary}'s container. No clean shutdown, no goodbye. "
+        "Watch the manager: detect (its own probe AND the replicas' view), fence, choose by "
+        "GTID, catch up, promote, repoint.")
+    events = EventStream(rs)
+    t_kill = time.time()
+    docker.kill(primary, "KILL")
+    new, t_new = fleet.wait_new_primary(primary, 90)
+    if new:
+        print(f"   {GREEN}new primary {new} after {t_new - t_kill:.1f}s{RESET}")
+    else:
+        print(f"   {RED}no new primary after 90 s{RESET}")
+
+    act(4, "Diagnose", pause)
+    say("dbgctl doctor explains the set in sentences, with the GTID gap of every node.")
+    dbgctl("doctor", rs)
+
+    act(5, "Heal", pause)
+    say(f"Bring {primary} back. Its gtid_executed is compared with the new primary's. If it is a "
+        "subset it is repointed. If it holds transactions nobody acknowledged, it is rebuilt "
+        "with CLONE from the new primary and those phantom transactions are discarded.")
+    t_up = time.time()
+    docker.up(primary)
+    ev = fleet.wait_event(t_up - 1, {"rejoin", "rebuild"}, 180)
+    time.sleep(1)
+    if ev is None:
+        print(f"   {RED}no rejoin event within 180 s{RESET}")
+    wl.stop()
+    events.stop()
+    dbgctl("status")
+
+    act(6, "Verdict", pause)
+    say("The checker reads every node directly and compares against the ack log: lost "
+        "acknowledged writes, phantom writes, single writer, convergence.")
+    oks, errs = chaos.read_ack_log(wl.ack_log)
+    st = chaos.analyze_acks(oks, errs, t_kill)
+    print(f"   acknowledged {st.acked}, client errors {st.errors}, "
+          f"write outage {st.failover_s or 0:.1f}s as the clients saw it")
+    try:
+        v = chaos.run_checker(run_id, wl.ack_log, [n for n in chaos.set_nodes(rs)], run_dir)
+        f = chaos.checker_fields(v)
+        color = GREEN if f["lost_acked_writes"] == 0 and f["phantom_writes"] == 0 else RED
+        print(f"   {color}lost acknowledged writes {f['lost_acked_writes']}, phantom writes "
+              f"{f['phantom_writes']}, single-writer violations {f['single_writer_violations']}, "
+              f"converged {f['converged']}{RESET}")
+    except Exception as e:  # noqa: BLE001
+        print(f"   {RED}checker failed: {e}{RESET}")
+    if os.environ.get("DBGUARD_KEEP_ACKS") != "1":
+        wl.ack_log.unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
