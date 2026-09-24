@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbguard"
+version = "0.1.0"
+description = "MySQL replica-set fleet manager with lossless failover"
+requires-python = ">=3.12"
+dependencies = [
+  "aiomysql>=0.2.0",
+  "aiohttp>=3.9",
+  "pydantic>=2.5",
+  "PyYAML>=6.0",
+  "structlog>=24.1",
+  "prometheus-client>=0.19",
+  "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "hypothesis>=6.98", "ruff>=0.4", "PyMySQL>=1.1"]
+
+[project.scripts]
+dbguard = "dbguard.manager.main:main"
+dbguard-agent = "dbguard.agent.main:main"
+dbgctl = "dbguard.cli.dbgctl:main"
+
+[tool.setuptools.packages.find]
+include = ["dbguard*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
