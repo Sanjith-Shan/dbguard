@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""bin/bootstrap, see dbguard/harness/bootstrap.py."""
+"""bin/bootstrap, see dbguard/harness/bootstrap.py.
+
+Orchestrator profile only: never run it while the dbguard manager container is up.
+"""
 import os
 import sys
 

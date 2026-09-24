@@ -5,8 +5,12 @@ replicates from it with the INTERFACES.md options (semi-sync replica on). Idempo
 replica already replicating from the right source with both threads running is left alone,
 and a primary that is already writable is only re-asserted.
 
-Until the manager exists this is how the fleet is formed. It talks to the published host
-ports (1331X/1332X) as root, and tells the replicas to use the compose service names.
+Use it ONLY when the dbguard manager is not running, which in practice means the
+Orchestrator profile: the chaos harness calls it explicitly after stopping the manager.
+With the manager up, the manager bootstraps the sets itself and `make up` just waits for
+HEALTHY. Running both at once races on the same nodes (it killed mysql-a1's agent and
+triggered a failover). It talks to the published host ports (1331X/1332X) as root, and
+tells the replicas to use the compose service names.
 """
 
 from __future__ import annotations

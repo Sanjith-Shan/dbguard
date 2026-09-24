@@ -6,7 +6,8 @@ RS1      := mysql-a1:13311,mysql-a2:13312,mysql-a3:13313
 RUN_ID   ?= smoke-$(shell date +%s)
 DURATION ?= 60
 
-.PHONY: build build-node build-manager up up-naive down ps bootstrap test test-integration \
+.PHONY: build build-node build-manager up up-naive wait-healthy down ps bootstrap test \
+        test-integration \
         lint workload check
 
 build: build-node build-manager
@@ -17,13 +18,24 @@ build-node:
 build-manager:
 	docker build -f deploy/Dockerfile.manager -t dbguard-manager .
 
+# The manager bootstraps the sets itself. Do NOT also run bin/bootstrap here: the two raced
+# on the same nodes, killed mysql-a1's agent and triggered a failover. bin/bootstrap is for
+# the Orchestrator profile only (the harness calls it explicitly with the manager stopped).
 up:
 	DBGUARD_SEMISYNC=1 DBGUARD_MODE=dbguard $(COMPOSE) up -d
-	DBGUARD_SEMISYNC=1 $(PY) bin/bootstrap
+	$(MAKE) --no-print-directory wait-healthy
 
 up-naive:
 	DBGUARD_SEMISYNC=0 DBGUARD_MODE=naive $(COMPOSE) up -d
-	DBGUARD_SEMISYNC=0 $(PY) bin/bootstrap --naive
+	$(MAKE) --no-print-directory wait-healthy
+
+# Poll the manager until every set is HEALTHY (timeout 180 s), then print dbgctl status.
+wait-healthy:
+	@$(PY) -c 'import json, sys, time, urllib.request; \
+	deadline = time.time() + 180; last = None; \
+	exec("while time.time() < deadline:\n try:\n  last = json.load(urllib.request.urlopen(\"http://127.0.0.1:19090/v1/status\", timeout=2))\n  st = {k: v[\"state\"] for k, v in last[\"sets\"].items()}\n  print(st, flush=True)\n  if st and all(x == \"HEALTHY\" for x in st.values()): sys.exit(0)\n except OSError as e:\n  print(\"manager not ready:\", e, flush=True)\n time.sleep(2)"); \
+	sys.exit("sets not HEALTHY after 180 s: %s" % (last,))'
+	$(PY) -m dbguard.cli.dbgctl status
 
 down:
 	$(COMPOSE) --profile spare --profile orchestrator down -v --remove-orphans
@@ -31,6 +43,7 @@ down:
 ps:
 	$(COMPOSE) ps
 
+# Orchestrator profile only, with the dbguard manager stopped (see bin/bootstrap).
 bootstrap:
 	$(PY) bin/bootstrap
 
