@@ -159,6 +159,8 @@ can start them from inside its container. HAProxy lists the spares too, resolved
  "source_reachable":bool|null,       (TCP connect to source_host:3306 within 500 ms)
  "heartbeat":{"ts":<unix float>|null,"age_s":float|null,"writer":str|null},
  "self_fence":{"enabled":bool,"manager_unreachable_s":float,"semisync_clients":int|null},
+ "wake_guard":{"enabled":bool},
+ "mysqld_restart_hold_s":float,      (seconds left on a kill-fence restart hold, 0.0 if none)
  "agent_uptime_s":float,"agent_version":str}
 ```
 
@@ -170,6 +172,9 @@ by my.cnf). The flag is cleared only by `/promote` or `/unfence`.
 
 Agent additions to the shapes above. Extra keys only, nothing removed.
 
+- `/status` answers within one 2 s deadline for the whole handler. The source TCP probe runs
+  beside the SQL, and any field not collected by then is null (with `error` naming the
+  deadline). Callers should allow at least 2.5 s.
 - `/status` also carries `"role":"primary"|"replica"|"fenced"|"unknown"`,
   `semisync.wait_sessions` (Rpl_semi_sync_source_wait_sessions), `semisync.mode` (the agent's
   semi-sync setting, changed by `/configure`), `heartbeat.stalled_s` (how long the in-flight
@@ -183,11 +188,23 @@ Agent additions to the shapes above. Extra keys only, nothing removed.
   `SET GLOBAL read_only=0`, then the fence flag is cleared.
 - `/fence` answers 500 with `"method":"failed"` when the SET missed its deadline and the agent
   has no mysqld pid to kill (only possible with `--no-supervise`). The flag is still set.
-- `/configure` answers `{"ok":true,"semisync":bool,"role":str,"source_enabled":bool,
-  "replica_enabled":bool}`. It never switches the source side off while
+- `/configure` takes any of `{"semisync":bool,"self_fence":bool,"wake_guard":bool}` and
+  answers `{"ok":true,"semisync":bool,"role":str,"source_enabled":bool,"replica_enabled":bool,
+  "self_fence":bool,"wake_guard":bool}`. `self_fence` and `wake_guard` are runtime toggles for
+  the self-fence lease and the startup and wake guard, reflected in `/status` as
+  `self_fence.enabled` and `wake_guard.enabled`. They live in agent memory, so an agent
+  restart returns them to the env defaults (`DBGUARD_WAKE_GUARD`, default 1, and
+  `DBGUARD_SELF_FENCE_AFTER_S`, 0 disables). A body with only toggles runs no SQL and answers
+  without `role`, `source_enabled` and `replica_enabled`. The orchestrator baseline turns both
+  off this way. It never switches the source side off while
   `Rpl_semi_sync_source_wait_sessions > 0`, because that would release waiting sessions and
   acknowledge writes no replica has. The agent also runs it after startup and after every
   mysqld restart.
+- Restart hold. When `/fence` takes the kill path the agent does not restart mysqld for
+  `DBGUARD_RESTART_HOLD_S` seconds (default 20). A restarted old primary would serve its
+  unacked binlog tail to replicas that still point at it. `/promote`, `/repoint` and
+  `/rebuild` end the hold at once, wait for mysqld to answer, then run their SQL. `/kill-mysqld`
+  (the crash test hook) never holds.
 - `/rebuild` also returns `gtid_executed` after the clone. `/kill-mysqld` and `/hang-mysqld`
   answer `{"ok":true,"pid":n}` (plus `seconds`) and 409 without a supervised mysqld.
 - `/primary` answers 503 `unknown` until the startup guard has run, and a request that
@@ -219,8 +236,10 @@ Startup and wake guard (woken-primary window): on agent start, and whenever the 
 monotonic loop observes a gap > 3 s (the container was frozen), the agent asks the manager
 `GET /v1/sets/<rs>/primary`. If the answer is not this node and this node has
 `super_read_only=0`, it fences itself before doing anything else. If the manager is
-unreachable, it fences if the fence file exists, else leaves state alone and logs. Env
-`DBGUARD_MANAGER_URL=http://dbguard:9090`.
+unreachable, it fences if the fence file exists, else leaves state alone and logs. If the
+manager answers 503, or `"primary":"unknown"`, it is still discovering, so the agent leaves
+state alone and logs, whatever the fence file says. The heartbeat writer does not write after
+a gap until the guard has run. Env `DBGUARD_MANAGER_URL=http://dbguard:9090`.
 
 Env for the agent container: `DBGUARD_NODE`, `DBGUARD_RS`, `DBGUARD_SERVER_ID`,
 `DBGUARD_SEMISYNC`, `DBGUARD_MANAGER_URL`, `MYSQL_ROOT_PASSWORD`.
