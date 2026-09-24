@@ -118,6 +118,7 @@ class EventLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists():
                 self._load_tail()
+                self._terminate_torn_line()
 
     def _load_tail(self) -> None:
         assert self.path
@@ -130,6 +131,18 @@ class EventLog:
                     self._ring.append(Event.model_validate_json(line))
                 except Exception:  # noqa: BLE001 - a torn last line must not stop startup
                     continue
+
+    def _terminate_torn_line(self) -> None:
+        """A crash mid-write leaves a line without its newline. Close it so the next
+        event starts on its own line instead of being glued to the torn one."""
+        assert self.path
+        with self.path.open("rb+") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                return
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
 
     def subscribe(self, fn) -> None:
         self._listeners.append(fn)

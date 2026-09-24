@@ -47,3 +47,5 @@ def test_event_log_roundtrip_and_query(tmp_path):
     assert [e.type for e in again.query(rs="rs1")] == ["suspect", "rejoin"]
     assert [e.ts for e in again.query(since=1.5)] == [2.0, 3.0]
     assert again.last("rs1").rejoin.phantom_gtids == 4
+    again.append(Event(rs="rs1", type="healthy", ts=4.0))
+    assert [e.ts for e in EventLog(tmp_path / "events.jsonl").query()] == [1.0, 2.0, 3.0, 4.0]
