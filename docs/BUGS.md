@@ -549,3 +549,18 @@ heredocs and cache mounts already).
   /unstick; restore a replica or fence the primary by hand") and records the per-attempt
   counts. The simulation checks the order, the repeats, a retry that clears, and the HALT.
   Whether this lets a real clone finish awaits a real kill-two run.
+
+### The replica delay was applied in the direction replication does not use
+
+- Symptom. The naive (async) baseline lost 0 acknowledged writes in 30 kills, and still 0 in
+  10 more with a 2 ms netem delay on the replicas, though the spec requires it to lose writes.
+- How found. Working out where the delay acts. `tc netem` on a container's `eth0` root
+  shapes that container's egress. On the replicas that is the semi-sync acks and the IO
+  thread's requests, while the binlog stream the primary pushes arrived undelayed, so an
+  async replica never lagged behind a commit.
+- Fix. Kill runs with `--replica-netem-ms` put a prio qdisc on the primary with a netem band
+  and u32 filters for the replica IPs, which delays only the primary-to-replica stream (clients
+  and the manager are not delayed). Rows record `netem_direction`. The wrong-direction rows are
+  kept in results/old-config/netem-replica-egress/. The cost table's netem cells were measured
+  with the old direction, which is still the semi-sync ack path, so the semi-sync-on cells are
+  valid and the async netem cells carry no replication delay.
