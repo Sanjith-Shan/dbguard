@@ -133,9 +133,9 @@ candidate applies everything, then it is promoted.
 
 | mode | runs | stall p50 s | stall p99 s | client errors | runs with errors | lost acked writes |
 |---|---|---|---|---|---|---|
-| dbguard | `[[N: switchover run count, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p99, results/switchover_dbguard.jsonl]]` | `[[N: switchover client errors, results/switchover_dbguard.jsonl]]` | `[[N: switchover runs with errors, results/switchover_dbguard.jsonl]]` | `[[N: switchover lost acked writes, results/switchover_dbguard.jsonl]]` |
+| dbguard | 10 | 1.44 | 6.03 | 80 | 10 | 0 |
 
-Measured under the final configuration (a 10-run rerun). An earlier 30-run table under the
+Measured under the final configuration (a 10-run rerun). No acknowledged write was lost and no run left errant GTIDs. Every run saw one HAProxy cut, 8 client errors, one per client. The stall is bimodal. Six runs stalled 0.53 to 1.65 s and four stalled 5.2 to 6.0 s, while the manager's own switchover took 0.39 to 1.94 s in every run, so the slow mode happens on the client side after the manager has finished. The likely cause, not yet verified, is that the cut clients reconnect through HAProxy before it has marked the new primary UP and each burns the lab client's 2 s handshake timeout. An earlier 30-run table under the
 `agent-live-primary-check` configuration lost no acknowledged write, but its stall grew from
 0.6 s in the first runs to 24 s as the host ran into swap (p50 2.06 s, p99 24.02 s), which
 is why the health check was changed and the table rerun. Those rows are archived in

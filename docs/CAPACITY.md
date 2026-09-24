@@ -76,7 +76,7 @@ The measured distribution follows.
 | primary killed | 8.83 s | 9.75 s | 30 |
 | primary frozen | not yet measured | | |
 | primary partitioned from replicas | 11.58 s | 14.23 s | 30 |
-| planned switchover (client stall) | `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` | `[[N: switchover stall p99, results/switchover_dbguard.jsonl]]` | `[[N: switchover run count, results/switchover_dbguard.jsonl]]` |
+| planned switchover (client stall) | 1.44 s | 6.03 s | 10 |
 | naive, primary killed | `[[N: kill failover p50 naive, results/kill_naive.jsonl]]` | `[[N: kill failover p99 naive, results/kill_naive.jsonl]]` | `[[N: kill run count naive, results/kill_naive.jsonl]]` |
 | Orchestrator, primary killed | not yet measured | | |
 

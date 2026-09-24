@@ -239,7 +239,7 @@ Every agent answering 503 means no node believes it is the unfenced writable pri
 2. `dbgctl doctor rs1`. Every gap should be small or empty.
 3. `dbgctl failover rs1 --to mysql-a2` (or without `--to` to let the manager choose). The manager quiesces the old primary with the same fence, repoints the other nodes to the candidate while it is still read-only, waits for it to apply everything, checks against the final `gtid_executed` the fence returned that the candidate holds nothing extra, and promotes it. Repointing first means the new primary has an acking replica the moment it becomes writable. Before that reorder a switchover stalled clients for 3.8 s, after it 0.89 s (`docs/BUGS.md`).
 4. `dbgctl status` shows the new primary and `HEALTHY`. The event row has the stall duration.
-5. Clients see one short stall, `[[N: switchover stall p50, results/switchover_dbguard.jsonl]]` median, and a single retry covers it.
+5. Clients see one short stall, 1.44 s median and 6.03 s p99 in the lab, and a single retry covers it. The lab stall was bimodal (about 1 s or about 5.5 s) with the manager's own work under 2 s every time, see the switchover table in the README.
 
 **Abort.** If step 3 fails before promotion, the manager promotes the old primary back itself and answers 409 with the reason and the state. Check `dbgctl status` shows the old primary writable and `HEALTHY`. If it does not (the abort itself failed and the set `HALTED`), call `/promote` on the old primary's agent, which clears its fence flag and `super_read_only`, then `dbgctl resume rs1`.
 
