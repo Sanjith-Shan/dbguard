@@ -1,10 +1,10 @@
-"""mysqld process supervision.
+"""mysqld process supervision, what makes the agent able to fence a node it cannot query.
 
-The agent is the container's main process (under tini) and runs mysqld as its child.
-`docker-entrypoint.sh mysqld` execs (through gosu) into mysqld, so the child pid is the
-mysqld pid once the entrypoint is done. The child gets MYSQLD_PARENT_PID set to the
-agent's pid, which is how mysqld recognises a monitoring process: RESTART and the
-post-CLONE restart then exit with code 16 instead of failing with ER 3707.
+The agent runs mysqld as its child, so it always knows the pid to SIGKILL, and it decides when
+mysqld comes back. After a kill fence ``hold`` keeps it down so the old primary cannot serve its
+unacked binlog tail, until the manager decides the node's role. The child gets
+``MYSQLD_PARENT_PID`` set to the agent's pid, which is how mysqld recognises a monitoring
+process. RESTART and the post-CLONE restart then exit with code 16 instead of ER 3707.
 """
 
 from __future__ import annotations
@@ -32,34 +32,44 @@ class NullSupervisor:
 
     @property
     def alive(self) -> bool | None:
+        """Unknown, the process is not ours."""
         return None
 
     async def start(self) -> None:
+        """Nothing to start."""
         return None
 
     def kill(self, sig: int = signal.SIGKILL) -> int | None:
+        """Nothing to signal."""
         return None
 
     async def wait_exit(self, timeout: float) -> bool:
+        """Never observed."""
         return False
 
     async def wait_generation(self, gen: int, timeout: float) -> bool:
+        """Never observed."""
         return False
 
     def hold(self, seconds: float) -> None:
+        """Nothing to hold."""
         return None
 
     def release_hold(self) -> bool:
+        """Nothing held."""
         return False
 
     held = False
     hold_remaining_s = 0.0
 
     async def stop(self, timeout: float = 120.0) -> None:
+        """Nothing to stop."""
         return None
 
 
 class MysqldSupervisor:
+    """Runs mysqld as a child, restarting it with backoff unless held or stopping."""
+
     supervised = True
 
     def __init__(self, cmd: list[str], *, min_backoff: float = 0.5, max_backoff: float = 5.0,
@@ -80,21 +90,26 @@ class MysqldSupervisor:
 
     @property
     def pid(self) -> int | None:
+        """The running mysqld's pid, None when it is not running."""
         return self.proc.pid if self.proc and self.proc.returncode is None else None
 
     @property
     def alive(self) -> bool:
+        """True while the child runs."""
         return self.proc is not None and self.proc.returncode is None
 
     async def start(self) -> None:
+        """Start the spawn-and-restart loop."""
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="mysqld-supervisor")
 
     async def _notify(self) -> None:
+        """Wake everyone waiting on a start or exit."""
         async with self._changed:
             self._changed.notify_all()
 
     async def _run(self) -> None:
+        """Spawn mysqld and restart it when it exits, honouring holds and backoff."""
         backoff = self.min_backoff
         env = dict(os.environ)
         env["MYSQLD_PARENT_PID"] = str(os.getpid())
@@ -150,6 +165,7 @@ class MysqldSupervisor:
             log.warning("mysqld_restart_hold", seconds=seconds)
 
     def release_hold(self) -> bool:
+        """End a hold early. False when none is set."""
         if self._hold_until is None:
             return False
         self._hold_release.set()
@@ -157,15 +173,18 @@ class MysqldSupervisor:
 
     @property
     def held(self) -> bool:
+        """True while a hold is set."""
         return self._hold_until is not None
 
     @property
     def hold_remaining_s(self) -> float:
+        """Seconds left on the hold, 0.0 when none."""
         if self._hold_until is None:
             return 0.0
         return round(max(0.0, self._hold_until - time.monotonic()), 3)
 
     async def _wait_hold(self) -> None:
+        """Sleep out the hold or until it is released, then clear it."""
         remaining = self.hold_remaining_s
         released = self._hold_release.is_set()
         if remaining > 0 and not released:
@@ -179,6 +198,7 @@ class MysqldSupervisor:
         log.info("mysqld_restart_hold_end", released=released)
 
     def kill(self, sig: int = signal.SIGKILL) -> int | None:
+        """Signal mysqld and return its pid. SIGKILL skips the restart backoff."""
         pid = self.pid
         if pid is None:
             return None
@@ -192,6 +212,7 @@ class MysqldSupervisor:
         return pid
 
     async def wait_exit(self, timeout: float) -> bool:
+        """True once the current mysqld has exited."""
         proc = self.proc
         if proc is None or proc.returncode is not None:
             return True
@@ -213,6 +234,7 @@ class MysqldSupervisor:
             return False
 
     async def stop(self, timeout: float = 120.0) -> None:
+        """SIGTERM mysqld (SIGCONT first), SIGKILL after ``timeout``, stop restarting."""
         self._stopping = True
         self._hold_release.set()
         proc = self.proc

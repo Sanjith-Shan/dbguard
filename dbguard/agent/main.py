@@ -1,7 +1,9 @@
-"""dbguard-agent entry point.
+"""``dbguard-agent`` entry point, the container's main process under tini.
 
-The container's main process under tini: supervises mysqld and serves :8080.
-`--no-supervise` attaches to an already running mysqld (local development, tests).
+It builds the agent with a real SQL layer and, unless ``--no-supervise``, a supervisor that
+starts mysqld as the agent's own child. Owning the process is what lets the fence fall back to
+SIGKILL and what lets mysqld restart after CLONE. ``--no-supervise`` attaches to a mysqld the
+agent did not start (local development, tests).
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from dbguard.agent.supervisor import MysqldSupervisor, NullSupervisor
 
 
 def setup_logging(level: str = "INFO") -> None:
+    """structlog JSON lines on stdout, aiohttp access and aiomysql quietened."""
     logging.basicConfig(format="%(message)s", stream=sys.stdout,
                         level=getattr(logging, level.upper(), logging.INFO))
     for noisy in ("aiohttp.access", "aiomysql"):
@@ -43,6 +46,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def build_agent(settings: AgentSettings) -> Agent:
+    """An Agent with its SQL layer and supervisor, the supervisor calling back on restarts."""
     db = MySQL(settings.mysql_host, settings.mysql_port, settings.mysql_user,
                settings.mysql_password,
                fallback=("root", settings.root_password) if settings.root_password else None,
@@ -59,6 +63,7 @@ def build_agent(settings: AgentSettings) -> Agent:
 
 
 async def run(settings: AgentSettings) -> None:
+    """Serve the API and run the agent until SIGTERM or SIGINT, then stop mysqld."""
     log = structlog.get_logger("dbguard.agent")
     agent = build_agent(settings)
     app = make_app(agent)
@@ -82,6 +87,7 @@ async def run(settings: AgentSettings) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Parse flags, read the environment, run."""
     p = argparse.ArgumentParser(prog="dbguard-agent")
     p.add_argument("--no-supervise", action="store_true",
                    help="attach to a running mysqld instead of starting one")

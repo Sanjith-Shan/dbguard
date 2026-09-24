@@ -1,14 +1,10 @@
-"""The agent's SQL layer.
+"""The agent's SQL layer, bounded so a hung mysqld can never hold the agent.
 
-Everything the agent sends to mysqld goes through a `Session`, so tests can inject a
-fake. Every call carries a timeout. A statement that times out leaves the aiomysql
-connection mid-protocol, so the session is closed on any error and never reused. That
-is what keeps a hung mysqld from exhausting anything: each request opens (or borrows)
-one connection, and a connection that ever timed out is thrown away.
-
-Auth: 8.4 accounts use caching_sha2_password. Over plain TCP the first login needs RSA
-(the `cryptography` package) or TLS. mysqld auto-generates certificates, so the agent
-always connects with TLS and certificate verification off. See docs/BUGS.md.
+Everything the agent sends to mysqld goes through a ``Session``, so tests can inject a fake.
+Every call carries a timeout, and a statement that times out leaves the aiomysql connection
+mid-protocol, so the session is closed on any error and never reused. Accounts use
+caching_sha2_password, so the agent always connects with TLS and verification off, which is
+why this module has its own ``insecure_tls()`` (docs/INTERFACES.md, docs/BUGS.md).
 """
 
 from __future__ import annotations
@@ -40,27 +36,39 @@ class DbError(Exception):
 
 
 class Session(Protocol):
+    """One connection. Any error closes it for good."""
+
     async def query(self, sql: str, args: Any = None, *, timeout: float | None = None,
-                    log_sql: bool = False) -> list[dict[str, Any]]: ...
+                    log_sql: bool = False) -> list[dict[str, Any]]:
+        """Rows as dicts."""
 
     async def execute(self, sql: str, args: Any = None, *, timeout: float | None = None,
-                      log_sql: bool = False) -> int: ...
+                      log_sql: bool = False) -> int:
+        """Affected row count."""
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Close the connection."""
 
     @property
-    def closed(self) -> bool: ...
+    def closed(self) -> bool:
+        """True once closed or broken."""
 
 
 class Database(Protocol):
-    async def connect(self, timeout: float | None = None) -> Session: ...
+    """A connection factory with a small idle pool."""
 
-    def session(self, timeout: float | None = None) -> Any: ...
+    async def connect(self, timeout: float | None = None) -> Session:
+        """A new, unpooled session."""
 
-    async def close(self) -> None: ...
+    def session(self, timeout: float | None = None) -> Any:
+        """Async context manager lending a pooled session."""
+
+    async def close(self) -> None:
+        """Close every pooled session."""
 
 
 def insecure_tls() -> ssl.SSLContext:
+    """TLS for mysqld's self-signed certificate, encrypted and unverified."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -68,6 +76,7 @@ def insecure_tls() -> ssl.SSLContext:
 
 
 def _redact(sql: str, args: Any) -> str:
+    """The statement for the log, with password arguments masked."""
     if args is None:
         return sql
     if isinstance(args, dict):
@@ -77,6 +86,8 @@ def _redact(sql: str, args: Any) -> str:
 
 
 class MySQLSession:
+    """An aiomysql connection behind the Session protocol."""
+
     def __init__(self, conn: aiomysql.Connection, default_timeout: float):
         self._conn = conn
         self._default_timeout = default_timeout
@@ -84,9 +95,11 @@ class MySQLSession:
 
     @property
     def closed(self) -> bool:
+        """True once closed or broken."""
         return self._closed or self._conn.closed
 
     def close(self) -> None:
+        """Close the connection, ignoring errors."""
         if not self._closed:
             self._closed = True
             with contextlib.suppress(Exception):
@@ -94,6 +107,7 @@ class MySQLSession:
 
     async def _run(self, sql: str, args: Any, timeout: float | None, log_sql: bool,
                    fetch: bool) -> Any:
+        """Run one statement within ``timeout``, turning every failure into DbError."""
         if self.closed:
             raise DbError("session closed")
         t = self._default_timeout if timeout is None else timeout
@@ -133,10 +147,12 @@ class MySQLSession:
 
     async def query(self, sql: str, args: Any = None, *, timeout: float | None = None,
                     log_sql: bool = False) -> list[dict[str, Any]]:
+        """Rows as dicts."""
         return await self._run(sql, args, timeout, log_sql, True)
 
     async def execute(self, sql: str, args: Any = None, *, timeout: float | None = None,
                       log_sql: bool = False) -> int:
+        """Affected row count."""
         return await self._run(sql, args, timeout, log_sql, False)
 
 
@@ -161,6 +177,7 @@ class MySQL:
         self._tls = insecure_tls()
 
     async def _open(self, user: str, password: str, timeout: float) -> aiomysql.Connection:
+        """One TLS connection attempt with these credentials."""
         return await asyncio.wait_for(
             aiomysql.connect(host=self.host, port=self.port, user=user, password=password,
                              autocommit=True, connect_timeout=timeout, ssl=self._tls,
@@ -168,6 +185,7 @@ class MySQL:
             timeout=timeout)
 
     async def connect(self, timeout: float | None = None) -> MySQLSession:
+        """A new session, trying each credential until one is not denied."""
         t = self.default_timeout if timeout is None else timeout
         last: Exception | None = None
         for user, password in self.creds:
@@ -188,6 +206,7 @@ class MySQL:
 
     @asynccontextmanager
     async def session(self, timeout: float | None = None) -> AsyncIterator[MySQLSession]:
+        """Lend a pooled session, returning it only if the body finished without error."""
         s: MySQLSession | None = None
         while self._idle:
             cand = self._idle.pop()
@@ -207,9 +226,11 @@ class MySQL:
                 s.close()
 
     def drop_idle(self) -> None:
+        """Close every idle pooled session."""
         for s in self._idle:
             s.close()
         self._idle.clear()
 
     async def close(self) -> None:
+        """Close the pool."""
         self.drop_idle()

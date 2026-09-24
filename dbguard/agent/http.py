@@ -1,4 +1,9 @@
-"""aiohttp routes for the agent API (docs/INTERFACES.md, Agent HTTP API)."""
+"""aiohttp routes for the agent API (docs/INTERFACES.md, Agent HTTP API).
+
+Thin handlers over ``Agent``. The middleware maps an ``AgentError`` to its status and a
+``DbError`` to 500 with ``sql_code``, or 503 when mysqld timed out. The manager retries a role
+change once on ``sql_code`` 2006 or 2013, the link a fence on the same node killed.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ AGENT_KEY: web.AppKey[Agent] = web.AppKey("agent", Agent)
 
 
 async def _body(request: web.Request) -> dict[str, Any]:
+    """The JSON object body, {} when absent, 400 when not an object."""
     if not request.can_read_body:
         return {}
     try:
@@ -33,6 +39,7 @@ async def _body(request: web.Request) -> dict[str, Any]:
 
 @web.middleware
 async def errors(request: web.Request, handler):
+    """Turn agent and SQL errors into JSON answers with the right status."""
     try:
         return await handler(request)
     except web.HTTPException:
@@ -47,42 +54,51 @@ async def errors(request: web.Request, handler):
 
 
 async def primary(request: web.Request) -> web.Response:
+    """GET /primary, HAProxy's health check."""
     code, body = await request.app[AGENT_KEY].primary_check()
     return web.json_response(body, status=code)
 
 
 async def status(request: web.Request) -> web.Response:
+    """GET /status."""
     return web.json_response(await request.app[AGENT_KEY].status())
 
 
 async def health(request: web.Request) -> web.Response:
+    """GET /health, the process is alive."""
     return web.json_response({"ok": True})
 
 
 async def fence(request: web.Request) -> web.Response:
+    """POST /fence."""
     code, body = await request.app[AGENT_KEY].fence(reason="api")
     return web.json_response(body, status=code)
 
 
 async def unfence(request: web.Request) -> web.Response:
+    """POST /unfence."""
     return web.json_response(await request.app[AGENT_KEY].unfence())
 
 
 async def promote(request: web.Request) -> web.Response:
+    """POST /promote."""
     return web.json_response(await request.app[AGENT_KEY].promote())
 
 
 async def repoint(request: web.Request) -> web.Response:
+    """POST /repoint {"source": node}."""
     body = await _body(request)
     return web.json_response(await request.app[AGENT_KEY].repoint(str(body.get("source") or "")))
 
 
 async def rebuild(request: web.Request) -> web.Response:
+    """POST /rebuild {"donor": node}."""
     body = await _body(request)
     return web.json_response(await request.app[AGENT_KEY].rebuild(str(body.get("donor") or "")))
 
 
 async def configure(request: web.Request) -> web.Response:
+    """POST /configure with any of semisync, self_fence, wake_guard."""
     body = await _body(request)
     vals = {}
     for key in ("semisync", "self_fence", "wake_guard"):
@@ -95,10 +111,12 @@ async def configure(request: web.Request) -> web.Response:
 
 
 async def kill_mysqld(request: web.Request) -> web.Response:
+    """POST /kill-mysqld test hook."""
     return web.json_response(request.app[AGENT_KEY].kill_mysqld())
 
 
 async def hang_mysqld(request: web.Request) -> web.Response:
+    """POST /hang-mysqld {"seconds": n} test hook."""
     body = await _body(request)
     try:
         seconds = float(body.get("seconds", 10))
@@ -108,6 +126,7 @@ async def hang_mysqld(request: web.Request) -> web.Response:
 
 
 async def metrics(request: web.Request) -> web.Response:
+    """GET /metrics."""
     agent = request.app[AGENT_KEY]
     agent.m.heartbeat_stalled.set(agent.heartbeat_stalled_s())
     alive = agent.mysqld_alive()
@@ -118,6 +137,7 @@ async def metrics(request: web.Request) -> web.Response:
 
 
 def make_app(agent: Agent) -> web.Application:
+    """The aiohttp application serving ``agent``."""
     app = web.Application(middlewares=[errors])
     app[AGENT_KEY] = agent
     app.router.add_get("/primary", primary)

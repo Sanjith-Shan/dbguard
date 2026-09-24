@@ -1,4 +1,10 @@
-"""Agent configuration, read from the environment only (docs/INTERFACES.md)."""
+"""Agent configuration, read from the environment only (docs/INTERFACES.md).
+
+Every container gets the same image and differs only by ``DBGUARD_NODE``, ``DBGUARD_RS`` and
+``DBGUARD_SERVER_ID``. The timing fields without an env var (SQL timeout, status and fence
+deadlines, the 30 s role-change deadline, the 3 s wake gap) are the documented contract
+values and change only with docs/INTERFACES.md.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,7 @@ from dataclasses import dataclass, field
 
 
 def _bool(value: str | None, default: bool) -> bool:
+    """An env flag (1, true, yes, on), ``default`` when unset."""
     if value is None or value == "":
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
@@ -15,6 +22,8 @@ def _bool(value: str | None, default: bool) -> bool:
 
 @dataclass
 class AgentSettings:
+    """Everything the agent is configured with."""
+
     node: str = "localhost"
     rs: str = "rs0"
     semisync: bool = True
@@ -51,10 +60,12 @@ class AgentSettings:
 
     @property
     def fence_file(self) -> str:
+        """Path of the persisted fence flag."""
         return os.path.join(self.state_dir, "fenced")
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> AgentSettings:
+        """Settings from ``env`` (default os.environ)."""
         e = os.environ if env is None else env
         return cls(
             node=e.get("DBGUARD_NODE") or os.uname().nodename,

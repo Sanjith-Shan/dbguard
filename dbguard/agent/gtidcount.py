@@ -1,13 +1,15 @@
-"""Phantom GTID counting for /rebuild.
+"""Phantom GTID counting for /rebuild, the number a rejoin by clone reports as discarded.
 
-Uses dbguard.gtid.GtidSet when the manager's module is present, else a small local
-parser of "uuid:1-5:7,uuid2:1-3" that is enough to count `a - b`.
+The count is ``own gtid_executed`` minus the donor's, done with ``dbguard.gtid.GtidSet``. If
+that cannot parse the text, a small local parser counts it instead, because the rebuild itself
+must not fail over a number that is only reported. tests/test_agent_unit.py checks both agree.
 """
 
 from __future__ import annotations
 
 
 def _parse(text: str | None) -> dict[str, list[tuple[int, int]]]:
+    """A lenient parse of a GTID set into ``uuid[:tag]`` -> intervals, unmerged."""
     out: dict[str, list[tuple[int, int]]] = {}
     if not text:
         return out
@@ -30,6 +32,7 @@ def _parse(text: str | None) -> dict[str, list[tuple[int, int]]]:
 
 
 def _interval_count(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
+    """Transactions in intervals ``a`` not covered by intervals ``b``."""
     count = 0
     for lo, hi in a:
         pieces = [(lo, hi)]
@@ -54,6 +57,6 @@ def subtract_count(a: str | None, b: str | None) -> int:
         from dbguard.gtid import GtidSet  # type: ignore[attr-defined]
 
         return int(GtidSet.parse(a or "").subtract(GtidSet.parse(b or "")).count())
-    except Exception:  # noqa: BLE001, S110  absent, or its API drifted: count locally
+    except Exception:  # noqa: BLE001, S110  unparseable text: count locally
         pass
     return sum(_interval_count(ivs, _parse(b).get(k, [])) for k, ivs in _parse(a).items())

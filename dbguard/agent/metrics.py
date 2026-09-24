@@ -1,4 +1,9 @@
-"""Prometheus metrics for one agent. A registry per agent keeps tests independent."""
+"""Prometheus metrics for one agent, served at ``/metrics``.
+
+Fences by method (sql, kill, failed), role changes, rebuilds, wake-guard decisions,
+self-fences, and the latency of ``GET /primary``, which is how the in-memory answer is shown
+to cost microseconds. One registry per agent keeps tests independent.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,8 @@ ROLES = ("primary", "replica", "fenced", "unknown")
 
 
 class AgentMetrics:
+    """The agent's collectors, on a private registry."""
+
     def __init__(self) -> None:
         r = self.registry = CollectorRegistry()
         self.fences = Counter("dbguard_agent_fences_total", "Fences by method", ["method"],
@@ -43,8 +50,10 @@ class AgentMetrics:
                                   registry=r)
 
     def set_role(self, role: str) -> None:
+        """Set the one-hot role gauge."""
         for name in ROLES:
             self.role.labels(role=name).set(1 if name == role else 0)
 
     def render(self) -> bytes:
+        """The Prometheus text exposition."""
         return generate_latest(self.registry)
