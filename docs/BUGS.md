@@ -48,3 +48,30 @@ Every real bug found while building DBGuard. Symptom, how it was found, fix.
 - How found. Fencing the dev node with one `SELECT SLEEP(300)` client open.
 - Fix. The fence closes the agent's idle pool and its heartbeat connection before it lists
   threads, and pooled requests retry once on a lost link (2006, 2013).
+
+## Harness
+
+### docker kill -s STOP froze nothing but tini
+
+- Symptom. The hang-container scenario as specified (`docker kill -s STOP` on the primary)
+  would have left mysqld and the agent running. Only PID 1 stopped.
+- How found. Before the fleet existed, on a scratch container with `--init` and two child
+  processes. After `docker kill -s STOP`, `ps` inside showed `docker-init` in state `T` and
+  both children still in `S`. Docker delivers the signal to PID 1 only, and tini cannot
+  forward SIGSTOP because SIGSTOP cannot be caught.
+- Fix. hang-container uses `docker pause`, the cgroup freezer, which stops every process in
+  the container. The row records the mechanism, whether the agent still answered `/status`
+  while frozen, and the exit code of a `docker exec` into the frozen container. hang-process
+  keeps the per-pid `kill -STOP` on mysqld alone.
+
+### The upstream Orchestrator image cannot manage MySQL 8.4
+
+- Symptom. `openarkcode/orchestrator` stops at v3.2.4 (2021, amd64 only) and the last
+  upstream release is 3.2.6. Both issue `SHOW SLAVE STATUS` and `SHOW MASTER STATUS`, which
+  MySQL 8.4 removed, so discovery cannot work against this fleet.
+- How found. Reading the Docker Hub tag list and the release dates while choosing the
+  baseline image.
+- Fix. The baseline runs `percona/percona-orchestrator:3.2.6-24`, Percona's maintained fork,
+  which speaks the 8.4 statements and ships a native arm64 image. The config keeps
+  Orchestrator's own detection and recovery and only adds the hooks that tell our agents
+  about a fence and a promotion.
