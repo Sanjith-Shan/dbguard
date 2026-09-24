@@ -1,18 +1,12 @@
-"""Finding the primary at startup, and bootstrapping a brand new set.
+"""Finding the primary when the manager starts, before any failover can happen.
 
-Startup rules, in order:
-1. exactly one member is writable (super_read_only=0, not fenced): it is the primary;
-2. more than one is writable: HALTED, a human decides which writes to keep;
-3. none writable, every member reachable, read-only, not replicating, with empty or
-   identical gtid_executed: a new set, so bootstrap it (promote nodes[0], repoint the
-   rest) per docs/INTERFACES.md;
-4. none writable but replicas agree on a source S. If S is reachable, not fenced, holds
-   every transaction any replica holds, and every reachable replica replicates from S
-   without an IO error, this is a cold start (the whole set rebooted, my.cnf makes every
-   node boot read-only): promote S in place and record a ``cold_start`` event. Failing
-   over here would be a false failover, S is fine, only read-only. Otherwise believe S is
-   the primary and let detection decide (a manager restarted during an outage);
-5. otherwise wait, the fleet may still be starting.
+Exactly one writable member is the primary, and more than one HALTs the set. With none,
+members that are all read-only, unreplicated and identical are a new set, bootstrapped by
+promoting ``nodes[0]``. Otherwise, if every node booted read-only (a whole-set restart, since
+my.cnf boots read-only) and one member holds every transaction any other holds, it is promoted
+in place as a ``cold_start``. That rule exists because rs2 once failed over from a primary that
+was merely rebooting. Replicas agreeing on a source that is not answering yet make it the
+believed primary, and detection decides from there.
 """
 
 from __future__ import annotations
@@ -25,7 +19,7 @@ import structlog
 
 from dbguard.gtid import GtidSet
 from dbguard.manager.client import AgentError
-from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
+from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S, repoint_all
 from dbguard.manager.model import NodeView, Observation
 
 if TYPE_CHECKING:
@@ -35,6 +29,7 @@ log = structlog.get_logger("dbguard.manager.bootstrap")
 
 
 async def discover(ctl: SetController, ob: Observation) -> None:
+    """Called each tick while the set has no primary. Settles on one, or waits."""
     views = {n: ob.nodes[n] for n in ctl.members if n in ob.nodes}
     writable = [n for n, v in views.items() if v.writable]
     if len(writable) == 1:
@@ -70,14 +65,12 @@ async def discover(ctl: SetController, ob: Observation) -> None:
     if node:
         await cold_start(ctl, node, views)
         return
-    if sources:
-        src, n = sources.most_common(1)[0]
-        if n * 2 > len(ctl.members) - 1:
-            # Not (yet) a cold start, typically the source is not answering. Believe it; the
-            # tick re-checks for a cold start every poll and detection handles a dead one.
-            ctl.set_primary(src)
-            log.warning("no writable node, believing replicas' source", rs=ctl.rs, primary=src)
-            return
+    if src is not None:
+        # Not (yet) a cold start, typically the source is not answering. Believe it; the
+        # tick re-checks for a cold start every poll and detection handles a dead one.
+        ctl.set_primary(src)
+        log.warning("no writable node, believing replicas' source", rs=ctl.rs, primary=src)
+        return
     note = (f"no primary found yet: {len(usable)} of {len(ctl.members)} nodes answer, "
             f"none writable")
     if note != ctl.last_discover_note:
@@ -129,6 +122,7 @@ def cold_start_choice(views: dict[str, NodeView], members: list[str],
 
 
 async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -> None:
+    """Promote ``src`` in place after a whole-set restart and record a cold_start event."""
     t0 = time.monotonic()
     log.warning("cold start, promoting in place", rs=ctl.rs, primary=src)
     # Replicas that do not already follow ``src`` (it was not their source before the
@@ -137,7 +131,6 @@ async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -
     movers = [m for m in ctl.members if m != src and m in views and views[m].usable
               and views[m].replica.source_host != src]
     if movers:
-        from dbguard.manager.failover import repoint_all
         await repoint_all(ctl, movers, src)
     try:
         resp = await ctl.agents.post(src, "/promote", timeout=ROLE_CHANGE_TIMEOUT_S)
@@ -158,6 +151,7 @@ async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -
 
 
 async def bootstrap(ctl: SetController) -> None:
+    """Promote ``nodes[0]`` of a brand new set and repoint the rest to it."""
     first, rest = ctl.scfg.nodes[0], [n for n in ctl.members if n != ctl.scfg.nodes[0]]
     t0 = time.monotonic()
     log.warning("bootstrap", rs=ctl.rs, primary=first, replicas=rest)
@@ -167,7 +161,6 @@ async def bootstrap(ctl: SetController) -> None:
         ctl.st.halt(f"bootstrap: promote of {first} failed: {e}")
         return
     ctl.set_primary(first)
-    from dbguard.manager.failover import repoint_all
     step = await repoint_all(ctl, rest, first)
     ctl.event(type="bootstrap", new_primary=first, total_s=round(time.monotonic() - t0, 3),
               watermark_gtid=resp.get("gtid_executed") if isinstance(resp, dict) else None,

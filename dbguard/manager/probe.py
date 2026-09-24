@@ -1,10 +1,16 @@
-"""The manager's own view of a set: agent /status of every node and a write probe of the
-believed primary. Every call is bounded so a hung node never stalls the loop."""
+"""The manager's own view of a set, the evidence detection and every failover step start from.
+
+Two sources feed each poll. Every node's agent ``/status`` comes from ``StatusCache``, one
+poller task per node, so a slow or dead agent never stretches the tick. The believed primary
+is probed directly by ``MysqlProber`` with ``SELECT 1`` and a write, because a primary cut off
+from its replicas answers reads while every commit waits for an ack. The prober also runs the
+few SQL statements failover and switchover need outside the agents (stopping IO threads,
+reading the SQL thread's state, waiting for a GTID set). Every call is bounded.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import ssl
 import time
 from collections.abc import Sequence
 from typing import Protocol
@@ -14,6 +20,7 @@ import structlog
 
 from dbguard.manager.client import Addressing, AgentClient
 from dbguard.manager.model import NodeView, Observation, ProbeResult
+from dbguard.mysqlx import insecure_tls
 
 log = structlog.get_logger("dbguard.manager.probe")
 
@@ -23,25 +30,33 @@ ER_LOST = 2013
 
 
 class Prober(Protocol):
-    async def probe(self, rs: str, node: str) -> ProbeResult: ...
-    async def stop_io(self, node: str, timeout: float = 3.0) -> str | None: ...
-    async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None: ...
-    async def gtid_waiter(self, node: str, timeout: float = 3.0) -> "GtidWaiter | None": ...
-    async def close(self) -> None: ...
+    """What the controller needs from direct SQL. The simulator in fake.py provides one too."""
+
+    async def probe(self, rs: str, node: str) -> ProbeResult:
+        """SELECT 1 and a write on ``node``, never raising."""
+
+    async def stop_io(self, node: str, timeout: float = 3.0) -> str | None:
+        """STOP REPLICA IO_THREAD, None on success or the error text."""
+
+    async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
+        """The SHOW REPLICA STATUS row, None when unreachable."""
+
+    async def gtid_waiter(self, node: str, timeout: float = 3.0) -> "GtidWaiter | None":
+        """A pre-opened connection to wait on, None when unreachable."""
+
+    async def close(self) -> None:
+        """Release every connection."""
 
 
 class GtidWaiter(Protocol):
+    """A pre-opened connection that waits for a GTID set to be applied."""
+
     async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
         """Block until ``gtid_set`` is applied (True) or the timeout passed (False).
         Returns the node's gtid_executed read right after."""
-    async def close(self) -> None: ...
 
-
-def _tls() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+    async def close(self) -> None:
+        """Close the connection."""
 
 
 class MysqlProber:
@@ -66,6 +81,7 @@ class MysqlProber:
         self._conns: dict[str, aiomysql.Connection] = {}
 
     async def _conn(self, node: str) -> aiomysql.Connection:
+        """The kept probe connection to ``node``, opened on first use."""
         c = self._conns.get(node)
         if c is not None and not c.closed:
             return c
@@ -73,11 +89,12 @@ class MysqlProber:
         c = await aiomysql.connect(host=host, port=port, user=self.user,
                                    password=self.password, autocommit=True,
                                    connect_timeout=self.timeout_s,
-                                   ssl=_tls() if self.use_tls else None)
+                                   ssl=insecure_tls() if self.use_tls else None)
         self._conns[node] = c
         return c
 
     def _drop(self, node: str) -> None:
+        """Close and forget the probe connection, which may be mid-packet."""
         c = self._conns.pop(node, None)
         if c is not None:
             try:
@@ -86,6 +103,7 @@ class MysqlProber:
                 pass
 
     async def probe(self, rs: str, node: str) -> ProbeResult:
+        """One probe of ``node``. Never raises, a failure is a ProbeResult with its kind."""
         t0 = time.monotonic()
         ts = time.time()
         state = {"select_ok": False}
@@ -126,7 +144,7 @@ class MysqlProber:
             c = await aiomysql.connect(host=host, port=port, user=self.user,
                                        password=self.password, autocommit=True,
                                        connect_timeout=timeout,
-                                       ssl=_tls() if self.use_tls else None,
+                                       ssl=insecure_tls() if self.use_tls else None,
                                        cursorclass=aiomysql.DictCursor)
             try:
                 async with c.cursor() as cur:
@@ -151,7 +169,7 @@ class MysqlProber:
         try:
             c = await asyncio.wait_for(aiomysql.connect(
                 host=host, port=port, user=self.user, password=self.password, autocommit=True,
-                connect_timeout=timeout, ssl=_tls() if self.use_tls else None), timeout)
+                connect_timeout=timeout, ssl=insecure_tls() if self.use_tls else None), timeout)
         except Exception:  # noqa: BLE001
             return None
         return MysqlGtidWaiter(c)
@@ -165,6 +183,7 @@ class MysqlProber:
         return dict(rows[0]) if rows else {}
 
     async def close(self) -> None:
+        """Close every kept probe connection."""
         for n in list(self._conns):
             self._drop(n)
 
@@ -177,6 +196,7 @@ class MysqlGtidWaiter:
         self.conn = conn
 
     async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
+        """True once ``gtid_set`` is applied, False at the timeout, plus gtid_executed after."""
         async def go():
             async with self.conn.cursor() as cur:
                 await cur.execute("SELECT WAIT_FOR_EXECUTED_GTID_SET(%s, %s)",
@@ -188,6 +208,7 @@ class MysqlGtidWaiter:
         return await asyncio.wait_for(go(), timeout_s + 2.0)
 
     async def close(self) -> None:
+        """Close the connection, ignoring errors."""
         try:
             self.conn.close()
         except Exception:  # noqa: BLE001
@@ -214,6 +235,7 @@ class StatusCache:
         self._not_before: float = 0.0
 
     def ensure(self, nodes: Sequence[str]) -> None:
+        """Start a poller for every node that has none running."""
         for n in nodes:
             t = self._tasks.get(n)
             if t is None or t.done():
@@ -232,6 +254,7 @@ class StatusCache:
         self._not_before = time.time()
 
     def get(self, node: str, now: float | None = None) -> NodeView:
+        """The newest view of ``node``, or an unreachable one when missing, stale or pre-action."""
         now = now or time.time()
         v = self.views.get(node)
         if v is None:
@@ -244,6 +267,7 @@ class StatusCache:
         return v
 
     async def close(self) -> None:
+        """Stop every poller."""
         for t in self._tasks.values():
             t.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)

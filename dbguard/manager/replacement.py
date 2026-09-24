@@ -1,13 +1,11 @@
-"""Replacing a lost replica with a new host.
+"""Replacing a lost replica, what keeps a set from living on its last replica after failover.
 
-When a set has been DEGRADED for longer than ``rebuild_after_s``, the manager asks a
-Provisioner for a new node, waits for its agent, clones it from a healthy replica (never
-from the primary, to keep the primary's I/O for clients) and repoints it.
-
-In this lab the new host is the set's spare container, started with docker compose. In a
-real fleet ``Provisioner.provision`` is where the manager would call the host allocator
-(ask the inventory service for a machine in the right failure domain, image it with the
-agent, and return its name once the agent answers). Nothing else in the manager changes.
+With ``wait_for_replica_count=1`` a set with one replica still commits but has no margin. When
+it has been DEGRADED for longer than ``rebuild_after_s``, the manager asks a Provisioner for a
+new node, waits for its agent, clones it from a healthy replica (never the primary, whose I/O
+belongs to clients) and repoints it. In this lab the new host is the set's spare container,
+started with docker compose. In a real fleet ``Provisioner.provision`` is where the manager
+would call the host allocator, and nothing else in the manager changes.
 """
 
 from __future__ import annotations
@@ -27,10 +25,12 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger("dbguard.manager.replacement")
 
-AGENT_WAIT_S = 180.0
+AGENT_WAIT_S = 180.0   # how long a provisioned node's agent may take to answer
 
 
 class Provisioner(Protocol):
+    """Makes a new node exist. The one place DBGuard stands in for a host allocator."""
+
     async def provision(self, rs: str, node: str) -> None:
         """Make ``node`` exist and start its agent. Raise on failure."""
 
@@ -42,6 +42,7 @@ class NullProvisioner:
         self.calls: list[tuple[str, str]] = []
 
     async def provision(self, rs: str, node: str) -> None:
+        """Record the call and return."""
         self.calls.append((rs, node))
 
 
@@ -60,12 +61,14 @@ class ComposeProvisioner:
         self.timeout_s = timeout_s
 
     def command(self, node: str) -> list[str]:
+        """The compose command that starts ``node``."""
         cmd = ["docker", "compose", "-f", self.compose_file]
         if self.project:
             cmd += ["-p", self.project]
         return cmd + ["--profile", "spare", "up", "-d", "--no-recreate", node]
 
     async def provision(self, rs: str, node: str) -> None:
+        """Run the compose command, raising on a non-zero exit or the timeout."""
         cmd = self.command(node)
         log.warning("provision", rs=rs, node=node, cmd=shlex.join(cmd))
         proc = await asyncio.create_subprocess_exec(
@@ -81,6 +84,9 @@ class ComposeProvisioner:
 
 
 async def maybe_replace(ctl: SetController, ob: Observation, healthy: list[str]) -> None:
+    """Start a replacement when the set has been DEGRADED long enough and has a donor.
+
+    Never while FAILING_OVER, SUSPECT, HALTED or REBUILDING, nor within the cooldown."""
     spare = ctl.scfg.spare
     if not spare or spare in ctl.members or ctl.provisioner is None:
         return
@@ -96,6 +102,7 @@ async def maybe_replace(ctl: SetController, ob: Observation, healthy: list[str])
 
 
 async def replace(ctl: SetController, spare: str, donor: str):
+    """Provision ``spare``, clone it from ``donor``, repoint it, and make it a member."""
     from dbguard.manager.rejoin import rebuild_and_join
 
     t0 = time.monotonic()

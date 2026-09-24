@@ -1,4 +1,9 @@
-"""The manager: one SetController per replica set, sharing an event log and metrics."""
+"""The manager process, one SetController per replica set sharing an event log and metrics.
+
+Sets are independent. Each runs its own control loop task, so a failover in ``rs1`` never
+waits on ``rs2``, and the harness checks that injecting into one set changes nothing in the
+other. There is one manager, and if it dies nothing fails over (docs/DESIGN.md section 12).
+"""
 
 from __future__ import annotations
 
@@ -18,6 +23,8 @@ log = structlog.get_logger("dbguard.manager")
 
 
 class Manager:
+    """Builds the shared clients and one controller per configured set."""
+
     def __init__(self, cfg, *, addressing: Addressing | None = None,
                  state_dir: str | None = None, mode: str | None = None,
                  rejoin: str | None = None, prober: Prober | None = None,
@@ -42,6 +49,7 @@ class Manager:
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
+        """Start every set's control loop."""
         for rs, ctl in self.sets.items():
             self._tasks.append(asyncio.create_task(ctl.run(), name=f"set-{rs}"))
         log.info("manager started", mode=self.mode, sets=list(self.sets))

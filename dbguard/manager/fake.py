@@ -1,17 +1,12 @@
-"""In-process fake fleet for tests: agents speaking the real HTTP contract over a
-simulated replica set. No MySQL, no Docker.
+"""In-process fake fleet, agents speaking the real HTTP contract over a simulated replica set.
 
-Each FakeNode is a tiny model of mysqld + agent: a gtid_executed, a relay log
-(Retrieved_Gtid_Set), a source, semi-sync flags, a fence flag. FakeFleet.step() moves
-time forward: the writable primary commits one transaction per step if the workload is
-on (and, with semi-sync, only if some replica can take it, else the write stalls),
-replicas that can reach their source copy its binlog into their relay log, SQL threads
-apply the relay log (optionally slowly), and the primary's heartbeat replicates.
-
-Faults are flags: ``kill`` (container gone: agent disconnects, mysqld gone),
-``hang`` (mysqld stopped: agent answers, mysqld does not), ``freeze`` (whole container
-stopped: agent requests hang), ``partition(a, b)`` and ``manager_cut`` (the manager
-cannot reach mysqld of that node, agents stay reachable).
+tests/test_manager_sim.py runs the real manager against it, so whole failovers, rejoins and
+switchovers are tested without MySQL or Docker. Each FakeNode models mysqld plus agent (a
+gtid_executed, a relay log, a source, semi-sync flags, a fence flag), and ``FakeFleet.step``
+moves time forward. With semi-sync the primary commits only when a replica can take the
+transaction, and counts it acknowledged only once a replica holds it, so ``acked`` is exactly
+what a lossless failover must keep. Faults are flags, ``kill``, ``hung`` (mysqld stopped),
+``frozen`` (whole container), ``partition(a, b)`` and ``manager_cut``.
 """
 
 from __future__ import annotations
@@ -30,6 +25,8 @@ from dbguard.manager.model import ProbeResult
 
 @dataclass
 class FakeNode:
+    """One simulated mysqld and its agent."""
+
     name: str
     rs: str
     uuid: str = field(default_factory=lambda: str(uuidlib.uuid4()))
@@ -59,14 +56,18 @@ class FakeNode:
 
     @property
     def responsive(self) -> bool:
+        """Container up, mysqld up and not stopped."""
         return self.alive and self.mysqld_up and not self.hung and not self.frozen
 
     @property
     def writable(self) -> bool:
+        """Accepts writes."""
         return self.responsive and not self.super_read_only and not self.fenced
 
 
 class FakeFleet:
+    """Every simulated node, the network cuts between them and the acknowledged writes."""
+
     def __init__(self, sets: dict[str, list[str]], semisync: bool = True,
                  spares: dict[str, str] | None = None):
         self.semisync = semisync
@@ -90,6 +91,7 @@ class FakeFleet:
 
     # ------------------------------------------------------------- topology helpers
     def setup_replication(self, rs: str, primary: str | None = None) -> None:
+        """Make ``primary`` (default the first node) writable and the rest its replicas."""
         names = self.sets[rs]
         primary = primary or names[0]
         for n in names:
@@ -102,16 +104,20 @@ class FakeFleet:
                 node.semisync_replica = self.semisync
 
     def partition(self, a: str, b: str) -> None:
+        """Cut the link between two nodes."""
         self.cut.add(frozenset((a, b)))
 
     def heal(self) -> None:
+        """Remove every cut, including the manager's."""
         self.cut.clear()
         self.manager_cut.clear()
 
     def can_talk(self, a: str, b: str) -> bool:
+        """True unless the pair is cut."""
         return frozenset((a, b)) not in self.cut
 
     def kill(self, n: str) -> None:
+        """The container is gone, agent and mysqld with it."""
         node = self.nodes[n]
         node.alive = False
         node.mysqld_up = False
@@ -127,16 +133,19 @@ class FakeFleet:
         node.retrieved = GtidSet()     # relay_log_recovery discards the relay log
 
     def primary_of(self, rs: str) -> list[str]:
+        """Every writable node of ``rs``, one when all is well."""
         return [n for n in self.sets[rs] if self.nodes[n].writable]
 
     # ------------------------------------------------------------- simulation
     def io_ok(self, node: FakeNode) -> bool:
+        """The node's IO thread can receive from its source now."""
         if not node.responsive or node.source is None or node.io_stopped:
             return False
         src = self.nodes.get(node.source)
         return bool(src and src.responsive and self.can_talk(node.name, src.name))
 
     def step(self) -> None:
+        """Advance time one step. Commit, replicate into relay logs, apply."""
         now = time.time()
         for rs in self.sets:
             for n in self.sets[rs] + [x for x in self.nodes if self.nodes[x].rs == rs
@@ -199,6 +208,7 @@ class FakeFleet:
 
     # ------------------------------------------------------------- agent HTTP
     def status_body(self, node: FakeNode) -> dict:
+        """The agent's /status body for ``node``."""
         now = time.time()
         src = self.nodes.get(node.source) if node.source else None
         io = None
@@ -348,6 +358,7 @@ class FakeFleet:
         return app
 
     async def start_agents(self, step_interval: float = 0.02) -> dict[str, str]:
+        """Serve one fake agent per node on a free port and start the clock. Returns the URLs."""
         for n, node in self.nodes.items():
             runner = web.AppRunner(self._app(node), access_log=None)
             await runner.setup()
@@ -360,6 +371,7 @@ class FakeFleet:
         return self.urls
 
     async def close(self) -> None:
+        """Stop the clock and every fake agent."""
         self.closing = True
         if self._task:
             self._task.cancel()
@@ -368,6 +380,7 @@ class FakeFleet:
             await r.cleanup()
 
     def overrides(self) -> dict[str, tuple[str, int, str]]:
+        """Addressing overrides pointing the manager at the fake agents."""
         return {n: ("127.0.0.1", 0, u) for n, u in self.urls.items()}
 
 
@@ -381,6 +394,7 @@ class FakeProber:
         self.stopped_io: list[str] = []
 
     async def probe(self, rs: str, node: str) -> ProbeResult:
+        """Probe the simulated primary as MysqlProber would."""
         ts = time.time()
         n = self.fleet.nodes[node]
         if node in self.fleet.manager_cut or n.hung or n.frozen:
@@ -402,6 +416,7 @@ class FakeProber:
         return ProbeResult(ok=True, ts=ts, duration_s=0.001, select_ok=True)
 
     async def stop_io(self, node: str, timeout: float = 3.0) -> str | None:
+        """Stop the node's IO thread."""
         n = self.fleet.nodes[node]
         if not n.responsive:
             return "not responsive"
@@ -410,12 +425,14 @@ class FakeProber:
         return None
 
     async def gtid_waiter(self, node: str, timeout: float = 3.0):
+        """A waiter on the simulated node, None when it is not responsive."""
         n = self.fleet.nodes[node]
         if not n.responsive:
             return None
         return FakeGtidWaiter(n)
 
     async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
+        """The SHOW REPLICA STATUS fields failover reads."""
         n = self.fleet.nodes[node]
         if not n.responsive:
             return None
@@ -428,14 +445,17 @@ class FakeProber:
                 "Retrieved_Gtid_Set": str(n.retrieved), "Executed_Gtid_Set": str(n.executed)}
 
     async def close(self) -> None:
-        pass
+        """Nothing to release."""
 
 
 class FakeGtidWaiter:
+    """WAIT_FOR_EXECUTED_GTID_SET against a simulated node."""
+
     def __init__(self, node: FakeNode):
         self.node = node
 
     async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
+        """Poll the node until it executed ``gtid_set`` or the timeout passed."""
         target = GtidSet.parse(gtid_set)
         end = time.monotonic() + timeout_s
         while True:
@@ -446,4 +466,4 @@ class FakeGtidWaiter:
             await asyncio.sleep(0.005)
 
     async def close(self) -> None:
-        pass
+        """Nothing to release."""

@@ -1,4 +1,11 @@
-"""Per-set state machine. Every change of state is an event."""
+"""Per-set state machine. Every change of state is an event.
+
+The controller moves a set between DISCOVERING, HEALTHY, SUSPECT, FAILING_OVER, DEGRADED,
+REBUILDING and HALTED through ``SetState.to``, which records the event and refuses two moves
+on purpose. HALTED is sticky, only an operator's resume leaves it, because a set halts when
+promoting either way would throw transactions away. HEALTHY needs a known primary, since a set
+once showed HEALTHY while every mysqld was still initialising.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +30,8 @@ _EVENT_FOR = {
 
 
 class SetState:
+    """State, primary, cooldown and failover count of one replica set."""
+
     def __init__(self, rs: str, mode: str, events: EventLog,
                  on_change: Callable[[str, State, State], None] | None = None,
                  clock: Callable[[], float] = time.time):
@@ -44,6 +53,7 @@ class SetState:
 
     @property
     def halted(self) -> bool:
+        """True while a human has to look before anything else happens."""
         return self.state == State.HALTED
 
     def to(self, new: State, note: str | None = None, emit: bool = True, **event_kw) -> bool:
@@ -75,9 +85,11 @@ class SetState:
         return True
 
     def halt(self, reason: str, **event_kw) -> None:
+        """Enter HALTED with ``reason``, recording a halt event."""
         self.to(State.HALTED, note=reason, **event_kw)
 
     def resume(self, note: str | None = None) -> bool:
+        """Leave HALTED for HEALTHY, or DISCOVERING when no primary is known."""
         if self.state != State.HALTED:
             return False
         old = self.state
@@ -95,5 +107,6 @@ class SetState:
         return True
 
     def in_cooldown(self, now: float | None = None) -> bool:
+        """True within ``cooldown_s`` of the last failover, when no new one may start."""
         now = self.clock() if now is None else now
         return self.cooldown_until is not None and now < self.cooldown_until

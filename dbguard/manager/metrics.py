@@ -1,4 +1,9 @@
-"""Prometheus metrics for the manager. One registry per Manager (tests build several)."""
+"""Prometheus metrics for the manager, served at ``/metrics``.
+
+State per set, failovers by outcome and trigger, per-step durations, phantom GTIDs discarded,
+rebuilds, and per-node lag, heartbeat age and semi-sync wait. One registry per Manager, because
+tests build several managers in one process.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,8 @@ _BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 60, 120)
 
 
 class Metrics:
+    """The manager's collectors, on a private registry."""
+
     def __init__(self):
         r = self.registry = CollectorRegistry()
         self.set_state = Gauge("dbguard_set_state", "1 for the current state of the set",
@@ -38,10 +45,12 @@ class Metrics:
                               ["rs"], registry=r)
 
     def state(self, rs: str, state: State) -> None:
+        """Set the one-hot state gauge of ``rs``."""
         for s in State:
             self.set_state.labels(rs=rs, state=s.value).set(1 if s == state else 0)
 
     def observe(self, rs: str, ob: Observation) -> None:
+        """Update the probe and per-node gauges from one poll."""
         if ob.probe is not None:
             self.probe_ok.labels(rs=rs).set(1 if ob.probe.ok else 0)
         for name, nv in ob.nodes.items():
@@ -56,4 +65,5 @@ class Metrics:
                 self.hb_age.labels(rs=rs, node=name).set(nv.heartbeat_age_s)
 
     def render(self) -> bytes:
+        """The Prometheus text exposition."""
         return generate_latest(self.registry)

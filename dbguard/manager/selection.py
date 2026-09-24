@@ -1,4 +1,12 @@
-"""Candidate selection for promotion. Pure, hypothesis-tested (tests/test_selection.py)."""
+"""Failover step 3, choosing the replica to promote. Pure and hypothesis-tested.
+
+The winner is the candidate holding the most transactions, counted over executed plus
+retrieved GTIDs, because with ``AFTER_SYNC`` an acknowledged write is only guaranteed to be in
+some replica's relay log. Every other candidate must hold a subset of the winner's set. If not,
+someone wrote to a replica or an earlier failover went wrong, either choice loses transactions,
+and the set HALTs for a human. A node with no replication configured is never a candidate,
+because its empty set is a subset of everything and would pass the check vacuously.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,8 @@ from dbguard.manager.model import NodeView
 
 @dataclass(frozen=True)
 class Choice:
+    """The outcome of choosing, a winner or the reason there is none."""
+
     winner: str | None
     candidates: list[str]
     excluded: dict[str, str] = field(default_factory=dict)   # node -> why not a candidate
@@ -20,6 +30,7 @@ class Choice:
 
     @property
     def halt_reason(self) -> str | None:
+        """Why the set must HALT, or None when there is a winner."""
         if self.diverged:
             return f"replicas diverged: {self.diverged}"
         if self.winner is None:

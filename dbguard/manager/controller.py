@@ -1,10 +1,11 @@
-"""One replica set: the poll loop, the verdict, and the actions. One asyncio task per set.
+"""One replica set's control loop, the place every failover starts. One asyncio task per set.
 
-The loop observes (bounded), evaluates the detector, and then either fails over or
-reconciles (rejoin, stragglers, degraded, replacement). Slow work (clone rebuilds,
-provisioning a spare) runs as a background maintenance task so detection never pauses
-for it. Actions that change roles hold ``self.lock`` so an API switchover and an
-automatic failover can never interleave.
+Each tick polls every node (one cached task per node, so a dead agent never stretches the
+tick), then either discovers the primary, cold-starts a restarted set, fails over on a DEAD
+verdict, or reconciles (rejoin, second writers, DEGRADED, replacement). Clone rebuilds and
+spare provisioning run as a background maintenance task so detection never pauses for them.
+Everything that changes roles holds ``self.lock``, so an API switchover and an automatic
+failover can never interleave, and a tick that finds the lock taken only observes.
 """
 
 from __future__ import annotations
@@ -16,27 +17,26 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from dbguard.events import Event, EventLog
-from dbguard.gtid import GtidSet
-from dbguard.manager.client import AgentClient
+from dbguard.events import Detect, Event, EventLog
+from dbguard.manager.client import STATUS_TIMEOUT_S, AgentClient
 from dbguard.manager.detector import DetectParams, Verdict, evaluate
 from dbguard.manager.model import NodeView, Observation, State
-from dbguard.manager.client import STATUS_TIMEOUT_S
 from dbguard.manager.probe import Prober, StatusCache, observe
 from dbguard.manager.state import SetState
 
 if TYPE_CHECKING:
-    from dbguard.manager.config import FleetConfig, SetConfig
+    from dbguard.config import FleetConfig, SetConfig
     from dbguard.manager.metrics import Metrics
     from dbguard.manager.replacement import Provisioner
 
 log = structlog.get_logger("dbguard.manager")
 
-ACTION_BACKOFF_S = 10.0     # do not repeat a rejoin action on the same node sooner
 DEGRADED_GRACE_S = 2.0      # a replica may be briefly not-Yes right after a repoint
 
 
 class SetController:
+    """Owns one set's state, poll history and every action taken on it."""
+
     def __init__(self, rs: str, cfg: FleetConfig, scfg: SetConfig, agents: AgentClient,
                  prober: Prober | None, events: EventLog, metrics: Metrics | None = None,
                  provisioner: Provisioner | None = None, mode: str | None = None,
@@ -77,25 +77,30 @@ class SetController:
     # ---------------------------------------------------------------- properties
     @property
     def primary(self) -> str | None:
+        """The node the manager believes is primary, None while discovering or failing over."""
         return self.st.primary
 
     @property
     def configured_replicas(self) -> int:
+        """How many replicas fleet.yaml gives the set, the bar for HEALTHY."""
         return len(self.scfg.nodes) - 1
 
     @property
     def params(self) -> DetectParams:
+        """Detector parameters from the config and this set's mode."""
         return DetectParams(mode=self.mode, detect_window_s=self.cfg.detect_window_s,
                             probe_failures=self.cfg.probe_failures,
                             configured_replicas=self.configured_replicas)
 
     def all_nodes(self) -> list[str]:
+        """Members plus the spare, every node that is polled."""
         out = list(self.members)
         if self.scfg.spare and self.scfg.spare not in out:
             out.append(self.scfg.spare)
         return out
 
     def view(self, node: str) -> NodeView | None:
+        """The node as of the last poll."""
         return self.last_obs.nodes.get(node) if self.last_obs else None
 
     def _on_state(self, rs: str, old: State, new: State) -> None:
@@ -103,18 +108,21 @@ class SetController:
             self.metrics.state(rs, new)
 
     def set_primary(self, node: str | None) -> None:
+        """Adopt a new primary. Detection history is dropped, it was about the old one."""
         self.cache.invalidate()
         self.st.primary = node
         self.history.clear()
         self.verdict = None
 
     def event(self, **kw) -> Event:
+        """Record an event for this set in its mode."""
         self.cache.invalidate()
         kw.setdefault("mode", self.mode)
         return self.events.append(Event(rs=self.rs, **kw))
 
     # ---------------------------------------------------------------- loop
     async def run(self) -> None:
+        """Tick every ``poll_interval_s`` until stopped. A failed tick is logged, not fatal."""
         interval = self.cfg.poll_interval_s
         while not self._stop.is_set():
             t0 = time.monotonic()
@@ -141,6 +149,7 @@ class SetController:
         await self.cache.close()
 
     async def poll(self) -> Observation:
+        """Observe every node and probe the primary. History keeps max(3 windows, 10 s)."""
         ob = await observe(self.rs, self.primary, self.all_nodes(), self.agents, self.prober,
                            cache=self.cache)
         self.last_obs = ob
@@ -153,6 +162,7 @@ class SetController:
         return ob
 
     async def tick(self) -> None:
+        """One poll and at most one decision: discover, cold start, fail over or reconcile."""
         ob = await self.poll()
         if self.st.halted:
             return
@@ -214,6 +224,7 @@ class SetController:
         return True
 
     def whole_set_restart(self, ob: Observation | None = None) -> bool:
+        """The believed primary answers read-only and unfenced, and no member is writable."""
         ob = ob or self.last_obs
         if ob is None or self.primary is None:
             return False
@@ -228,6 +239,10 @@ class SetController:
 
     # ---------------------------------------------------------------- reconcile
     async def reconcile(self, ob: Observation) -> None:
+        """With a live primary, repair what is not a streaming replica and set the state.
+
+        HEALTHY needs every configured replica streaming. Short gaps after a repoint get a
+        grace period before DEGRADED, and a set DEGRADED too long provisions a replacement."""
         from dbguard.manager.rejoin import rejoin_actions
         from dbguard.manager.replacement import maybe_replace
 
@@ -277,6 +292,7 @@ class SetController:
                          source=nv.replica.source_host)
 
     def _check_stall(self, ob: Observation, pv: NodeView | None) -> None:
+        """Record a stall event when writes on the primary stop, and another when they resume."""
         stalled = False
         why = ""
         if pv is not None and pv.usable and self.mode == "dbguard":
@@ -299,11 +315,15 @@ class SetController:
 
     # ---------------------------------------------------------------- helpers
     async def fresh_views(self, nodes: list[str] | None = None) -> dict[str, NodeView]:
+        """Uncached /status of ``nodes`` (default the members), fetched in parallel."""
         nodes = nodes if nodes is not None else self.members
         res = await asyncio.gather(*(self.agents.status(n) for n in nodes))
         return {v.name: v for v in res}
 
     def start_maintenance(self, coro, nodes: list[str]) -> bool:
+        """Run a long action (clone rebuild, replacement) in the background, one at a time.
+
+        Returns False, and closes ``coro``, when one is already running."""
         if self.maint is not None and not self.maint.done():
             coro.close()
             return False
@@ -323,6 +343,7 @@ class SetController:
         return True
 
     def node_busy(self, node: str) -> bool:
+        """True while a maintenance or per-node task is working on ``node``."""
         t = self.node_tasks.get(node)
         return node in self.busy or (t is not None and not t.done())
 
@@ -345,11 +366,13 @@ class SetController:
         return True
 
     def healthy_replicas(self, views: dict[str, NodeView], exclude=()) -> list[str]:
+        """Members streaming from the primary, the only valid clone donors."""
         return [n for n in self.members
                 if n != self.primary and n not in exclude and n in views
                 and views[n].replicating_from(self.primary)]
 
     def status(self) -> dict:
+        """The SetStatus body of docs/INTERFACES.md."""
         nodes = {}
         for n in self.all_nodes():
             nv = self.view(n)
@@ -390,12 +413,7 @@ class SetController:
         }
 
 
-def _detect(v: Verdict):
-    from dbguard.events import Detect
+def _detect(v: Verdict) -> Detect:
+    """The event's detect block from a verdict."""
     return Detect(manager_probe_failed=v.probe_failed, replica_votes=v.replica_votes,
                   replica_total=v.replica_total, duration_s=round(v.detect_s, 3))
-
-
-def primary_gtid(views: dict[str, NodeView], primary: str | None) -> GtidSet | None:
-    pv = views.get(primary) if primary else None
-    return pv.gtid_executed if pv is not None and pv.usable else None

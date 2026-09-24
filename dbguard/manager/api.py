@@ -1,4 +1,10 @@
-"""Manager HTTP API (:9090), the routes of docs/INTERFACES.md."""
+"""Manager HTTP API (:9090), the routes of docs/INTERFACES.md.
+
+Handlers only read a controller's state or call into it. The one with a safety role is
+``GET /v1/sets/{rs}/primary``, which agents ask before trusting that they are primary. It
+answers null during a failover, so a woken old primary fences itself, and 503 ``unknown``
+while discovering, so an agent leaves its state alone instead of reading it as "someone else".
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ MGR: web.AppKey = web.AppKey("mgr")
 
 
 def _ctl(request: web.Request):
+    """The set named in the path, or 404."""
     mgr = request.app[MGR]
     rs = request.match_info["rs"]
     ctl = mgr.sets.get(rs)
@@ -22,6 +29,7 @@ def _ctl(request: web.Request):
 
 
 async def _body(request: web.Request) -> dict:
+    """The JSON body as a dict, {} when absent, 400 when not JSON."""
     if not request.can_read_body:
         return {}
     try:
@@ -33,16 +41,19 @@ async def _body(request: web.Request) -> dict:
 
 
 async def status(request):
+    """GET /v1/status, every set."""
     mgr = request.app[MGR]
     return web.json_response({"mode": mgr.mode,
                               "sets": {rs: c.status() for rs, c in mgr.sets.items()}})
 
 
 async def set_status(request):
+    """GET /v1/sets/{rs}."""
     return web.json_response(_ctl(request).status())
 
 
 async def set_primary(request):
+    """GET /v1/sets/{rs}/primary, asked by agents' wake guard and lease."""
     ctl = _ctl(request)
     # Mid-failover the old primary is still ctl.primary until the promote step. A woken
     # node asking now must not be told it is the primary, so answer null.
@@ -56,10 +67,12 @@ async def set_primary(request):
 
 
 async def set_doctor(request):
+    """GET /v1/sets/{rs}/doctor."""
     return web.json_response(doctor(_ctl(request)))
 
 
 async def set_failover(request):
+    """POST /v1/sets/{rs}/failover, a planned switchover. 409 when refused."""
     from dbguard.manager.switchover import SwitchoverError, switchover
     ctl = _ctl(request)
     body = await _body(request)
@@ -71,6 +84,7 @@ async def set_failover(request):
 
 
 async def set_halt(request):
+    """POST /v1/sets/{rs}/halt."""
     ctl = _ctl(request)
     body = await _body(request)
     ctl.st.halt(body.get("reason") or "halted by operator")
@@ -78,6 +92,7 @@ async def set_halt(request):
 
 
 async def set_resume(request):
+    """POST /v1/sets/{rs}/resume. Detection history and backoffs start over."""
     ctl = _ctl(request)
     ctl.st.resume()
     ctl.history.clear()
@@ -86,6 +101,7 @@ async def set_resume(request):
 
 
 async def set_rejoin(request):
+    """POST /v1/sets/{rs}/rejoin, rejoin one node now. A rebuild runs in the background."""
     from dbguard.manager.rejoin import needs_rejoin, rejoin_node
     ctl = _ctl(request)
     body = await _body(request)
@@ -109,6 +125,7 @@ async def set_rejoin(request):
 
 
 async def events(request):
+    """GET /v1/events, filtered by ``rs`` and ``since``."""
     mgr = request.app[MGR]
     rs = request.query.get("rs") or None
     since = request.query.get("since")
@@ -122,6 +139,7 @@ async def events(request):
 
 
 async def metrics(request):
+    """GET /metrics."""
     mgr = request.app[MGR]
     for rs, c in mgr.sets.items():
         mgr.metrics.state(rs, c.st.state)
@@ -130,10 +148,12 @@ async def metrics(request):
 
 
 async def health(request):
+    """GET /health."""
     return web.json_response({"ok": True})
 
 
 def make_app(mgr) -> web.Application:
+    """The aiohttp application serving ``mgr``."""
     app = web.Application()
     app[MGR] = mgr
     app.add_routes([

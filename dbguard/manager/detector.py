@@ -1,22 +1,13 @@
-"""Holistic failure detection. A pure function of recent observations.
+"""Failure detection, the first decision of a failover, as a pure function of recent polls.
 
-The design follows orchestrator's split between DeadMaster and UnreachableMaster: the
-manager's own failed probe is only half the evidence, the other half is what the
-replicas see. A primary is DEAD only when both hold, continuously, for detect_window_s:
-
-1. The manager's probe (``SELECT 1`` and a heartbeat WRITE) failed ``probe_failures``
-   consecutive times. It must be a write. A primary cut off from its replicas still
-   answers ``SELECT 1``, but with semi-sync its commits block waiting for an ack, so only
-   a write notices (Experiment 3).
-2. Strictly more than half of the witnesses, and at least one, vote that they lost the
-   primary. A witness is a replica the manager can reach that is configured to replicate
-   from the primary. A vote means its IO thread is not running, its agent cannot TCP
-   connect to the primary, or its heartbeat row is older than detect_window_s. Zero
-   witnesses means nobody can confirm, and the verdict stays SUSPECT.
-
-(1) without (2) is SUSPECT: the manager is probably the partitioned one (Experiment 4),
-and the correct action is none. (2) without (1) is logged and left alone. Naive mode
-decides from (1) alone, which is exactly what makes it false-fail over.
+A primary is DEAD only when two things hold continuously for ``detect_window_s``. The
+manager's probe (``SELECT 1`` plus a write, since a primary cut off from its replicas still
+answers reads) failed ``probe_failures`` times, and a strict majority of witnesses vote it gone.
+Witnesses are replicas the manager can reach that replicate from this primary, because a node
+following someone else, like the fenced old primary, knows nothing about it. A heartbeat row
+is read after the replica applied it, so apply lag is subtracted from its age before it votes.
+Probe failure alone is SUSPECT (the manager is probably the one cut off) and does nothing.
+Naive mode decides from the probe alone, which is what makes it fail over falsely.
 """
 
 from __future__ import annotations
@@ -27,11 +18,14 @@ from dataclasses import dataclass, field
 from dbguard.manager.model import NodeView, Observation
 
 
+# A heartbeat row older than this many windows is left over from before a whole-set restart.
 HEARTBEAT_VOTE_MAX_WINDOWS = 10
 
 
 @dataclass(frozen=True)
 class DetectParams:
+    """The fleet.yaml knobs the detector reads."""
+
     mode: str = "dbguard"
     detect_window_s: float = 5.0
     probe_failures: int = 3
@@ -40,6 +34,8 @@ class DetectParams:
 
 @dataclass(frozen=True)
 class Verdict:
+    """The detector's answer for one set, with the evidence the event and doctor report."""
+
     kind: str                     # OK | SUSPECT | DEAD | REPLICAS_ONLY | NO_PRIMARY
     primary: str | None = None
     probe_failed: bool = False
@@ -57,6 +53,7 @@ class Verdict:
 
     @property
     def dead(self) -> bool:
+        """True when the controller should start a failover."""
         return self.kind == "DEAD"
 
 
@@ -114,6 +111,10 @@ def classify_trigger(pv: NodeView | None) -> str:
 
 def evaluate(history: Sequence[Observation], members: Sequence[str], p: DetectParams,
              now: float | None = None) -> Verdict:
+    """Judge the believed primary from the poll history, newest last.
+
+    Both the probe streak and the witness majority are measured back from the newest
+    observation, so each must have held without a gap for the window."""
     if not history:
         return Verdict(kind="OK")
     last = history[-1]
@@ -144,6 +145,7 @@ def evaluate(history: Sequence[Observation], members: Sequence[str], p: DetectPa
     # replica's broken IO thread plus a manager partition is enough to fail over. Zero
     # witnesses means nobody can confirm, so the verdict stays SUSPECT.
     def votes_at(ob: Observation) -> tuple[int, int, dict[str, list[str]]]:
+        """Votes, witness count and each voter's reasons in one observation."""
         rs: dict[str, list[str]] = {}
         witnesses = 0
         for m in replicas:
@@ -157,6 +159,7 @@ def evaluate(history: Sequence[Observation], members: Sequence[str], p: DetectPa
         return len(rs), witnesses, rs
 
     def has_quorum(votes: int, witnesses: int) -> bool:
+        """A strict majority of at least one witness."""
         return witnesses > 0 and votes >= 1 and votes * 2 > witnesses
 
     votes, witnesses, reasons = votes_at(last)

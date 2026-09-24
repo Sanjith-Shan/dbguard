@@ -1,17 +1,13 @@
-"""Bringing nodes back under the current primary.
+"""Rejoin, the step after a failover, bringing the old primary and any straggler back.
 
-Covers the former primary coming back and any straggler replicating from the wrong
-source (or not at all). The rule is the last paragraph of the 2014 GTID post:
-
-- the node's gtid_executed is a subset of the primary's: it has nothing the primary
-  lacks, so repoint it with SOURCE_AUTO_POSITION=1;
-- otherwise it holds transactions the primary never received. With AFTER_SYNC those
-  were never acknowledged to a client and must not survive: rebuild it with the clone
-  plugin from a healthy replica (never from the primary, to keep primary I/O clean),
-  then repoint. The count of discarded GTIDs is recorded.
-
-``rejoin: manual`` records that a node wants to rejoin and does nothing else, except
-fencing a node that is writable while it is not the primary, which is always done.
+The choice is exact and made by GTID_SUBSET. A node whose gtid_executed is a subset of the
+primary's has nothing the primary lacks and is repointed with SOURCE_AUTO_POSITION=1, with no
+data copy. Otherwise the difference is phantoms, transactions crash recovery committed that no
+client was told about, and the node is rebuilt by clone and the count recorded. The donor is
+always a healthy replica, never the primary, because a clone reads the whole dataset and
+blocks DDL on the donor, and a clone from a primary stalled on semi-sync never finished.
+``rejoin: manual`` only records the need, but a node writable while it is not the primary is
+fenced in every mode except naive, which records the split brain instead.
 """
 
 from __future__ import annotations
@@ -32,8 +28,9 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger("dbguard.manager.rejoin")
 
-REBUILD_TIMEOUT_S = 1800.0
-RESTART_WAIT_S = 180.0
+RETRY_BACKOFF_S = 10.0       # do not repeat a rejoin action on the same node sooner
+REBUILD_TIMEOUT_S = 1800.0   # a clone takes as long as the data does
+RESTART_WAIT_S = 180.0       # mysqld restarts after a clone before it can be repointed
 
 
 def needs_rejoin(nv: NodeView, primary: str) -> str | None:
@@ -51,6 +48,9 @@ def needs_rejoin(nv: NodeView, primary: str) -> str | None:
 
 
 async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
+    """After a poll, fence second writers and start a rejoin for every member that needs one.
+
+    Each node is retried at most every 10 s, and a node with a task already running is skipped."""
     primary = ctl.primary
     pv = ob.nodes.get(primary) if primary else None
     if pv is None or not pv.usable:
@@ -82,7 +82,7 @@ async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
             continue
         if ctl.backoff.get(n, 0) > now:
             continue
-        ctl.backoff[n] = now + 10.0
+        ctl.backoff[n] = now + RETRY_BACKOFF_S
         if ctl.rejoin_mode == "manual":
             if n not in ctl.manual_noted:
                 ctl.manual_noted.add(n)
@@ -96,6 +96,7 @@ async def rejoin_actions(ctl: SetController, ob: Observation) -> None:
 
 
 async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> None:
+    """Fence a node that is writable while another is primary, and record it."""
     log.error("second writable node, fencing", rs=ctl.rs, node=n, primary=primary)
     try:
         await ctl.agents.post(n, "/fence", timeout=ctl.cfg.fence_deadline_s)
@@ -108,6 +109,9 @@ async def fence_second_writer(ctl: "SetController", n: str, primary: str) -> Non
 
 async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
                       why: str = "operator request", wait: bool = False) -> Event | None:
+    """Repoint ``n`` if it holds nothing the primary lacks, else rebuild it from a replica.
+
+    A rebuild runs in the background unless ``wait`` is set, and then returns no event."""
     primary = ctl.primary
     phantom = nv.gtid_executed - pv.gtid_executed
     if phantom.is_empty:
@@ -127,7 +131,7 @@ async def rejoin_node(ctl: SetController, n: str, nv: NodeView, pv: NodeView,
     if not donors:
         log.warning("rebuild needed but no healthy replica to clone from", rs=ctl.rs, node=n,
                     phantom=phantom.count())
-        ctl.backoff[n] = time.time() + 10.0
+        ctl.backoff[n] = time.time() + RETRY_BACKOFF_S
         return None
     donor = donors[0]
     coro = rebuild_and_join(ctl, n, donor, phantom_count=phantom.count(), phantom=str(phantom),

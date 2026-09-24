@@ -1,4 +1,10 @@
-"""How the manager reaches nodes: addressing and the agent HTTP client."""
+"""How the manager reaches nodes, the addressing and the agent HTTP client.
+
+The manager never changes a node's role over SQL. Fence, promote, repoint and rebuild are all
+requests to that node's agent, made here. Every call is bounded, so a hung agent costs at most
+its timeout. Role changes are retried once when the agent reports a lost MySQL link, because a
+fence on that node kills pooled connections and each role change is idempotent.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ class Addressing:
     host_ports: bool = False
 
     def mysql_addr(self, node: str) -> tuple[str, int]:
+        """(host, port) of ``node``'s mysqld as seen from the manager."""
         if node in self.overrides:
             h, p, _ = self.overrides[node]
             return h, p
@@ -45,6 +52,7 @@ class Addressing:
         return node, self.mysql_port
 
     def agent_url(self, node: str) -> str:
+        """Base URL of ``node``'s agent as seen from the manager."""
         if node in self.overrides:
             return self.overrides[node][2]
         if self.host_ports and (pp := published_ports(node)):
@@ -53,6 +61,7 @@ class Addressing:
 
     @staticmethod
     def parse_map(text: str | None) -> dict[str, tuple[str, int, str]]:
+        """Parse ``DBGUARD_HOST_MAP`` into node -> (host, mysql port, agent URL)."""
         out = {}
         for item in (text or "").split(","):
             item = item.strip()
@@ -66,6 +75,7 @@ class Addressing:
     @classmethod
     def from_env(cls, agent_port: int, mysql_port: int, host_ports: bool = False,
                  env: dict | None = None) -> Addressing:
+        """Addressing from the config ports plus ``DBGUARD_HOST_MAP`` and ``DBGUARD_HOST_PORTS``."""
         e = os.environ if env is None else env
         return cls(agent_port=agent_port, mysql_port=mysql_port,
                    overrides=cls.parse_map(e.get("DBGUARD_HOST_MAP")),
@@ -76,6 +86,7 @@ _NODE_RE = re.compile(r"^mysql-([a-z])(\d)$")
 
 
 def published_ports(node: str) -> tuple[int, int] | None:
+    """(mysqld, agent) host ports of a node by the compose pattern, mysql-a1 is 13311, 18011."""
     m = _NODE_RE.match(node)
     if not m:
         return None
@@ -95,10 +106,13 @@ LOST_LINK_CODES = (2006, 2013)
 
 
 class AgentError(Exception):
+    """An agent call failed. ``status`` and ``body`` are set when the agent answered."""
+
     def __init__(self, node: str, path: str, msg: str, status: int | None = None,
                  body: Any = None, timeout: bool = False):
         super().__init__(f"{node} {path}: {msg}")
-        self.node, self.path, self.status, self.body, self.timeout = node, path, status, body, timeout
+        self.node, self.path, self.status = node, path, status
+        self.body, self.timeout = body, timeout
 
 
 class AgentClient:
@@ -110,6 +124,7 @@ class AgentClient:
         self._session: aiohttp.ClientSession | None = None
 
     async def session(self) -> aiohttp.ClientSession:
+        """The shared HTTP session, created on first use."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=0, force_close=False,
@@ -118,10 +133,12 @@ class AgentClient:
         return self._session
 
     async def close(self) -> None:
+        """Close the HTTP session."""
         if self._session and not self._session.closed:
             await self._session.close()
 
     async def status(self, node: str, timeout: float | None = None) -> NodeView:
+        """The agent's /status as a NodeView. Never raises, failure is an unreachable view."""
         t = timeout or self.status_timeout_s
         try:
             body = await self.request("GET", node, "/status", timeout=t)
@@ -131,6 +148,7 @@ class AgentClient:
 
     async def request(self, method: str, node: str, path: str, body: Any = None,
                       timeout: float = 5.0) -> Any:
+        """One JSON request. Any failure, HTTP 4xx and 5xx included, raises AgentError."""
         url = self.addr.agent_url(node) + path
         s = await self.session()
         try:

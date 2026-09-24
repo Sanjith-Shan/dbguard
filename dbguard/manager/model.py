@@ -1,4 +1,11 @@
-"""Plain data the manager reasons over. No I/O here."""
+"""Plain data the manager reasons over, with no I/O.
+
+Each poll turns every agent's ``/status`` JSON into a ``NodeView``, and one poll of a set is an
+``Observation``. The detector, selection and the controller read only these, which is what lets
+tests/test_manager_sim.py drive whole failovers without MySQL. The one derived value that
+matters is ``NodeView.have``, the union of executed and retrieved GTIDs, because a replica's
+retrieved set alone is reset by every repoint and would pick the wrong failover winner.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +18,9 @@ from dbguard.gtid import GtidSet
 
 
 class State(str, enum.Enum):
-    DISCOVERING = "DISCOVERING"   # initial: no primary found yet (fleet starting, manager just started)
+    """A replica set's state, as served in SetStatus. docs/DESIGN.md section 5 has the rules."""
+
+    DISCOVERING = "DISCOVERING"   # no primary found yet (fleet starting, manager just started)
     HEALTHY = "HEALTHY"
     SUSPECT = "SUSPECT"
     FAILING_OVER = "FAILING_OVER"
@@ -21,6 +30,7 @@ class State(str, enum.Enum):
 
 
 def _gs(v: Any) -> GtidSet:
+    """Parse a GTID set from JSON, empty when missing or unparseable."""
     try:
         return GtidSet.parse(v) if v else GtidSet()
     except ValueError:
@@ -29,6 +39,8 @@ def _gs(v: Any) -> GtidSet:
 
 @dataclass(frozen=True)
 class ReplicaView:
+    """The ``replica`` object of an agent's /status, with GTID sets parsed."""
+
     configured: bool = False
     source_host: str | None = None
     io_running: str | None = None
@@ -41,6 +53,7 @@ class ReplicaView:
 
     @classmethod
     def from_json(cls, d: dict | None) -> ReplicaView:
+        """Build from the agent's JSON, tolerating a missing object."""
         d = d or {}
         return cls(
             configured=bool(d.get("configured")),
@@ -57,6 +70,8 @@ class ReplicaView:
 
 @dataclass(frozen=True)
 class SemisyncView:
+    """The ``semisync`` object of an agent's /status."""
+
     source_enabled: bool = False
     replica_enabled: bool = False
     source_status: bool = False
@@ -68,6 +83,7 @@ class SemisyncView:
 
     @classmethod
     def from_json(cls, d: dict | None) -> SemisyncView:
+        """Build from the agent's JSON, coercing each field to its default's type."""
         d = d or {}
         kw = {}
         for k, f in cls.__dataclass_fields__.items():
@@ -98,10 +114,12 @@ class NodeView:
 
     @classmethod
     def unreachable(cls, name: str, error: str, ts: float | None = None) -> NodeView:
+        """A node whose agent did not answer, with the reason."""
         return cls(name=name, ts=ts or time.time(), reachable=False, error=error)
 
     @classmethod
     def from_status(cls, name: str, d: dict, ts: float | None = None) -> NodeView:
+        """A node from its agent's /status body."""
         hb = d.get("heartbeat") or {}
         return cls(
             name=name,
@@ -128,6 +146,7 @@ class NodeView:
 
     @property
     def writable(self) -> bool:
+        """Accepting writes, answering, super_read_only off and not fenced."""
         return self.usable and self.super_read_only is False and not self.fenced
 
     @property
@@ -143,9 +162,11 @@ class NodeView:
 
     @property
     def relay_applied(self) -> bool:
+        """Every retrieved transaction has been applied (the catch-up condition)."""
         return self.replica.retrieved.is_subset(self.gtid_executed | self.replica.executed)
 
     def replicating_from(self, primary: str | None) -> bool:
+        """Streaming from ``primary`` with both threads Yes, which HEALTHY requires."""
         r = self.replica
         return (
             self.usable
@@ -158,6 +179,7 @@ class NodeView:
 
     @property
     def role(self) -> str:
+        """The SetStatus role word, down, fenced, primary or replica."""
         if not self.usable:
             return "down"
         if self.fenced:
@@ -168,6 +190,7 @@ class NodeView:
 
     @property
     def semisync_word(self) -> str:
+        """Which semi-sync side is on, for SetStatus."""
         if self.semisync.source_enabled:
             return "source"
         if self.semisync.replica_enabled:
@@ -188,6 +211,7 @@ class ProbeResult:
 
     @property
     def write_stalled(self) -> bool:
+        """SELECT 1 answered but the write timed out, the signature of a semi-sync stall."""
         return self.select_ok and not self.ok and self.kind == "timeout"
 
 
@@ -199,6 +223,3 @@ class Observation:
     primary: str | None
     probe: ProbeResult | None
     nodes: dict[str, NodeView]
-
-    def replicas(self, members: list[str]) -> list[NodeView]:
-        return [self.nodes[n] for n in members if n != self.primary and n in self.nodes]

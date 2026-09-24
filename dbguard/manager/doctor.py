@@ -1,4 +1,11 @@
-"""`dbgctl doctor <set>`: the set's state in sentences, and what a human should do."""
+"""``dbgctl doctor <set>``, the set's state in sentences and what a human should do next.
+
+It re-runs the detector and candidate selection on the latest poll without acting, so it can
+say what the manager would do if the current evidence held, then lists every other node with
+its GTID gap from the primary (``GTID_SUBTRACT``). A node holding transactions the primary never
+had is called out as needing a rebuild, the same rule rejoin applies. A HALTED set gets the
+next step matched to its halt reason, following docs/RUNBOOK.md.
+"""
 
 from __future__ import annotations
 
@@ -17,10 +24,12 @@ VERDICT_WORD = {"OK": "HEALTHY", "SUSPECT": "SUSPECT", "DEAD": "FAILED",
 
 
 def _plural(n: int, word: str) -> str:
+    """``1 replica``, ``2 replicas``."""
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def next_step_for(reason: str, rs: str) -> str:
+    """The operator's next step for a halt reason."""
     r = reason.lower()
     if "diverged" in r:
         return (f"Next: compare the GTID gaps below, decide whose transactions to keep, "
@@ -43,6 +52,7 @@ def next_step_for(reason: str, rs: str) -> str:
 
 
 def doctor(ctl: SetController, now: float | None = None) -> dict:
+    """The doctor body of docs/INTERFACES.md, ``lines``, ``verdict`` and per-node ``gaps``."""
     now = now or time.time()
     rs = ctl.rs
     ob = ctl.last_obs
