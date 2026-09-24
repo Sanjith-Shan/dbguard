@@ -1,7 +1,13 @@
-"""The agent's logic: role changes, fence, status, heartbeat, wake guard.
+"""The agent's logic, the only code that changes its node's role (HTTP lives in http.py).
 
-HTTP lives in http.py. This module takes its SQL layer, its mysqld supervisor and its
-manager client as constructor arguments so the unit tests can replace all three.
+The fence flag file is written before any SQL, because the SQL may never return, and it
+survives restarts. When the SET cannot finish, mysqld is killed and its restart held for 20 s,
+so the dead primary cannot serve its unacked binlog tail. The self-fence lease fences a primary
+that has lost both the manager and every semi-sync replica before the one-hour semi-sync
+timeout can fall back to async. ``/primary`` answers HAProxy from memory (the flag plus a
+100 ms sample of super_read_only), so a hung mysqld fails it by staleness, never by a stuck
+query. The wake guard asks the manager who is primary after a freeze. SQL layer, supervisor
+and manager client are constructor arguments so the unit tests replace all three.
 """
 
 from __future__ import annotations
@@ -53,6 +59,8 @@ CLONE_NOT_SUPERVISED = 3707
 
 
 class AgentError(Exception):
+    """A request failed. ``status`` is the HTTP answer and ``extra`` joins its body."""
+
     def __init__(self, msg: str, status: int = 500, **extra: Any):
         super().__init__(msg)
         self.status = status
@@ -60,6 +68,7 @@ class AgentError(Exception):
 
 
 def _b(v: Any) -> bool | None:
+    """A MySQL boolean (1, ON, YES) as bool, None for NULL."""
     if v is None:
         return None
     if isinstance(v, str):
@@ -68,6 +77,7 @@ def _b(v: Any) -> bool | None:
 
 
 def _i(v: Any) -> int | None:
+    """An int, or None for NULL, '' and junk."""
     if v is None or v == "":
         return None
     try:
@@ -77,6 +87,7 @@ def _i(v: Any) -> int | None:
 
 
 def _gtid(v: Any) -> str | None:
+    """A GTID set with the server's line breaks removed."""
     if v is None:
         return None
     if isinstance(v, bytes):
@@ -85,6 +96,7 @@ def _gtid(v: Any) -> str | None:
 
 
 def _s(v: Any) -> str | None:
+    """A string, None for NULL and ''."""
     if v is None or v == "":
         return None
     return v.decode() if isinstance(v, bytes) else str(v)
@@ -95,6 +107,7 @@ class ManagerUnknown(Exception):
 
 
 async def default_manager_get(url: str, timeout: float) -> dict[str, Any]:
+    """GET the manager's /v1/sets/<rs>/primary. A 503 raises ManagerUnknown."""
     import aiohttp
 
     async with (aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s,
@@ -107,6 +120,7 @@ async def default_manager_get(url: str, timeout: float) -> dict[str, Any]:
 
 
 async def tcp_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if a TCP connection to host:port opens within ``timeout``."""
     try:
         _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
         w.close()
@@ -116,6 +130,8 @@ async def tcp_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
 
 
 class Agent:
+    """One node's agent. Owns the fence flag, the role changes and the guards."""
+
     def __init__(self, settings: AgentSettings, db: Database, supervisor: Any, *,
                  manager_get: ManagerGet | None = None,
                  donor_db: Callable[[str], Database] | None = None,
@@ -156,6 +172,7 @@ class Agent:
     # ------------------------------------------------------------------ helpers
 
     def _default_donor_db(self, host: str) -> Database:
+        """A connection factory for the clone donor's mysqld."""
         return MySQL(host, self.s.source_port, self.s.mysql_user, self.s.mysql_password,
                      fallback=("root", self.s.root_password) if self.s.root_password else None,
                      default_timeout=self.s.sql_timeout_s)
@@ -175,11 +192,13 @@ class Agent:
 
     async def _role_sql(self, sess: Session, sql: str, args: Any = None,
                         timeout: float | None = None) -> int:
+        """Run one logged role-change statement, remembering it as the current step."""
         self._step = sql
         return await sess.execute(sql, args, timeout=timeout or self.s.role_change_timeout_s,
                                   log_sql=True)
 
     def _write_fence_file(self) -> None:
+        """Persist the flag durably, temp file, fsync, rename, fsync the directory."""
         os.makedirs(self.s.state_dir, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".fenced.", dir=self.s.state_dir)
         try:
@@ -201,6 +220,7 @@ class Agent:
             raise
 
     def _set_fenced(self, value: bool) -> None:
+        """Set or clear the fence flag, on disk first when setting."""
         if value:
             self._write_fence_file()
         else:
@@ -215,12 +235,14 @@ class Agent:
         log.info("fence_flag", fenced=value, file=self.s.fence_file)
 
     def _set_role(self, role: str) -> None:
+        """Record the role for logs and the role gauge."""
         if role != self._role:
             log.info("role", role=role, previous=self._role)
         self._role = role
         self.m.set_role(role)
 
     def mysqld_alive(self) -> bool | None:
+        """Whether the supervised mysqld process runs, None when not supervised."""
         return self.sup.alive
 
     # ------------------------------------------------------------------ /primary
@@ -236,6 +258,7 @@ class Agent:
             self.m.primary_check.observe(time.perf_counter() - t0)
 
     def _primary_answer(self) -> tuple[int, dict[str, str]]:
+        """The /primary decision, fence flag first, then startup, wake guard and sample age."""
         if self.fenced:
             return 503, {"role": "fenced"}
         if not self.startup_done.is_set() or self.rebuilding:
@@ -261,6 +284,7 @@ class Agent:
     # ------------------------------------------------------------------ /primary sampler
 
     def invalidate_primary_sample(self) -> None:
+        """Forget the sample so /primary answers unknown until a new one."""
         self._primary_sample = None
 
     async def refresh_primary_sample(self) -> bool:
@@ -283,6 +307,7 @@ class Agent:
                 return False
 
     async def _primary_refresher(self) -> None:
+        """Sample super_read_only every ``primary_sample_interval_s`` for /primary."""
         while not self._stopping:
             await self.refresh_primary_sample()
             await asyncio.sleep(self.s.primary_sample_interval_s)
@@ -290,6 +315,9 @@ class Agent:
     # ------------------------------------------------------------------ /status
 
     async def status(self) -> dict[str, Any]:
+        """GET /status, every key of docs/INTERFACES.md, null when not collected in time.
+
+        One deadline covers the whole handler, and the source TCP probe runs beside the SQL."""
         out: dict[str, Any] = {
             "node": self.s.node, "rs": self.s.rs, "ts": time.time(),
             "mysqld_alive": None, "mysqld_responsive": False, "mysqld_pid": self.sup.pid,
@@ -415,60 +443,28 @@ class Agent:
     # ------------------------------------------------------------------ /fence
 
     async def fence(self, reason: str = "api") -> tuple[int, dict[str, Any]]:
+        """POST /fence, the fence sequence of docs/DESIGN.md section 4, in its order.
+
+        The flag goes first because the SQL may never return. A frozen mysqld executes
+        nothing, and a primary cut off from its replicas has sessions waiting for an ack
+        that the SET queues behind, so a partitioned primary is fenced by the kill path."""
         async with self._fence_lock:
             t0 = time.monotonic()
-            self._set_fenced(True)  # FIRST: /primary answers 503 from here on
-            deadline = t0 + self.s.fence_deadline_s
-            # The agent's own pooled and heartbeat links are closed, not killed.
-            self.db_drop_idle()
-            if self._hb_session is not None:
-                self._hb_session.close()
-            method = "sql"
-            killed = 0
-            gtid: str | None = None
-            error: str | None = None
-            sess: Session | None = None
-            try:
-                sess = await self.db.connect(timeout=max(0.05, deadline - time.monotonic()))
-                await sess.execute("SET GLOBAL super_read_only=1",
-                                   timeout=max(0.05, deadline - time.monotonic()), log_sql=True)
-            except DbError as e:
-                error = str(e)
-                method = "kill"
-                if sess is not None:
-                    sess.close()
-                sess = None
-            if method == "sql":
-                assert sess is not None
-                await self.refresh_primary_sample()
-                try:
-                    killed = await self._kill_clients(sess)
-                    rows = await sess.query("SELECT @@GLOBAL.gtid_executed AS g",
-                                            timeout=self.s.sql_timeout_s)
-                    gtid = _gtid(rows[0]["g"])
-                except DbError as e:
-                    log.warning("fence_post_set_error", error=str(e))
-                finally:
-                    sess.close()
+            # 1. The flag file. /primary answers 503 from here on, whatever the SQL does.
+            self._set_fenced(True)
+            # 2. Close our own links, then super_read_only=1 within the fence deadline.
+            sess, error = await self._fence_set_read_only(t0 + self.s.fence_deadline_s)
+            killed, gtid = 0, None
+            if sess is not None:
+                # 3. The SET returned. Kill client threads, read the final gtid_executed.
+                method = "sql"
+                killed, gtid = await self._fence_after_set(sess)
             else:
-                # Hold the restart so the dead primary does not come back and serve its
-                # unacked binlog tail to replicas that are not repointed yet (review #4).
-                self.sup.hold(self.s.restart_hold_s)
-                self.invalidate_primary_sample()
-                pid = self.sup.kill(signal.SIGKILL)
-                if pid is None:
-                    # Nothing to kill: either mysqld is already gone, or we do not own it.
-                    if self.sup.supervised and not self.sup.alive:
-                        log.warning("fence_mysqld_already_down", error=error)
-                    else:
-                        dur = round((time.monotonic() - t0) * 1000, 2)
-                        self.m.fences.labels(method="failed").inc()
-                        log.error("fence_failed", reason=reason, error=error, duration_ms=dur)
-                        return 500, {"fenced": True, "method": "failed", "gtid_executed": None,
-                                     "duration_ms": dur, "killed_threads": 0, "error": error}
-                else:
-                    await self.sup.wait_exit(1.0)
-                self.db_drop_idle()
+                # 4. It did not. SIGKILL mysqld and hold its restart.
+                method = "kill"
+                failed = await self._fence_kill_mysqld(reason, error, t0)
+                if failed is not None:
+                    return failed
             dur = round((time.monotonic() - t0) * 1000, 2)
             self.m.fences.labels(method=method).inc()
             log.info("fence", reason=reason, method=method, duration_ms=dur,
@@ -476,7 +472,64 @@ class Agent:
             return 200, {"fenced": True, "method": method, "gtid_executed": gtid,
                          "duration_ms": dur, "killed_threads": killed}
 
+    async def _fence_set_read_only(self, deadline: float) -> tuple[Session | None, str | None]:
+        """Fence step 2. Returns the session that ran the SET, or None and the error."""
+        # The agent's own pooled and heartbeat links are closed, not killed.
+        self.db_drop_idle()
+        if self._hb_session is not None:
+            self._hb_session.close()
+        sess: Session | None = None
+        try:
+            sess = await self.db.connect(timeout=max(0.05, deadline - time.monotonic()))
+            await sess.execute("SET GLOBAL super_read_only=1",
+                               timeout=max(0.05, deadline - time.monotonic()), log_sql=True)
+            return sess, None
+        except DbError as e:
+            if sess is not None:
+                sess.close()
+            return None, str(e)
+
+    async def _fence_after_set(self, sess: Session) -> tuple[int, str | None]:
+        """Fence step 3. Returns (killed client threads, final gtid_executed), closing ``sess``."""
+        killed, gtid = 0, None
+        await self.refresh_primary_sample()
+        try:
+            killed = await self._kill_clients(sess)
+            rows = await sess.query("SELECT @@GLOBAL.gtid_executed AS g",
+                                    timeout=self.s.sql_timeout_s)
+            gtid = _gtid(rows[0]["g"])
+        except DbError as e:
+            log.warning("fence_post_set_error", error=str(e))
+        finally:
+            sess.close()
+        return killed, gtid
+
+    async def _fence_kill_mysqld(self, reason: str, error: str | None,
+                                 t0: float) -> tuple[int, dict[str, Any]] | None:
+        """Fence step 4. SIGKILL mysqld with a restart hold. Returns the 500 answer when
+        there is nothing to kill because the agent does not own mysqld, else None."""
+        # Hold the restart so the dead primary does not come back and serve its
+        # unacked binlog tail to replicas that are not repointed yet (review #4).
+        self.sup.hold(self.s.restart_hold_s)
+        self.invalidate_primary_sample()
+        pid = self.sup.kill(signal.SIGKILL)
+        if pid is None:
+            # Nothing to kill: either mysqld is already gone, or we do not own it.
+            if self.sup.supervised and not self.sup.alive:
+                log.warning("fence_mysqld_already_down", error=error)
+            else:
+                dur = round((time.monotonic() - t0) * 1000, 2)
+                self.m.fences.labels(method="failed").inc()
+                log.error("fence_failed", reason=reason, error=error, duration_ms=dur)
+                return 500, {"fenced": True, "method": "failed", "gtid_executed": None,
+                             "duration_ms": dur, "killed_threads": 0, "error": error}
+        else:
+            await self.sup.wait_exit(1.0)
+        self.db_drop_idle()
+        return None
+
     async def _kill_clients(self, sess: Session) -> int:
+        """KILL every client thread except replication and system accounts."""
         rows = await sess.query(CLIENT_THREADS_SQL,
                                 ((self.s.repl_user,) + PROTECTED_USERS,),
                                 timeout=self.s.sql_timeout_s, log_sql=True)
@@ -493,11 +546,13 @@ class Agent:
         return killed
 
     def db_drop_idle(self) -> None:
+        """Close the pooled idle connections, which a fence or restart has made stale."""
         drop = getattr(self.db, "drop_idle", None)
         if drop:
             drop()
 
     async def unfence(self) -> dict[str, Any]:
+        """POST /unfence. Clears the flag only, read_only is unchanged."""
         async with self._fence_lock:
             self._set_fenced(False)
         return {"fenced": False}
@@ -532,9 +587,11 @@ class Agent:
             raise AgentError("deadline", status=504, step=self._step) from e
 
     async def promote(self) -> dict[str, Any]:
+        """POST /promote under the role-change deadline."""
         return await self._deadlined("promote", self._promote)
 
     async def _promote(self) -> dict[str, Any]:
+        """Replica to primary. Semi-sync source on before writable, and writable last."""
         async with self._role_lock:
             t0 = time.monotonic()
             await self._end_restart_hold("promote")
@@ -566,11 +623,13 @@ class Agent:
             return {"gtid_executed": gtid, "duration_ms": dur}
 
     async def repoint(self, source: str) -> dict[str, Any]:
+        """POST /repoint under the role-change deadline."""
         if not source or source == self.s.node:
             raise AgentError(f"bad source {source!r}", status=400)
         return await self._deadlined("repoint", lambda: self._repoint(source))
 
     async def _repoint(self, source: str) -> dict[str, Any]:
+        """Become a read-only semi-sync replica of ``source`` with auto-positioning."""
         async with self._role_lock:
             t0 = time.monotonic()
             await self._end_restart_hold("repoint")
@@ -598,6 +657,7 @@ class Agent:
             return {"ok": True, "duration_ms": dur}
 
     def guard_toggles(self) -> dict[str, bool]:
+        """The runtime switches of the self-fence lease and the wake guard."""
         return {"self_fence": self.self_fence_on, "wake_guard": self.wake_guard_on}
 
     async def configure(self, semisync: bool | None = None, reason: str = "api", *,
@@ -620,6 +680,7 @@ class Agent:
         return await self._deadlined("configure", lambda: self._configure(reason))
 
     async def _configure(self, reason: str) -> dict[str, Any]:
+        """Set the semi-sync sides for the current role, never releasing waiting sessions."""
         async with self._role_lock:
             async with self.db.session(self.s.sql_timeout_s) as s:
                 r = (await s.query("SELECT @@GLOBAL.super_read_only AS sro",
@@ -659,6 +720,10 @@ class Agent:
                     **self.guard_toggles()}
 
     async def rebuild(self, donor: str) -> dict[str, Any]:
+        """POST /rebuild, replace this node's data with a clone of ``donor``.
+
+        Counts the phantoms first (own gtid_executed minus the donor's), then clones.
+        The node ends read-only and unreplicated, and the manager repoints it."""
         if not donor or donor == self.s.node:
             raise AgentError(f"bad donor {donor!r}", status=400)
         async with self._role_lock:
@@ -722,6 +787,7 @@ class Agent:
 
     async def _rebuild_finish(self, donor: str, gen: int, t0: float, phantom: int,
                               restarting: bool) -> dict[str, Any]:
+        """Wait for mysqld to restart after the clone, then leave it read-only, unreplicated."""
         if self.sup.supervised:
             if not await self.sup.wait_exit(60.0):
                 # mysqld did not stop on its own after the clone. Make it.
@@ -760,6 +826,7 @@ class Agent:
     # ------------------------------------------------------------------ test hooks
 
     def kill_mysqld(self) -> dict[str, Any]:
+        """POST /kill-mysqld test hook. SIGKILL, and the supervisor restarts at once."""
         pid = self.sup.kill(signal.SIGKILL)
         if pid is None:
             raise AgentError("no supervised mysqld to kill", status=409)
@@ -767,6 +834,7 @@ class Agent:
         return {"ok": True, "pid": pid}
 
     def hang_mysqld(self, seconds: float) -> dict[str, Any]:
+        """POST /hang-mysqld test hook. SIGSTOP now, SIGCONT after ``seconds``."""
         pid = self.sup.kill(signal.SIGSTOP)
         if pid is None:
             raise AgentError("no supervised mysqld to hang", status=409)
@@ -782,6 +850,7 @@ class Agent:
     # ------------------------------------------------------------------ liveness
 
     async def responsive(self) -> bool:
+        """True if mysqld answers SELECT 1."""
         try:
             await self._sql(lambda s: s.query("SELECT 1 AS one"))
             return True
@@ -789,6 +858,7 @@ class Agent:
             return False
 
     async def wait_responsive(self, timeout: float) -> bool:
+        """Poll every 0.5 s until mysqld answers or ``timeout`` passes."""
         end = time.monotonic() + timeout
         while time.monotonic() < end and not self._stopping:
             if await self.responsive():
@@ -854,6 +924,7 @@ class Agent:
         return decision
 
     def _trigger_guard(self, reason: str) -> asyncio.Task:
+        """Start the wake guard unless it is already running."""
         if self._guard_task is None or self._guard_task.done():
             self._guard_task = asyncio.create_task(self.wake_guard(reason), name="wake-guard")
         return self._guard_task
@@ -865,7 +936,9 @@ class Agent:
         return self._guard_task is not None and not self._guard_task.done()
 
     async def ensure_awake(self) -> None:
-        """Called by /primary so a frozen-then-thawed agent never answers stale."""
+        """Run the wake guard first if a freeze went unnoticed, and wait for it (2.5 s at most).
+
+        The heartbeat writer calls it so a woken primary never writes before the guard ran."""
         now = time.monotonic()
         if now - self.last_tick > self.s.wake_gap_s:
             log.warning("wake_gap", gap_s=round(now - self.last_tick, 3), where="request")
@@ -877,6 +950,7 @@ class Agent:
                 await asyncio.wait_for(asyncio.shield(task), 2.5)
 
     async def _ticker(self) -> None:
+        """Tick every 0.5 s. A gap over ``wake_gap_s`` means the container was frozen."""
         while not self._stopping:
             await asyncio.sleep(0.5)
             now = time.monotonic()
@@ -889,10 +963,12 @@ class Agent:
     # ------------------------------------------------------------------ heartbeat
 
     def heartbeat_stalled_s(self) -> float:
+        """How long the in-flight heartbeat write has waited, 0.0 when none is."""
         since = self._hb_inflight_since
         return round(time.monotonic() - since, 3) if since is not None else 0.0
 
     async def _heartbeat(self) -> None:
+        """Write the heartbeat row every 500 ms while this node is an unfenced primary."""
         await self.startup_done.wait()
         while not self._stopping:
             await asyncio.sleep(self.s.heartbeat_interval_s)
@@ -928,19 +1004,23 @@ class Agent:
     # ------------------------------------------------------------------ self-fence lease
 
     def self_fence_enabled(self) -> bool:
+        """The lease runs only with semi-sync on, a manager URL and a non-zero timeout."""
         return bool(self.self_fence_on and self.semisync and self.s.self_fence_after_s > 0
                     and self.s.manager_url)
 
     def manager_unreachable_s(self) -> float:
+        """How long the manager has been continuously unreachable."""
         since = self._mgr_unreachable_since
         return round(time.monotonic() - since, 3) if since is not None else 0.0
 
     def self_fence_state(self) -> dict[str, Any]:
+        """The ``self_fence`` object of /status."""
         return {"enabled": self.self_fence_enabled(),
                 "manager_unreachable_s": self.manager_unreachable_s(),
                 "semisync_clients": self._sf_clients}
 
     def _sf_reset(self) -> None:
+        """Restart the lease's count."""
         self._mgr_unreachable_since = None
 
     async def self_fence_tick(self) -> str:
@@ -1002,6 +1082,7 @@ class Agent:
         return "self_fence"
 
     async def _self_fence_loop(self) -> None:
+        """Run one lease check every ``self_fence_interval_s``."""
         await self.startup_done.wait()
         while not self._stopping:
             await asyncio.sleep(self.s.self_fence_interval_s)
@@ -1013,6 +1094,7 @@ class Agent:
     # ------------------------------------------------------------------ lifecycle
 
     async def _startup(self) -> None:
+        """Wait for mysqld, run the startup guard, re-assert semi-sync, open /primary."""
         log.info("agent_startup", node=self.s.node, rs=self.s.rs, semisync=self.semisync,
                  fenced=self.fenced, supervised=self.sup.supervised)
         while not self._stopping and not await self.wait_responsive(5.0):
@@ -1024,6 +1106,7 @@ class Agent:
         self.startup_done.set()
 
     async def _reassert(self, reason: str) -> None:
+        """Re-apply semi-sync for the current role, logging a failure."""
         try:
             await self.configure(None, reason=reason)
         except (DbError, AgentError) as e:
@@ -1042,6 +1125,7 @@ class Agent:
         self._tasks.append(asyncio.create_task(after(), name="after-restart"))
 
     async def start(self) -> None:
+        """Start mysqld and every background loop."""
         await self.sup.start()
         self._tasks += [asyncio.create_task(self._startup(), name="startup"),
                         asyncio.create_task(self._ticker(), name="ticker"),
@@ -1050,6 +1134,7 @@ class Agent:
                         asyncio.create_task(self._primary_refresher(), name="primary-sampler")]
 
     async def stop(self) -> None:
+        """Stop the loops, then mysqld (SIGTERM, waited for)."""
         self._stopping = True
         for t in self._tasks:
             t.cancel()
