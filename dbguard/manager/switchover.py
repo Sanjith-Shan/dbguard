@@ -1,11 +1,12 @@
-"""Planned switchover, the graceful path.
+"""Planned switchover (``dbgctl failover rs1 [--to node]``), the graceful path.
 
-Quiesce the old primary (POST /fence: super_read_only=1 and client threads killed, the
-same operation as a fence), wait until the candidate has applied every transaction the
-old primary committed, promote it, repoint everyone else including the old primary. No
-acknowledged write can be lost because the old primary stops accepting writes before the
-candidate is compared with it. If the candidate does not catch up in time the old
-primary is promoted back and nothing changed.
+Before the stall, the other replicas move under the candidate while the old primary still
+takes writes. The stall is quiesce (the same ``/fence``), wait until the candidate applied the
+old primary's final gtid_executed, check it holds nothing extra, promote. The old primary is
+repointed afterwards in the background. No acknowledged write can be lost because the old
+primary stops accepting writes before the candidate is compared with it, and the errant check
+runs against that final set, not an earlier snapshot taken while writes flowed. If the
+candidate does not qualify in time, the old primary is promoted back and nothing changed.
 """
 
 from __future__ import annotations
@@ -31,15 +32,17 @@ log = structlog.get_logger("dbguard.manager.switchover")
 
 
 class SwitchoverError(Exception):
-    pass
+    """The switchover was refused or aborted. The API answers 409 with this message."""
 
 
 async def switchover(ctl: SetController, to: str | None = None) -> Event:
+    """Move the primary role to ``to``, or to the best candidate, holding the set's lock."""
     async with ctl.lock:
         return await _switchover(ctl, to)
 
 
 async def _switchover(ctl: SetController, to: str | None) -> Event:
+    """Validate and choose the candidate, prepare the replicas, then run the stall."""
     if ctl.st.halted:
         raise SwitchoverError(f"{ctl.rs} is HALTED ({ctl.st.halt_reason}), resume it first")
     old = ctl.primary
@@ -120,7 +123,7 @@ async def wait_attached(ctl: SetController, nodes: list[str], source: str,
 
 async def _stall(ctl: SetController, old: str, to: str, views, steps: Steps, notes: list[str],
                  attached: list[str], waiter, t0: float) -> Event:
-    # --- the stall: quiesce, catch up, promote -------------------------------------------
+    """Quiesce the old primary, catch the candidate up, promote it (or promote back)."""
     ts = time.monotonic()
     steps.fence, resp = await fence(ctl, old)
     if steps.fence.outcome == "unreachable":
@@ -132,26 +135,7 @@ async def _stall(ctl: SetController, old: str, to: str, views, steps: Steps, not
         if resp and resp.get("gtid_executed") is not None else None
 
     tk = time.monotonic()
-    ok, why = False, "not checked"
-    if waiter is not None and final is not None:
-        try:
-            ok, got = await waiter.wait(str(final), ctl.cfg.catchup_deadline_s)
-            why = "ok" if ok else f"{to} did not apply {old}'s final set in time"
-            if ok and got is not None:
-                errant = GtidSet.parse(got) - final
-                if errant:
-                    ok, why = False, (f"{to} holds {errant.count()} transactions {old} never "
-                                      f"had ({errant})")
-        except Exception as e:  # noqa: BLE001
-            waiter, why = None, f"waiter failed: {e}"
-    if waiter is None or final is None:
-        ok, why = await wait_caught_up(ctl, to, ctl.cfg.catchup_deadline_s, target=final)
-        if ok and final is not None:
-            tv = await ctl.agents.status(to)
-            errant = tv.have - final if tv.usable else None
-            if errant:
-                ok, why = False, (f"{to} holds {errant.count()} transactions {old} never "
-                                  f"had ({errant})")
+    ok, why = await _catch_up_to_final(ctl, old, to, final, waiter)
     steps.catchup = CatchupStep(duration_s=round(time.monotonic() - tk, 3), ok=ok)
     if not ok:
         note = f"{to} not promotable after quiesce ({why}), promoted {old} back"
@@ -202,7 +186,37 @@ async def _stall(ctl: SetController, old: str, to: str, views, steps: Steps, not
     return ev
 
 
+async def _catch_up_to_final(ctl: SetController, old: str, to: str, final: GtidSet | None,
+                             waiter) -> tuple[bool, str]:
+    """Wait until ``to`` applied the quiesced primary's final set and holds nothing more.
+
+    The pre-opened waiter (WAIT_FOR_EXECUTED_GTID_SET on the candidate) is the fast path.
+    Without it, or when it fails, the agent's /status is polled instead."""
+    ok, why = False, "not checked"
+    if waiter is not None and final is not None:
+        try:
+            ok, got = await waiter.wait(str(final), ctl.cfg.catchup_deadline_s)
+            why = "ok" if ok else f"{to} did not apply {old}'s final set in time"
+            if ok and got is not None:
+                errant = GtidSet.parse(got) - final
+                if errant:
+                    ok, why = False, (f"{to} holds {errant.count()} transactions {old} never "
+                                      f"had ({errant})")
+        except Exception as e:  # noqa: BLE001
+            waiter, why = None, f"waiter failed: {e}"
+    if waiter is None or final is None:
+        ok, why = await wait_caught_up(ctl, to, ctl.cfg.catchup_deadline_s, target=final)
+        if ok and final is not None:
+            tv = await ctl.agents.status(to)
+            errant = tv.have - final if tv.usable else None
+            if errant:
+                ok, why = False, (f"{to} holds {errant.count()} transactions {old} never "
+                                  f"had ({errant})")
+    return ok, why
+
+
 async def _repoint_after(ctl: SetController, old: str, to: str) -> None:
+    """Repoint the former primary under the new one after the stall, recorded as a rejoin."""
     t0 = time.monotonic()
     step = await repoint_all(ctl, [old], to)
     ok = old in step.nodes
