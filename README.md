@@ -21,7 +21,10 @@ datacenter or carried real traffic. Lossless is claimed only for acknowledged wr
 under the configuration below, and only as measured. With
 `rpl_semi_sync_source_wait_for_replica_count=1`, losing the primary and the one replica
 that acknowledged a write at the same time loses that write, and the `kill-two` experiment
-below publishes exactly that boundary.
+below publishes exactly that boundary. The naive asynchronous baseline also lost nothing in
+26 kills on this single host, because replication between containers on one machine is
+faster than the crash window, so the lab shows the async window only once a replica delay is
+added (the 2 ms table below).
 
 ## Results
 
@@ -45,7 +48,7 @@ under. The sentence under each table says the same.
 |---|---|
 | Primary kills, DBGuard | 30 runs |
 | Acknowledged writes lost by DBGuard across every measured injection | **0** |
-| Acknowledged writes lost by the asynchronous baseline across its kills | **`[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]`** |
+| Acknowledged writes lost by the asynchronous baseline, 0 ms and 2 ms replica delay | **0** of 26 kills at 0 ms, 2 ms rows pending |
 | Failover after a primary kill, median | **8.83 s** |
 | False failovers with the manager partitioned from the primary | **0** of 30 |
 | Commit latency cost of semi-sync at the median, no added delay | +1.6 ms (5.9 ms on vs 4.2 ms off) |
@@ -58,24 +61,38 @@ the first successful write through HAProxy, measured on the clients' clock.
 | mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss | phantom writes | single-writer violations | converged |
 |---|---|---|---|---|---|---|---|---|
 | dbguard | 30 | 8.83 | 9.75 | 0 | 0 | 0 | 0 | 30/30 |
-| naive | `[[N: kill naive run count, results/kill_naive.jsonl]]` | `[[N: kill naive failover p50, results/kill_naive.jsonl]]` | `[[N: kill naive failover p99, results/kill_naive.jsonl]]` | `[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]` | `[[N: kill naive runs with loss, results/kill_naive.jsonl]]` | `[[N: kill naive phantom writes, results/kill_naive.jsonl]]` | `[[N: kill naive single-writer violations, results/kill_naive.jsonl]]` | `[[N: kill naive converged runs, results/kill_naive.jsonl]]` |
+| naive | 26 | 5.45 | 5.85 | 0 | 0 | 0 | 0 | 26/26 |
 
 The dbguard row ran under the earlier `agent-live-primary-check` configuration (the agent
 answered HAProxy's health check with a live SQL query, HAProxy `fall 1`, before the rejoin
 quiescence fix), and its planned rerun was dropped at the deadline. About 9 s is the detection
 window (three failed probes plus `detect_window_s=5` of agreement from the replicas) followed
 by the fence, the catch-up and the promotion. The naive row runs asynchronous replication with
-no fence and no subset check, and it is expected to lose writes, because a baseline that loses
-nothing would mean the harness never landed a crash between commit and replication. It also
-decides on the manager's own probe alone, so it is expected to fail over faster. That speed is
-what it bought with the lost writes.
+no fence and no subset check, under the final configuration, and it decides on the manager's
+own probe alone, so it fails over about 3 s faster. It also lost nothing. That does not say
+asynchronous replication is safe. It says that on one host the replicas receive each
+transaction far sooner than a `docker kill` can land between the commit and its replication,
+so the single-host lab hides the async window. The table below adds the delay a real network
+has.
+
+#### Kill with a 2 ms replica delay
+
+`tc netem delay 2ms` between the primary and its replicas, the same kill, 10 runs per mode,
+both under the final configuration.
+
+| mode | runs | failover p50 s | failover p99 s | lost acked writes | runs with loss |
+|---|---|---|---|---|---|
+| naive | pending | | | | |
+| dbguard | pending | | | | |
+
+The 2 ms rows are still being measured. When they land, the naive row is expected to show the async window that the single-host 0 ms runs hide.
 
 Rejoin of the killed primary once its container is back.
 
 | scenario | mode | rejoins | repoint | rebuild | other | phantom GTIDs mean | phantom GTIDs max | rejoin p50 s | rejoin p99 s |
 |---|---|---|---|---|---|---|---|---|---|
 | kill | dbguard | 30 | 5 | 25 | 0 | 3.37 | 8 | 4.46 | 16.55 |
-| kill | naive | `[[N: kill naive rejoins, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin repoint count, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin rebuild count, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin other count, results/kill_naive.jsonl]]` | `[[N: kill naive phantom GTIDs mean, results/kill_naive.jsonl]]` | `[[N: kill naive phantom GTIDs max, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin p50, results/kill_naive.jsonl]]` | `[[N: kill naive rejoin p99, results/kill_naive.jsonl]]` |
+| kill | naive | 26 | 7 | 19 | 0 | 2.00 | 7 | 6.63 | 8.32 |
 
 Same configuration as the table above. Repoint means the old primary's `gtid_executed` was a
 subset of the new primary's after crash recovery, so it rejoined with no data copy. Rebuild
@@ -115,16 +132,15 @@ clients are fine, so the correct action is no action.
 | mode | runs | false failovers | lost acked writes | converged |
 |---|---|---|---|---|
 | dbguard | 30 | 0 | 0 | 30/30 |
-| naive | `[[N: partition-manager naive run count, results/partition-manager_naive.jsonl]]` | `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive lost acked writes, results/partition-manager_naive.jsonl]]` | `[[N: partition-manager naive converged runs, results/partition-manager_naive.jsonl]]` |
 
 The dbguard row ran under the earlier `agent-live-primary-check` configuration. In 9 of its
 30 runs the clients saw 8 or more errors although this scenario must see none. The cause was
 the health-check bug that configuration had (a slow live-SQL `/primary` answer made HAProxy
 mark a healthy primary down and cut every session), since fixed, and not a failover. DBGuard
 declares a primary dead only when its own probe fails and a majority of the replicas that can
-be asked also report losing it, so here it sits in `SUSPECT` and logs. Naive mode fails over
-on its own probe alone, and every false failover it makes is a real failover of a healthy
-primary.
+be asked also report losing it, so here it sits in `SUSPECT` and logs. Naive mode would fail over
+on its own probe alone, but its runs of this scenario were dropped for time and are listed
+under Not yet measured.
 
 ### Planned switchover
 
@@ -204,6 +220,7 @@ did not measure them. Each will get a table when it has been run.
   cloned in after `rebuild_after_s`). One run exists in `results/`, not enough for a table.
 - **Disk full** (the primary's binary log volume fills up while the workload runs).
 - **Every Orchestrator baseline** (kill, hang-container, partition-manager).
+- **Naive partition-manager**, dropped from the campaign for time.
 - **kill-two with recovery**, the rerun with the donor-of-last-resort recovery, where the
   stalled survivor itself serves as the clone donor so the set heals without an operator.
 

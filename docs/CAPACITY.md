@@ -77,7 +77,9 @@ The measured distribution follows.
 | primary frozen | not yet measured | | |
 | primary partitioned from replicas | 11.58 s | 14.23 s | 30 |
 | planned switchover (client stall) | 1.44 s | 6.03 s | 10 |
-| naive, primary killed | `[[N: kill failover p50 naive, results/kill_naive.jsonl]]` | `[[N: kill failover p99 naive, results/kill_naive.jsonl]]` | `[[N: kill run count naive, results/kill_naive.jsonl]]` |
+| naive, primary killed | 5.45 s | 5.85 s | 26 |
+| naive, primary killed, 2 ms replica delay | pending | | |
+| DBGuard, primary killed, 2 ms replica delay | pending | | |
 | Orchestrator, primary killed | not yet measured | | |
 
 ## 3. Picking detect_window and probe_timeout
@@ -94,7 +96,7 @@ A procedure for a team.
 2. Set `probe_timeout_s` above the p99.9 of a probe write under peak load, so a slow write is not a failed probe.
 3. Set `detect_window_s` to a margin above the longest normal stall from step 1.
 4. Check the budget in section 2 against the recovery objective. If the sum is too long, the fix is usually to shorten the stalls, not the window.
-5. Run the manager-partition experiment and a hang shorter than the window. The false failover count has to stay zero. It was 0 for DBGuard and `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` for naive mode.
+5. Run the manager-partition experiment and a hang shorter than the window. The false failover count has to stay zero. It was 0 for DBGuard in 30 runs. The naive runs of this scenario are not yet measured.
 
 ## 4. Sizing a replica set
 

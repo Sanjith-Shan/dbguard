@@ -144,7 +144,7 @@ Probe failure without the vote is `SUSPECT`, the manager is probably the one par
 
 `SOURCE_HEARTBEAT_PERIOD=0.5` makes a quiet primary send a heartbeat every half second, and `replica_net_timeout=2` makes the replica give up on a silent connection after two seconds instead of the default 60. A container hang uses `docker pause`, the cgroup freezer, because `docker kill -s STOP` signals only PID 1, which is `tini`, and SIGSTOP cannot be forwarded.
 
-When the manager is the partitioned one, the probe fails and the replicas keep streaming, so the set sits in `SUSPECT`. DBGuard's false failover count there is 0 against `[[N: false failovers naive, results/partition-manager_naive.jsonl]]` for naive mode. Orchestrator's count is not yet measured.
+When the manager is the partitioned one, the probe fails and the replicas keep streaming, so the set sits in `SUSPECT`. DBGuard's false failover count there is 0 in 30 runs. The naive and Orchestrator runs of this scenario are not yet measured.
 
 ### States
 
@@ -208,7 +208,7 @@ Two sets make "fleet" true and expose bugs in per-set state. Every chaos run aga
 
 ## 10. The baselines
 
-**Naive mode.** `--mode naive` runs replication asynchronously, detects from the probe alone, does not fence before promotion, promotes the largest executed set and skips the subset check. The primary acknowledges before any replica has the write, so a well-timed kill loses it. It lost `[[N: kill naive lost acked writes total, results/kill_naive.jsonl]]` acknowledged writes where DBGuard lost 0. If a baseline lost nothing the harness would be at fault, so it can add netem delay to naive kill runs and records when it did. Naive mode borrows one safety net, fencing a second writable node during rejoin, and its event note says so.
+**Naive mode.** `--mode naive` runs replication asynchronously, detects from the probe alone, does not fence before promotion, promotes the largest executed set and skips the subset check. The primary acknowledges before any replica has the write, so a well-timed kill loses it. On one host it lost 0 acknowledged writes in 26 kills, because replication between containers on one machine finishes before a kill can land in the window, so the lab hides the async window rather than showing async is safe. With a 2 ms netem delay on the replicas the naive and DBGuard runs are still being measured. Naive mode borrows one safety net, fencing a second writable node during rejoin, and its event note says so.
 
 **Orchestrator.** openark/orchestrator, originally by Shlomi Noach, is the industry tool and the model for DBGuard's detection. The baseline runs Percona's maintained fork, because upstream issues `SHOW SLAVE STATUS`, which MySQL 8.4 removed. Its pre-failover hook flips the agent's fence flag, and the agents' lease and wake guard are off for its runs. It discovers arbitrary topologies, "attempts to promote a replica that will retain the most serving capacity", and has datacenter-aware rules, graceful takeover, a UI and a raft HA mode. DBGuard, by default and unlike it, fences the old primary itself down to `SIGKILL`, refuses to promote across diverged replicas, decides repoint versus rebuild by GTID subset, rebuilds with clone, and provisions replacements. Its runs are built but not yet measured, and when they are, any run where it was faster will be reported.
 
