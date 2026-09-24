@@ -1,8 +1,13 @@
 __pycache__/
-*.pyc
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
 .venv/
 *.egg-info/
+*.pyc
+results/.fleet-ready
+results/*.log
+results/*.out
+results/disk-sampler.sh
+results/pilot/
 results/tmp/
-.pytest_cache/
-.hypothesis/
-.ruff_cache/
