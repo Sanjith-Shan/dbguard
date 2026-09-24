@@ -309,6 +309,7 @@ class FakeFleet:
             node.semisync_source = False
             node.semisync_replica = fleet.semisync
             node.source = body["source"]
+            fleet.log.append((time.time(), node.name, "repointed"))
             node.retrieved = GtidSet()     # CHANGE REPLICATION SOURCE purges relay logs
             node.partial = GtidSet()
             node.io_stopped = False
@@ -408,6 +409,12 @@ class FakeProber:
         n.io_stopped = True
         return None
 
+    async def gtid_waiter(self, node: str, timeout: float = 3.0):
+        n = self.fleet.nodes[node]
+        if not n.responsive:
+            return None
+        return FakeGtidWaiter(n)
+
     async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
         n = self.fleet.nodes[node]
         if not n.responsive:
@@ -419,6 +426,24 @@ class FakeProber:
                 "Replica has read all relay log; waiting for more updates" if done
                 else "Waiting for dependent transaction to commit",
                 "Retrieved_Gtid_Set": str(n.retrieved), "Executed_Gtid_Set": str(n.executed)}
+
+    async def close(self) -> None:
+        pass
+
+
+class FakeGtidWaiter:
+    def __init__(self, node: FakeNode):
+        self.node = node
+
+    async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
+        target = GtidSet.parse(gtid_set)
+        end = time.monotonic() + timeout_s
+        while True:
+            if target.is_subset(self.node.executed):
+                return True, str(self.node.executed)
+            if time.monotonic() >= end:
+                return False, str(self.node.executed)
+            await asyncio.sleep(0.005)
 
     async def close(self) -> None:
         pass

@@ -26,6 +26,14 @@ class Prober(Protocol):
     async def probe(self, rs: str, node: str) -> ProbeResult: ...
     async def stop_io(self, node: str, timeout: float = 3.0) -> str | None: ...
     async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None: ...
+    async def gtid_waiter(self, node: str, timeout: float = 3.0) -> "GtidWaiter | None": ...
+    async def close(self) -> None: ...
+
+
+class GtidWaiter(Protocol):
+    async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
+        """Block until ``gtid_set`` is applied (True) or the timeout passed (False).
+        Returns the node's gtid_executed read right after."""
     async def close(self) -> None: ...
 
 
@@ -136,6 +144,18 @@ class MysqlProber:
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}"[:200]
 
+    async def gtid_waiter(self, node: str, timeout: float = 3.0) -> "MysqlGtidWaiter | None":
+        """Open a connection to ``node`` now, so the switchover's stall does not pay for a
+        TCP and TLS handshake. None if it cannot connect."""
+        host, port = self.addr.mysql_addr(node)
+        try:
+            c = await asyncio.wait_for(aiomysql.connect(
+                host=host, port=port, user=self.user, password=self.password, autocommit=True,
+                connect_timeout=timeout, ssl=_tls() if self.use_tls else None), timeout)
+        except Exception:  # noqa: BLE001
+            return None
+        return MysqlGtidWaiter(c)
+
     async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
         """SHOW REPLICA STATUS row (Replica_SQL_Running_State, sets, threads), or None."""
         try:
@@ -147,6 +167,31 @@ class MysqlProber:
     async def close(self) -> None:
         for n in list(self._conns):
             self._drop(n)
+
+
+class MysqlGtidWaiter:
+    """WAIT_FOR_EXECUTED_GTID_SET on a pre-opened connection: the server returns the moment
+    the set is applied, with no polling interval at all."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def wait(self, gtid_set: str, timeout_s: float) -> tuple[bool, str | None]:
+        async def go():
+            async with self.conn.cursor() as cur:
+                await cur.execute("SELECT WAIT_FOR_EXECUTED_GTID_SET(%s, %s)",
+                                  (gtid_set, max(0.001, timeout_s)))
+                (res,) = await cur.fetchone()
+                await cur.execute("SELECT @@GLOBAL.gtid_executed")
+                (g,) = await cur.fetchone()
+                return res == 0, g
+        return await asyncio.wait_for(go(), timeout_s + 2.0)
+
+    async def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class StatusCache:

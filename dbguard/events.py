@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 EventType = Literal[
     "failover", "switchover", "rejoin", "rebuild", "replace", "halt", "resume",
-    "suspect", "degraded", "healthy", "stall", "bootstrap", "cold_start",
+    "suspect", "degraded", "healthy", "stall", "bootstrap", "cold_start", "split_brain",
 ]
 Trigger = Literal["dead", "hung", "partition", "planned", "manual"]
 
@@ -61,6 +61,7 @@ class RepointStep(_M):
 
 
 class Steps(_M):
+    prepare: RepointStep | None = None   # switchover: replicas moved under the candidate first
     fence: FenceStep | None = None
     choose: ChooseStep | None = None
     catchup: CatchupStep | None = None
@@ -96,6 +97,7 @@ class Event(_M):
     watermark_gtid: str | None = None
     rejoin: Rejoin | None = None
     clone: Clone | None = None
+    stall_s: float | None = None   # switchover: quiesce start to promote answered
     note: str | None = None
 
     def row(self) -> dict:
