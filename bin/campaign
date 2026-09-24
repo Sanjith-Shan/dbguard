@@ -157,7 +157,31 @@ def expand(entry: dict) -> list[dict]:
                  ["--semisync", ss, "--netem", str(n)]) for ss, n in cells]
 
 
+def archive_old_rows(e: dict) -> None:
+    """A rerun entry ({"archive": "<tag>"}) moves the rows written under the previous
+    configuration to results/old-config/<tag>/ the first time it starts, so its table is
+    rebuilt under one configuration. Idempotent: once the archive exists, nothing moves."""
+    tag = e.get("archive")
+    if not tag:
+        return
+    src = RESULTS / f"{e['scenario']}_{e['mode']}.jsonl"
+    dst_dir = RESULTS / "old-config" / tag
+    dst = dst_dir / src.name
+    if dst.exists() or not src.exists():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    n = sum(1 for _ in src.open())
+    src.rename(dst)
+    err = src.with_suffix(".errors.jsonl")
+    if err.exists():
+        err.rename(dst_dir / err.name)
+    log(f"ARCHIVE moved {n} rows of {src.name} to {dst.relative_to(REPO)} (rerun under {tag})")
+
+
 def done_count(e: dict) -> int:
+    if e.get("archive") and not (RESULTS / "old-config" / e["archive"] /
+                                 f"{e['scenario']}_{e['mode']}.jsonl").exists():
+        return 0    # a rerun that has not archived yet has done nothing
     rs = rows(e["scenario"], e["mode"])
     if "cell" in e:
         ss, n = e["cell"]
@@ -306,6 +330,7 @@ def main() -> int:
             eta = f"{remaining * rate / 3600:.1f} h" if rate else "?"
             log(f"ENTRY start {label}: {need} runs (attempt {attempt + 1}), campaign left "
                 f"{remaining} runs, ETA {eta}, free {free:.1f} GiB")
+            archive_old_rows(e)
             before = done_count(e)
             t0 = time.time()
             cmd = [PY, str(REPO / "bin" / "chaos"), "--scenario", e["scenario"], "--mode", e["mode"],
