@@ -564,3 +564,10 @@ heredocs and cache mounts already).
   kept in results/old-config/netem-replica-egress/. The cost table's netem cells were measured
   with the old direction, which is still the semi-sync ack path, so the semi-sync-on cells are
   valid and the async netem cells carry no replication delay.
+- Follow-up. With the delay on the primary's side, naive still lost 0, because `docker kill`
+  kills the processes while the kernel keeps draining the netem queue, so the delayed binlog
+  still arrived. Kill runs with a replica delay now emulate host death: the primary's packets
+  to the replicas are dropped (iptables, about 0.3 to 0.4 s before the SIGKILL, the helper's
+  own latency) and then the container is SIGKILLed. The first naive run lost 143 acknowledged
+  writes. dbguard mode gets the identical injection, and there semi-sync blocks those commits
+  instead of acknowledging them.
