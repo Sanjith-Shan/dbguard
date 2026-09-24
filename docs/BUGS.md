@@ -300,3 +300,47 @@ heredocs and cache mounts already).
 - How found. `/v1/status` after restarting the dbguard container on the real fleet.
 - Fix. Membership lived only in memory. The reconcile pass now adopts the spare as a member
   whenever it replicates from a member, so a restart rediscovers it.
+
+### mysqld OOM-killed during START REPLICA
+
+- Symptom. During real repoints on rs1 the agent's `/repoint` answered 500 "Lost connection
+  to MySQL server during query" from `START REPLICA`, and the next statement got "Can't connect".
+  The agent log showed `mysqld_exited` with returncode -9 in the same second. It hit mysql-a3
+  once, mysql-a4 once, and then both at the same moment in one kill run. In that run the new
+  primary a1 was left with no semi-sync replica, writes stalled for 23 s, and a second failover
+  to a3 followed. The checker still passed (no acknowledged write lost), but clients saw a 32 s
+  outage.
+- How found. Chasing "repoint failed on mysql-a3, mysql-a4" notes in real failover events
+  through `docker logs` of the nodes. `docker stats` showed every node at about 684 of 700 MiB
+  (`mem_limit: 700m`), with `replica_parallel_workers=16` in my.cnf. SIGKILL at the moment the
+  applier workers start points at the container memory limit.
+- Fix. In progress by the fleet agent (fewer applier workers or more memory per node). The
+  manager side already copes. A failed repoint is noted in the event and retried by the rejoin
+  pass, and the stalled primary is failed over like any other. The outage is the fleet's.
+
+### A stale status view repointed a replica the failover had just repointed
+
+- Symptom. In the simulated kill test, right after a failover, the manager logged a rejoin
+  "mysql-a3 replicating from mysql-a1, not mysql-a2, repointed" although the failover's
+  repoint step had repointed mysql-a3 to mysql-a2 a moment earlier. That repoint is harmless,
+  but it restarts replication for nothing and hides real stragglers in the event log.
+- How found. After moving `/status` to per-node background pollers (review item 3), the
+  end-to-end test asserting that only the old primary rejoins failed.
+- Fix. The status cache now drops every answer collected before the set's last action. Every
+  event and every change of primary invalidates it, so the next decision waits for a fresh
+  `/status` of every node.
+
+### The new primary could not acknowledge writes until the first repoint finished
+
+- Symptom. In real kill runs the promote finished well before clients could write again.
+  The new primary had semi-sync on with no replica attached, so every commit waited for the
+  repoint step. Repoints took 1.7 to 1.8 s, and a `START REPLICA` once took 2.4 s.
+- How found. Comparing the step durations in real failover and switchover events with the
+  workload's first error and first success after it.
+- Fix. In dbguard mode the other replicas are now repointed to the winner before it is
+  promoted. The winner is still read-only then, is caught up, and every other candidate's set
+  is a subset of its own, so attaching early is safe. When it becomes writable its semi-sync
+  replicas are already connected. The fence also runs concurrently with the steps that cannot
+  acknowledge a write, and the promote still waits for it (unit test with a slow fence). The
+  switchover got the same reorder first. The failover reorder has not yet had a clean real run,
+  because the only run with it hit the OOM kills above.
