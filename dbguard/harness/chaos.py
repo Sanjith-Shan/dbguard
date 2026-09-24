@@ -664,9 +664,14 @@ class Fleet:
         if len(prims) != 1:
             return {}
         p = prims[0]
+        # replicas first, THEN the primary: a replica read before the primary can only hold
+        # what the primary already had, so anything it has beyond that read is really errant
+        # (reading the primary first raced replication and flagged the primary's own newest
+        # transactions as errant)
+        reps = self.statuses()
         pg = (agent(p).status() or {}).get("gtid_executed")
         out = {}
-        for n, s in self.statuses().items():
+        for n, s in reps.items():
             if n == p or not s or not s.get("gtid_executed"):
                 continue
             d = gtid_minus(s.get("gtid_executed"), pg)
