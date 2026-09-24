@@ -49,6 +49,11 @@ class FakeNode:
     heartbeat_ts: float | None = None
     next_gno: int = 1
     sql_error: str | None = None
+    io_stopped: bool = False    # STOP REPLICA IO_THREAD
+    status_delay: float = 0.0   # a slow /status (loaded agent)
+    repoint_delay: float = 0.0  # a slow /repoint (START REPLICA taking seconds)
+    fail_next: dict = field(default_factory=dict)  # path -> times to answer 500 lost link
+    partial: GtidSet = field(default_factory=GtidSet)  # in the relay log, never appliable
     calls: list[str] = field(default_factory=list)
 
     @property
@@ -124,7 +129,7 @@ class FakeFleet:
 
     # ------------------------------------------------------------- simulation
     def io_ok(self, node: FakeNode) -> bool:
-        if not node.responsive or node.source is None:
+        if not node.responsive or node.source is None or node.io_stopped:
             return False
         src = self.nodes.get(node.source)
         return bool(src and src.responsive and self.can_talk(node.name, src.name))
@@ -169,7 +174,7 @@ class FakeFleet:
         for r in self.nodes.values():
             if not r.responsive or r.sql_error:
                 continue
-            todo = r.retrieved - r.executed
+            todo = r.retrieved - r.executed - r.partial
             if todo:
                 take = []
                 for (u, t), ivs in todo.items():
@@ -196,7 +201,7 @@ class FakeFleet:
         src = self.nodes.get(node.source) if node.source else None
         io = None
         if node.source and node.responsive:
-            io = "Yes" if self.io_ok(node) else "Connecting"
+            io = "No" if node.io_stopped else ("Yes" if self.io_ok(node) else "Connecting")
         sql = None
         if node.source and node.responsive:
             sql = "No" if node.sql_error else "Yes"
@@ -246,9 +251,16 @@ class FakeFleet:
                 request.transport.close()
                 raise web.HTTPServiceUnavailable()
             node.calls.append(request.path)
+            if node.fail_next.get(request.path, 0) > 0:
+                node.fail_next[request.path] -= 1
+                return web.json_response({"error": "(2013, 'Lost connection to MySQL server "
+                                          "during query')", "sql_code": 2013,
+                                          "timeout": False}, status=500)
             return await handler(request)
 
         async def status(request):
+            if node.status_delay:
+                await asyncio.sleep(node.status_delay)
             return web.json_response(fleet.status_body(node))
 
         async def fence(request):
@@ -273,6 +285,8 @@ class FakeFleet:
                 return web.json_response({"error": "mysqld down"}, status=503)
             node.source = None
             node.retrieved = GtidSet()
+            node.partial = GtidSet()
+            node.io_stopped = False
             node.semisync_replica = False
             node.semisync_source = fleet.semisync
             node.super_read_only = False
@@ -281,6 +295,8 @@ class FakeFleet:
 
         async def repoint(request):
             body = await request.json()
+            if node.repoint_delay:
+                await asyncio.sleep(node.repoint_delay)
             if not node.responsive:
                 return web.json_response({"error": "mysqld down"}, status=503)
             node.super_read_only = True
@@ -288,6 +304,8 @@ class FakeFleet:
             node.semisync_replica = fleet.semisync
             node.source = body["source"]
             node.retrieved = GtidSet()     # CHANGE REPLICATION SOURCE purges relay logs
+            node.partial = GtidSet()
+            node.io_stopped = False
             node.sql_error = None
             return web.json_response({"ok": True, "duration_ms": 1})
 
@@ -353,6 +371,7 @@ class FakeProber:
         self.fleet = fleet
         self.timeout_s = timeout_s
         self.count = itertools.count()
+        self.stopped_io: list[str] = []
 
     async def probe(self, rs: str, node: str) -> ProbeResult:
         ts = time.time()
@@ -374,6 +393,26 @@ class FakeProber:
             return ProbeResult(ok=False, ts=ts, duration_s=self.timeout_s, select_ok=True,
                                kind="timeout", error="SELECT 1 ok but heartbeat write blocked")
         return ProbeResult(ok=True, ts=ts, duration_s=0.001, select_ok=True)
+
+    async def stop_io(self, node: str, timeout: float = 3.0) -> str | None:
+        n = self.fleet.nodes[node]
+        if not n.responsive:
+            return "not responsive"
+        self.stopped_io.append(node)
+        n.io_stopped = True
+        return None
+
+    async def replica_state(self, node: str, timeout: float = 3.0) -> dict | None:
+        n = self.fleet.nodes[node]
+        if not n.responsive:
+            return None
+        if n.source is None:
+            return {}
+        done = (n.retrieved - n.executed).is_subset(n.partial)
+        return {"Replica_SQL_Running_State":
+                "Replica has read all relay log; waiting for more updates" if done
+                else "Waiting for dependent transaction to commit",
+                "Retrieved_Gtid_Set": str(n.retrieved), "Executed_Gtid_Set": str(n.executed)}
 
     async def close(self) -> None:
         pass

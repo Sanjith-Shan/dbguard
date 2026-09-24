@@ -154,7 +154,9 @@ async def test_kill_primary_full_failover_and_repoint_rejoin(sim_factory):
     # old primary comes back with nothing extra -> repoint branch
     s.fleet.start("mysql-a1")
     await s.until(lambda: s.events("rs1", "rejoin"), what="rejoin")
-    rj = s.events("rs1", "rejoin")[0]
+    rjs = s.events("rs1", "rejoin")
+    assert [e.rejoin.node for e in rjs] == ["mysql-a1"], "only the old primary rejoins"
+    rj = rjs[0]
     assert rj.rejoin.branch == "repoint" and rj.rejoin.phantom_gtids == 0
     assert s.fleet.nodes["mysql-a1"].source == new
     await s.healthy("rs1", new)
@@ -534,3 +536,127 @@ async def test_switchover_refuses_candidate_with_errant_transactions(sim_factory
         await switchover(s.ctl(), "mysql-a3")
     assert s.fleet.primary_of("rs1") == ["mysql-a1"]     # rolled back, still writable
     assert s.ctl().primary == "mysql-a1"
+
+
+# ------------------------------------------------------- review 2026-09-23 regressions
+
+
+async def test_slow_status_replicas_still_witness(sim_factory):
+    """REVIEW #3: a /status taking 1.5 s (loaded agent, TCP probe behind a DROP) must not
+    make replicas vanish as witnesses and candidates."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    for n in ("mysql-a2", "mysql-a3"):
+        s.fleet.nodes[n].status_delay = 1.5
+    await asyncio.sleep(1.8)
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), timeout=10, what="failover")
+    ev = s.events("rs1", "failover")[0]
+    assert ev.new_primary in ("mysql-a2", "mysql-a3")
+    assert ev.detect.replica_total == 2
+
+
+async def test_no_replacement_during_cooldown(sim_factory):
+    """REVIEW #2: after a failover the set is DEGRADED, but a spare must not be provisioned
+    while the old primary may still come back (cooldown)."""
+    s = await sim_factory(sets={"rs1": A}, spares={"rs1": "mysql-a4"}, provision=True,
+                          rebuild_after_s=0.2, cooldown_s=2.0)
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    t_fo = s.events("rs1", "failover")[0].ts
+    await s.until(lambda: s.events("rs1", "replace"), timeout=6, what="replace after cooldown")
+    assert s.events("rs1", "replace")[0].ts - t_fo >= 1.9
+
+
+async def test_io_threads_stopped_before_choosing(sim_factory):
+    """REVIEW #4: candidates' IO threads are stopped before their sets are compared."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    ev = s.events("rs1", "failover")[0]
+    assert sorted(s.mgr.prober.stopped_io) == ["mysql-a2", "mysql-a3"]
+    assert ev.steps.choose.io_stopped == ["mysql-a2", "mysql-a3"]
+    loser = ({"mysql-a2", "mysql-a3"} - {ev.new_primary}).pop()
+    assert not s.fleet.nodes[loser].io_stopped, "repoint restarts the IO thread"
+
+
+async def test_naive_does_not_stop_io_threads(sim_factory):
+    s = await sim_factory(mode="naive", sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    assert s.mgr.prober.stopped_io == []
+
+
+async def test_role_change_retried_once_on_lost_link(sim_factory):
+    """REVIEW #8: the fence killed the agent's pooled link, /repoint answers 500 2013 once."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    loser_links = {"/repoint": 1}
+    for n in ("mysql-a2", "mysql-a3"):
+        s.fleet.nodes[n].fail_next = dict(loser_links)
+        s.fleet.nodes[n].fail_next["/promote"] = 1
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    ev = s.events("rs1", "failover")[0]
+    assert ev.new_primary and ev.steps.repoint.nodes, ev.note
+    assert ev.note is None or "repoint failed" not in ev.note
+
+
+async def test_catchup_accepts_partial_trailing_transaction(sim_factory):
+    """REVIEW #9: the source died mid-send, the relay log ends in a GTID that can never be
+    applied. With the IO thread stopped and the SQL thread idle, that is caught up."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.2)
+    s.fleet.writing = False
+    await asyncio.sleep(0.2)
+    a1 = s.fleet.nodes["mysql-a1"]
+    torn = GtidSet.of(a1.uuid, a1.next_gno)
+    for n in ("mysql-a2", "mysql-a3"):
+        r = s.fleet.nodes[n]
+        r.receive = False
+        r.retrieved = r.retrieved | torn
+        r.partial = torn
+    s.fleet.kill("mysql-a1")
+    await s.until(lambda: s.events("rs1", "failover"), what="failover")
+    ev = s.events("rs1", "failover")[0]
+    assert ev.new_primary and ev.steps.catchup.ok
+    assert ev.steps.catchup.duration_s < 1.5
+    assert "partial transaction" in ev.note
+
+
+async def test_slow_rejoin_repoint_does_not_pause_detection(sim_factory):
+    """REVIEW #10: a rejoin repoint that takes seconds runs in the background."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    a3 = s.fleet.nodes["mysql-a3"]
+    a3.repoint_delay = 2.0
+    a3.source = "mysql-a2"                       # straggler, needs a repoint
+    await s.until(lambda: "/repoint" in a3.calls, what="repoint started")
+    t0 = s.ctl().last_obs.ts
+    await asyncio.sleep(0.8)
+    assert s.ctl().last_obs.ts - t0 > 0.5, "the poll loop kept running"
+    await s.until(lambda: a3.source == "mysql-a1", what="repoint done")
+
+
+async def test_wake_guard_gets_unknown_while_discovering(sim_factory):
+    """REVIEW #16: before discovery the answer is 503 unknown, never null."""
+    s = await sim_factory(sets={"rs1": A}, start=False)
+    from aiohttp.test_utils import TestClient, TestServer
+    async with TestClient(TestServer(make_app(s.mgr))) as c:
+        r = await c.get("/v1/sets/rs1/primary")
+        assert r.status == 503 and (await r.json())["primary"] == "unknown"
+        await s.mgr.start()
+        await s.healthy("rs1", "mysql-a1")
+        r = await c.get("/v1/sets/rs1/primary")
+        assert r.status == 200 and (await r.json())["primary"] == "mysql-a1"
+
+
+def test_role_change_budget_exceeds_agent_budget():
+    """REVIEW #17: the agent bounds a whole role change to 30 s, the manager waits longer."""
+    from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
+    assert ROLE_CHANGE_TIMEOUT_S > 30.0
