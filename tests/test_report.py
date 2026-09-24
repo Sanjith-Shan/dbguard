@@ -81,3 +81,15 @@ def test_main_writes_files(tmp_path, capsys):
     assert main(["--results", str(tmp_path)]) == 0
     assert (tmp_path / "SUMMARY.md").exists()
     assert json.loads((tmp_path / "summary.json").read_text())["rows"] == 1
+
+
+def test_errors_files_are_not_runs(tmp_path):
+    from dbguard.harness.report import load_errors
+    (tmp_path / "kill_dbguard.jsonl").write_text(json.dumps(row()) + "\n")
+    (tmp_path / "kill_dbguard.errors.jsonl").write_text(
+        json.dumps({"scenario": "kill", "mode": "dbguard", "error": "boom"}) + "\n")
+    rows = load_rows(tmp_path)
+    assert len(rows) == 1
+    s = summarize(rows, load_errors(tmp_path))
+    assert s["failover"][0]["runs"] == 1 and s["failed_runs"] == {"kill/dbguard": 1}
+    assert "kill/dbguard 1" in render_markdown(s)

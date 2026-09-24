@@ -349,3 +349,16 @@ def test_workload_handshake_is_bounded():
         c._connect()
     assert time.time() - t0 < 3
     srv.close()
+
+
+def test_reconnect_gap_per_client():
+    oks = [{"client": c, "seq": i, "t_ok": 100 + i * 0.1, "latency_ms": 1.0} for c in (1, 2)
+           for i in range(50)]                      # both write until 104.9
+    oks += [{"client": 1, "seq": 99, "t_ok": 108.0, "t_start": 107.9, "latency_ms": 1.0},
+            {"client": 2, "seq": 99, "t_ok": 110.0, "t_start": 109.9, "latency_ms": 1.0}]
+    errs = [{"client": 1, "seq": 51, "error": "x", "t_err": 105.5},
+            {"client": 2, "seq": 51, "error": "x", "t_err": 105.6},
+            {"client": 3, "seq": 1, "error": "in-flight at shutdown", "t_err": 120.0}]
+    st = analyze_acks(oks, errs, inject_ts=105.0)
+    assert st.reconnect_gaps == 2
+    assert st.reconnect_gap_p50_s == pytest.approx(108.0 - 104.9)

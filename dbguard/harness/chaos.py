@@ -162,6 +162,8 @@ class AckStats:
     writes_per_s: float | None = None
     first_ts: float | None = None
     last_ts: float | None = None
+    reconnect_gap_p50_s: float | None = None
+    reconnect_gaps: int = 0
 
 
 def read_ack_log(path: Path) -> tuple[list[dict], list[dict]]:
@@ -233,6 +235,27 @@ def analyze_acks(oks: list[dict], errs: list[dict], inject_ts: float | None,
             best = (b - a, a, b)
     if best[1] is not None:
         st.stall_s, st.stall_start, st.stall_end = best
+    # client-visible outage per client: its last ok before its own first error after inject,
+    # to its first ok whose request started after that error
+    gaps = []
+    by_client: dict[Any, list[dict]] = {}
+    for r in oks:
+        by_client.setdefault(r.get("client"), []).append(r)
+    first_err_by_client: dict[Any, float] = {}
+    for r in errs:
+        t = r.get("t_err")
+        if t is None or float(t) < inject_ts - 0.05 or r.get("error") == "in-flight at shutdown":
+            continue
+        c = r.get("client")
+        first_err_by_client[c] = min(first_err_by_client.get(c, float("inf")), float(t))
+    for c, te in first_err_by_client.items():
+        cok = by_client.get(c, [])
+        before_c = [float(r["t_ok"]) for r in cok if float(r["t_ok"]) <= te]
+        after_c = [float(r["t_ok"]) for r in cok if ok_start(r) >= te]
+        if before_c and after_c:
+            gaps.append(min(after_c) - max(before_c))
+    st.reconnect_gaps = len(gaps)
+    st.reconnect_gap_p50_s = nearest_rank(gaps, 50)
     if st.first_ok_after_ts is not None:
         st.failover_s = st.first_ok_after_ts - inject_ts
         # client-visible stall for an error-driven failover: last ok before the first error
@@ -1010,7 +1033,8 @@ def apply_acks(run: Run, wl: Workload, inject_ts: float | None, window_end: floa
     r.update({"acked_writes": st.acked, "errors": st.errors, "first_error_ts": st.first_error_ts,
               "first_ok_after_ts": st.first_ok_after_ts, "failover_s": st.failover_s,
               "stall_s": st.stall_s, "commit_p50_ms": st.commit_p50_ms,
-              "commit_p99_ms": st.commit_p99_ms, "writes_per_s": st.writes_per_s})
+              "commit_p99_ms": st.commit_p99_ms, "writes_per_s": st.writes_per_s,
+              "reconnect_gap_p50_s": st.reconnect_gap_p50_s, "reconnect_gaps": st.reconnect_gaps})
     r["workload_summary"] = wl.summary()
     return st
 
@@ -1399,6 +1423,13 @@ def sc_cost(run: Run) -> None:
         st = agent(p).status() or {}
         run.row["semisync_source_status"] = (st.get("semisync") or {}).get("source_status")
         wl = start_workload(run, o.cost_seconds)
+        last_wait = None
+        while wl.alive():    # keep the last sample taken while the workload still runs
+            ss = ((agent(p).status() or {}).get("semisync") or {})
+            if ss.get("avg_wait_time_us") is not None:
+                last_wait = ss["avg_wait_time_us"]
+            time.sleep(1.0)
+        run.row["semisync_avg_wait_us"] = last_wait
         wl.wait()
         apply_acks(run, wl, None)
         # steady state: drop the first 2 s of connection warm-up from the rate

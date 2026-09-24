@@ -27,6 +27,8 @@ def percentile(values: Iterable[float | None], q: float) -> float | None:
 def load_rows(results_dir: Path) -> list[dict]:
     rows = []
     for p in sorted(Path(results_dir).glob("*.jsonl")):
+        if p.name.endswith(".errors.jsonl"):
+            continue   # failed runs are not runs, see load_errors()
         for i, line in enumerate(p.read_text().splitlines()):
             line = line.strip()
             if not line:
@@ -38,6 +40,19 @@ def load_rows(results_dir: Path) -> list[dict]:
             row.setdefault("_file", f"{p.name}:{i + 1}")
             rows.append(row)
     return rows
+
+
+def load_errors(results_dir: Path) -> dict[str, int]:
+    """Failed runs per scenario/mode, from results/<scenario>_<mode>.errors.jsonl."""
+    out: dict[str, int] = defaultdict(int)
+    for p in sorted(Path(results_dir).glob("*.errors.jsonl")):
+        for line in p.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out[f"{r.get('scenario', '?')}/{r.get('mode', '?')}"] += 1
+    return dict(sorted(out.items()))
 
 
 def _f(v, digits=2) -> str:
@@ -88,6 +103,7 @@ def failover_summary(rows: list[dict]) -> list[dict]:
             "writes_on_woken_primary": sum(int(v) for v in woken) if woken else None,
             "stall_p50_s": percentile([r.get("stall_s") for r in rs], 50),
             "stall_p99_s": percentile([r.get("stall_s") for r in rs], 99),
+            "reconnect_gap_p50_s": percentile([r.get("reconnect_gap_p50_s") for r in rs], 50),
             "rs2_state_changes": _sum(rs, "rs2_state_changes"),
         })
     return out
@@ -130,6 +146,7 @@ def cost_summary(rows: list[dict]) -> list[dict]:
             "commit_p50_ms": percentile([r.get("commit_p50_ms") for r in rs], 50),
             "commit_p99_ms": percentile([r.get("commit_p99_ms") for r in rs], 50),
             "writes_per_s": percentile([r.get("writes_per_s") for r in rs], 50),
+            "semisync_avg_wait_us": percentile([r.get("semisync_avg_wait_us") for r in rs], 50),
         })
     return out
 
@@ -165,9 +182,10 @@ def switchover_summary(rows: list[dict]) -> list[dict]:
     return out
 
 
-def summarize(rows: list[dict]) -> dict:
+def summarize(rows: list[dict], errors: dict[str, int] | None = None) -> dict:
     return {
         "rows": len(rows),
+        "failed_runs": errors or {},
         "failover": failover_summary(rows),
         "rejoin": rejoin_summary(rows),
         "cost": cost_summary(rows),
@@ -185,18 +203,24 @@ def render_markdown(s: dict) -> str:
     for env in s["environment"]:
         parts.append(f"- {env}")
     parts.append("")
+    if s.get("failed_runs"):
+        parts.append("Runs that raised and wrote no row (results/*.errors.jsonl): " +
+                     ", ".join(f"{k} {v}" for k, v in s["failed_runs"].items()) + ".")
+        parts.append("")
 
     fo = [x for x in s["failover"] if x["scenario"] != "partition-manager"]
     if fo:
         parts += ["## Failover under injected faults", "", md_table(
             ["scenario", "mode", "runs", "failover p50 s", "failover p99 s", "lost acked writes",
              "runs with loss", "phantom writes", "single-writer violations", "false failovers",
-             "converged", "writes on woken primary", "stall p50 s", "stall p99 s", "rs2 changes"],
+             "converged", "writes on woken primary", "stall p50 s", "stall p99 s",
+             "client reconnect gap p50 s", "rs2 changes"],
             [[x["scenario"], x["mode"], x["runs"], x["failover_p50_s"], x["failover_p99_s"],
               x["lost_acked_writes"], x["runs_with_loss"], x["phantom_writes"],
               x["single_writer_violations"], x["false_failovers"],
               f"{x['converged_runs']}/{x['runs']}", x["writes_on_woken_primary"],
-              x["stall_p50_s"], x["stall_p99_s"], x["rs2_state_changes"]] for x in fo]), ""]
+              x["stall_p50_s"], x["stall_p99_s"], x["reconnect_gap_p50_s"],
+              x["rs2_state_changes"]] for x in fo]), ""]
     pm = [x for x in s["failover"] if x["scenario"] == "partition-manager"]
     if pm:
         parts += ["## Manager partitioned from the primary (correct action is none)", "", md_table(
@@ -212,9 +236,11 @@ def render_markdown(s: dict) -> str:
              for x in s["rejoin"]]), ""]
     if s["cost"]:
         parts += ["## Cost of losslessness", "", md_table(
-            ["mode", "semi-sync", "netem ms", "runs", "commit p50 ms", "commit p99 ms", "writes/s"],
+            ["mode", "semi-sync", "netem ms", "runs", "commit p50 ms", "commit p99 ms", "writes/s",
+             "semi-sync avg wait us"],
             [[x["mode"], "on" if x["semisync"] else "off", x["netem_ms"], x["runs"],
-              x["commit_p50_ms"], x["commit_p99_ms"], x["writes_per_s"]] for x in s["cost"]]), ""]
+              x["commit_p50_ms"], x["commit_p99_ms"], x["writes_per_s"],
+              x["semisync_avg_wait_us"]] for x in s["cost"]]), ""]
     if s["replica_loss"]:
         parts += ["## Replica loss and replacement", "", md_table(
             ["mode", "runs", "stall p50 s (no replica)", "resume p50 s", "clones", "clone MB",
@@ -238,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-write", action="store_true", help="print only, do not write SUMMARY.md")
     a = ap.parse_args(argv)
     rows = load_rows(Path(a.results))
-    s = summarize(rows)
+    s = summarize(rows, load_errors(Path(a.results)))
     md = render_markdown(s)
     print(md)
     if not a.no_write:
