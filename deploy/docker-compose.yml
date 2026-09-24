@@ -17,6 +17,9 @@ x-node: &node
     dockerfile: deploy/Dockerfile
   cap_add: [NET_ADMIN, SYS_NICE]
   mem_limit: 700m
+  # Binlog on a size-limited tmpfs (disk-full scenario). mysqld gets ENOSPC at 256 MB.
+  tmpfs:
+    - /var/lib/mysql-binlog:size=256m,mode=0770,uid=999,gid=999
   logging: *logging
   networks: [dbguard]
   restart: "no"

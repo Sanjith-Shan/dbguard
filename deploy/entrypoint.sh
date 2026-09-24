@@ -25,6 +25,10 @@ report_port=3306
 CNF
 log "rendered dbguard-node.cnf server_id=${DBGUARD_SERVER_ID} semisync=${DBGUARD_SEMISYNC}"
 
+# Binlog dir (tmpfs in compose, a plain dir otherwise). mysqld runs as user mysql.
+mkdir -p /var/lib/mysql-binlog
+chown mysql:mysql /var/lib/mysql-binlog
+
 if [ ! -d /var/lib/mysql/mysql ]; then
     log "datadir empty, initialising"
     /usr/local/bin/dbguard-initdb.sh

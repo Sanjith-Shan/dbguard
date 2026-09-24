@@ -105,6 +105,7 @@ Fleet deviations from the block above, all in `deploy/mysql/my.cnf`.
 | `loose_rpl_semi_sync_source_*` | `mysqld --initialize` ignores `plugin_load_add`, so without `loose_` the first boot aborts on an unknown variable. `bin/bootstrap` checks the plugins are ACTIVE instead |
 | one `plugin_load_add` line per plugin | same effect as the `;` list, easier to read |
 | `replica_parallel_workers=16`, `replica_preserve_commit_order=ON` | with 4 workers the replicas fell 44 s behind in five minutes of 8-client load (BUGS.md) |
+| `log_bin=/var/lib/mysql-binlog/binlog` on a per-node `tmpfs` of 256 MB | the disk-full scenario fills the binlog, not the datadir. The tmpfs is emptied by a container stop or recreate (not by the agent restarting mysqld), so a node that was stopped and started again comes back with no binlog files. Its GTID state survives in `mysql.gtid_executed`, so it can still be repointed, but it can no longer serve as a source for GTIDs only its old binlog had, and XA crash recovery of prepared transactions has no binlog to consult |
 | `relay_log_recovery=ON` | crash-safe replica. A replica that crashed refetches its relay log from the source by GTID auto-position |
 | `binlog_expire_logs_seconds=3600` | the laptop disk is small |
 | `innodb_buffer_pool_size=128M`, `innodb_redo_log_capacity=128M`, `mem_limit: 700m` | eight nodes fit in Docker Desktop's 8 GB |
