@@ -85,7 +85,8 @@ def by_what(res):
 def test_every_doc_tag_is_mapped():
     docs = [REPO / d for d in fill.DEFAULT_DOCS]
     tags = fill.scan(docs)
-    assert len(tags) > 200
+    # The docs are filled after a campaign, so zero tags is the normal shipped state.
+    # Any tag that is present must be one the mapping knows.
     assert not [t.body for t in tags if t.what not in fill.MAP]
 
 
