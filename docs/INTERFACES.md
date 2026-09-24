@@ -244,6 +244,68 @@ and in the API
  "notes":str}
 ```
 
+Harness additions to the row. Extra keys only, nothing removed.
+
+- Every row. `errors` (client errors in the ack log), `primary_at_inject`, `new_primary`,
+  `config` (the fleet.yaml knobs), `heal` (`{"hard_reset":bool,"heal_s":f}`), `duration_s`,
+  `commands` (every mutating docker command with its timestamp), `workload_summary` (the
+  workload's own JSON summary, for cross-checking), `checker_nodes`.
+- `failover_s`, `stall_s` and the commit percentiles are computed by the harness from the ack
+  log on the host clock. When the failover produced no client error (commits only blocked),
+  `failover_s` is inject to the end of the largest ack gap that follows the injection.
+  `stall_s` is that largest gap between consecutive acknowledged writes, all clients merged.
+- cost. `semisync` (bool), `netem_ms` (f), `semisync_effective` (the primary's
+  `Rpl_semi_sync_source_status` after `/configure`).
+- switchover. `switchover_api_s`. `failover_s` is null (a planned switchover is not a failure),
+  `errors` counts only errors after the call.
+- hang-container and hang-process. `wake_ts` and `woken`
+  (`{"node","samples","missing_on_new_primary","written_after_wake","primary_200_seen",
+  "super_read_only_0_seen","super_read_only_now","primary_code_now","fenced_now"}`),
+  polled every 0.5 s for 15 s after SIGCONT or unpause. hang-container also records
+  `agent_answered_while_frozen` and `docker_exec_while_frozen_rc`. hang-process records
+  `mysqld_pid`, `mysqld_restarted` and `fence_method`.
+- partition-replicas. `old_primary_fenced`, `heal_ts`. partition-manager. `states_seen`.
+- replica-loss. `resume_s`, `degraded_seen`, `writes_while_degraded`, `stall_event`,
+  `dataset_mb`, `killed`. kill-two. `killed` (the primary and the replica with the largest
+  Retrieved_Gtid_Set).
+- `rejoin` also carries `since_restart_s`, and `rejoin_event` holds the manager's event. In
+  orchestrator mode the branch is `harness-repoint` or `harness-rebuild`, because Orchestrator
+  does not rejoin a dead primary and the harness does it through the agents.
+- A run that raised is not written to the results file. It goes to
+  `results/<scenario>_<mode>.errors.jsonl` with the traceback.
+- Only the row survives a run. The ack log and the workload output are deleted once the
+  checker has read them (set `DBGUARD_KEEP_ACKS=1` to keep them).
+
+### Fault injection mechanics
+
+- kill. `docker kill -s KILL <primary>`.
+- hang-container. `docker pause` (cgroup freezer). `docker kill -s STOP` reaches only PID 1
+  (tini) and leaves the agent and mysqld running, so it cannot be used.
+- hang-process. `docker exec <c> kill -STOP <mysqld pid>`, the agent stays alive.
+- iptables and tc netem run in a helper container that joins the target's network namespace
+  (`docker run --rm --net container:<c> --cap-add NET_ADMIN dbguard-nettools:1`, alpine
+  plus iptables and iproute2, built on first use). Same kernel state as running them inside
+  the target, and no dependency on the target image.
+
+### disk-full (not implemented yet)
+
+Filling a node's datadir would fill the Docker VM disk that every container shares. The
+scenario needs a small per-node tmpfs for the binary logs, for example
+`tmpfs: /var/lib/mysql-binlog:size=256m` on every node in deploy/docker-compose.yml and
+`log_bin=/var/lib/mysql-binlog/binlog` in deploy/mysql/my.cnf. Both files belong to the
+fleet. Until they carry it, `bin/chaos --scenario disk-full` raises NotImplementedError.
+
+### Orchestrator baseline
+
+Image `percona/percona-orchestrator:3.2.6-24` (multi-arch, native arm64). The upstream
+`openarkcode/orchestrator` image stops at v3.2.4 (2021, amd64 only) and issues
+`SHOW SLAVE STATUS`, which MySQL 8.4 removed. The compose service (profile `orchestrator`)
+mounts `deploy/orchestrator/orchestrator.conf.json` at `/etc/orchestrator/orchestrator.conf.json`
+and `deploy/orchestrator/hooks` at `/usr/local/orchestrator/hooks` (read-only). The image runs
+as uid 1001, so the hooks write `/var/lib/orchestrator/hooks/events.jsonl` inside the
+container, and the harness reads it with `docker exec orchestrator cat`. The harness stops
+the `dbguard` container for the whole orchestrator campaign so only one automation acts.
+
 ## Workload and checker
 
 `bin/workload --host 127.0.0.1 --port 13306 --clients 8 --duration 60 --run-id X
