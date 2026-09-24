@@ -124,6 +124,29 @@ heredocs and cache mounts already).
 - Fix. The fence closes the agent's idle pool and its heartbeat connection before it lists
   threads, and pooled requests retry once on a lost link (2006, 2013).
 
+### CLONE refuses a super_read_only recipient
+
+- Symptom. `/rebuild` failed at once with `(1290, 'The MySQL server is running with the
+  --super-read-only option so it cannot execute this statement')` on `CLONE INSTANCE`.
+- How found. Rebuilding a node with three phantom GTIDs in a private two-node pair built
+  from the dbguard-node image. Every node boots read-only by design, so every rebuild hit it.
+- Fix. The agent sets `super_read_only=0` right before `CLONE INSTANCE` and holds a
+  `rebuilding` flag that keeps `/primary` at 503 and keeps the heartbeat, the wake guard and
+  the self-fence lease from treating the node as a primary. The clone overwrites anything
+  written in that window, and the restarted mysqld boots read-only again. Verified end to
+  end afterwards, phantom_gtids 3, 79 MB cloned in 7 s, mysqld exited with code 16 and the
+  agent restarted it (the `MYSQLD_PARENT_PID` handshake works).
+
+### A clone from a stalled semi-sync primary hangs
+
+- Symptom. `/rebuild` from a donor whose heartbeat INSERT was waiting for a semi-sync ACK
+  never finished. The donor showed clone threads in state `starting` for five minutes.
+- How found. The first rebuild attempt in the private pair, where the only replica was the
+  recipient, so the donor had no semi-sync replica left.
+- Fix. None in the agent. Clone from a donor that is not stalled, which is what the
+  manager does (a replica for replacement, or a new primary that has an acking replica for
+  rejoin). Worth a line in the runbook.
+
 ## Harness
 
 ### docker kill -s STOP froze nothing but tini
