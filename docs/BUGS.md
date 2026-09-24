@@ -169,8 +169,8 @@ heredocs and cache mounts already).
 - How found. The first rebuild attempt in the private pair, where the only replica was the
   recipient, so the donor had no semi-sync replica left.
 - Fix. None in the agent. Clone from a donor that is not stalled, which is what the
-  manager does (a replica for replacement, or a new primary that has an acking replica for
-  rejoin). Worth a line in the runbook.
+  manager does. For both rejoin and replacement the donor is a replica that is streaming from
+  the current primary, never the primary itself. Worth a line in the runbook.
 
 ## Harness
 
@@ -302,7 +302,9 @@ heredocs and cache mounts already).
   the step durations in the switchover event.
 - Fix. The switchover now repoints every other node to the candidate before promoting it.
   The candidate is read-only and already holds all of the old primary's transactions, so
-  replicas can attach early. The next switchover stalled clients for 0.89 s.
+  replicas can attach early. The next real switchover stalled clients for 1.6 s. A later
+  reorder moves the other replicas under the candidate before the quiesce and repoints the
+  old primary after the stall, so the stall is only quiesce, catch-up and promote.
 
 ### Switchover refused because two snapshots were taken at different moments
 
@@ -388,3 +390,26 @@ heredocs and cache mounts already).
   handshake is bounded, then clears the timeout for queries. A regression test uses a
   socket that accepts and never greets. Cost: a reconnect that lands in the dead window can
   wait up to 2 s before it retries, which bounds how much this can inflate `failover_s`.
+
+### The hang-process pilot never stopped mysqld
+
+- Symptom. In the first hang-process pilot the manager stayed HEALTHY for the whole 90 s
+  hang, the agent reported mysqld responsive, and the harness logged "no new primary
+  within 90 s".
+- How found. `/proc/131/status` inside mysql-a1 showed mysqld in state `S (sleeping)`, not
+  `T (stopped)`, 44 s after the harness had logged `docker exec mysql-a1 kill -STOP 131`.
+- Cause. The node image (Oracle Linux slim) has no `/usr/bin/kill`, only the shell builtin,
+  so `docker exec <c> kill ...` failed with "executable file not found". The helper ran
+  with `check=False` and the failure disappeared.
+- Fix. `signal_pid` runs `sh -c "kill -SIG pid"` and raises on failure, and the scenario
+  reads `/proc/<pid>/status` right after SIGSTOP and aborts the run unless mysqld is in
+  state T. The row records `mysqld_state_after_stop`.
+
+### Background chaos runs ignored SIGINT
+
+- Symptom. `pkill -INT` of a pilot started from a background shell script did nothing, and
+  only SIGTERM stopped it, which skipped the run's cleanup.
+- Cause. A non-interactive shell starts background jobs with SIGINT ignored, and Python
+  keeps an ignored disposition. bin/campaign under nohup runs chaos the same way.
+- Fix. bin/chaos installs handlers that turn SIGINT and SIGTERM into KeyboardInterrupt, so
+  the finally blocks thaw frozen containers, flush iptables and heal the set.
