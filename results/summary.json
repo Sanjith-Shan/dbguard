@@ -90,6 +90,48 @@
     {
       "converged_runs": 30,
       "failed_over_runs": 30,
+      "failover_p50_s": 5.450585126876831,
+      "failover_p99_s": 5.845079660415649,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "naive",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 5.48846697807312,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 0,
+      "runs": 30,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "kill",
+      "single_writer_violations": 0,
+      "stall_p50_s": 5.374212741851807,
+      "stall_p99_s": 5.79270076751709,
+      "writes_on_woken_primary": null
+    },
+    {
+      "converged_runs": 10,
+      "failed_over_runs": 10,
+      "failover_p50_s": 5.490654945373535,
+      "failover_p99_s": 5.762304067611694,
+      "false_failovers": 0,
+      "lost_acked_writes": 0,
+      "mode": "naive (netem 2 ms)",
+      "phantom_writes": 0,
+      "reconnect_gap_p50_s": 5.5233070850372314,
+      "rs2_role_changes": 0,
+      "rs2_state_changes": 0,
+      "runs": 10,
+      "runs_with_errant_gtids": 0,
+      "runs_with_loss": 0,
+      "scenario": "kill",
+      "single_writer_violations": 0,
+      "stall_p50_s": 5.455227851867676,
+      "stall_p99_s": 5.70512580871582,
+      "writes_on_woken_primary": null
+    },
+    {
+      "converged_runs": 30,
+      "failed_over_runs": 30,
       "failover_p50_s": 11.583947896957397,
       "failover_p99_s": 14.233891248703003,
       "false_failovers": 0,
@@ -165,6 +207,30 @@
       "scenario": "kill"
     },
     {
+      "mode": "naive",
+      "other": 0,
+      "phantom_gtids_max": 8,
+      "phantom_gtids_mean": 2.3333333333333335,
+      "rebuild": 22,
+      "rejoin_p50_s": 6.641,
+      "rejoin_p99_s": 8.623,
+      "rejoins": 30,
+      "repoint": 8,
+      "scenario": "kill"
+    },
+    {
+      "mode": "naive (netem 2 ms)",
+      "other": 0,
+      "phantom_gtids_max": 6,
+      "phantom_gtids_mean": 2.2,
+      "rebuild": 5,
+      "rejoin_p50_s": 0.181,
+      "rejoin_p99_s": 8.659,
+      "rejoins": 10,
+      "repoint": 5,
+      "scenario": "kill"
+    },
+    {
       "mode": "dbguard",
       "other": 0,
       "phantom_gtids_max": 10,
@@ -177,17 +243,29 @@
       "scenario": "partition-replicas"
     }
   ],
-  "replica_loss": [],
-  "rows": 149,
-  "switchover": [
+  "replica_loss": [
     {
-      "errors": 264,
+      "clone_mb_p50": 937.646365,
+      "clone_mb_per_s_p50": 128.26,
+      "clone_s_p50": 7.31,
+      "clones": 1,
       "lost_acked_writes": 0,
       "mode": "dbguard",
-      "runs": 30,
-      "runs_with_errors": 30,
-      "stall_p50_s": 2.0575931072235107,
-      "stall_p99_s": 24.016018867492676
+      "resume_p50_s": 12.455913782119751,
+      "runs": 1,
+      "stall_p50_s": 22.436190843582153
+    }
+  ],
+  "rows": 170,
+  "switchover": [
+    {
+      "errors": 80,
+      "lost_acked_writes": 0,
+      "mode": "dbguard",
+      "runs": 10,
+      "runs_with_errors": 10,
+      "stall_p50_s": 1.4448020458221436,
+      "stall_p99_s": 6.028404951095581
     }
   ]
 }

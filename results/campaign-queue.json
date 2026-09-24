@@ -1,109 +1,18 @@
 [
   {
-    "scenario": "partition-replicas",
-    "mode": "dbguard",
-    "runs": 30
-  },
-  {
-    "scenario": "kill-two",
-    "mode": "dbguard",
-    "runs": 10
-  },
-  {
-    "scenario": "cost",
-    "mode": "dbguard",
-    "runs": 3,
-    "args": [
-      "--cost-seconds",
-      "60"
-    ]
-  },
-  {
-    "scenario": "replica-loss",
-    "mode": "dbguard",
-    "runs": 10,
-    "args": [
-      "--data-mb",
-      "200"
-    ]
-  },
-  {
-    "scenario": "disk-full",
-    "mode": "dbguard",
-    "runs": 10
-  },
-  {
-    "scenario": "kill",
-    "mode": "naive",
-    "runs": 30
-  },
-  {
-    "scenario": "partition-manager",
-    "mode": "naive",
-    "runs": 30
-  },
-  {
-    "scenario": "kill",
-    "mode": "orchestrator",
-    "runs": 30
-  },
-  {
-    "scenario": "partition-manager",
-    "mode": "orchestrator",
-    "runs": 30
-  },
-  {
-    "scenario": "hang-container",
-    "mode": "dbguard",
-    "runs": 30,
-    "args": [
-      "--hang-seconds",
-      "45"
-    ],
-    "archive": "rejoin-quiesce"
-  },
-  {
-    "scenario": "hang-process",
-    "mode": "dbguard",
-    "runs": 30,
-    "args": [
-      "--hang-seconds",
-      "45"
-    ]
-  },
-  {
-    "scenario": "hang-container",
-    "mode": "orchestrator",
-    "runs": 15,
-    "args": [
-      "--hang-seconds",
-      "45"
-    ]
-  },
-  {
-    "scenario": "kill",
-    "mode": "dbguard",
-    "runs": 30,
-    "archive": "agent-live-primary-check"
-  },
-  {
-    "scenario": "partition-manager",
-    "mode": "dbguard",
-    "runs": 30,
-    "archive": "agent-live-primary-check"
-  },
-  {
     "scenario": "switchover",
     "mode": "dbguard",
-    "runs": 30,
+    "runs": 10,
     "archive": "agent-live-primary-check"
   },
   {
-    "scenario": "kill-two",
-    "mode": "dbguard",
-    "runs": 10,
-    "archive": "stall-recovery",
-    "fleet_rebuild": true,
-    "note": "agent POST /unstick, manager clones from the stalled primary as donor of last resort"
+    "scenario": "kill",
+    "mode": "naive",
+    "runs": 30
+  },
+  {
+    "scenario": "partition-manager",
+    "mode": "naive",
+    "runs": 10
   }
 ]

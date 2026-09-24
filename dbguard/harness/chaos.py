@@ -1299,11 +1299,16 @@ def sc_kill(run: Run) -> None:
         # Only used when the naive pilot lost nothing: async replication on one host can keep
         # up so closely that a SIGKILL never lands between commit and replication.
         p = f.primary()
-        for r in [n for n in f.members() if n != p]:
-            docker.netem_delay(r, o.naive_netem_ms)
+        reps = [n for n in f.members() if n != p]
+        # delay the primary -> replica direction only: that is the replication stream, so an
+        # async replica really lags and a kill can land between commit and replication.
+        # (Delaying the replicas' egress only slows acks and never opens a loss window.)
+        docker.netem_to(p, [docker.container_ip(r) for r in reps], o.naive_netem_ms)
         run.row["naive_netem_ms"] = float(o.naive_netem_ms)
         run.row["netem_ms"] = float(o.naive_netem_ms)
-        note(run, f"{o.mode} kill run with tc netem delay {o.naive_netem_ms} ms on the replicas")
+        run.row["netem_direction"] = "primary->replicas"
+        note(run, f"{o.mode} kill run with tc netem delay {o.naive_netem_ms} ms on the primary's "
+                  "packets to the replicas")
     _failover_common(run, lambda p: docker.kill(p, "KILL"))
 
 

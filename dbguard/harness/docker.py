@@ -240,6 +240,16 @@ def netem_delay(container: str, ms: float, dev: str = "eth0") -> None:
     netns(container, f"tc qdisc replace dev {dev} root netem delay {ms}ms")
 
 
+def netem_to(container: str, dst_ips: list[str], ms: float, dev: str = "eth0") -> None:
+    """Delay only the packets `container` sends to `dst_ips` (prio qdisc, netem on band 3,
+    u32 filters on the destination address). Clients and the manager are not delayed."""
+    cmds = [f"tc qdisc replace dev {dev} root handle 1: prio",
+            f"tc qdisc add dev {dev} parent 1:3 handle 30: netem delay {ms}ms"]
+    cmds += [f"tc filter add dev {dev} protocol ip parent 1:0 prio 3 u32 match ip dst {ip}/32 flowid 1:3"
+             for ip in dst_ips]
+    netns(container, " && ".join(cmds))
+
+
 def netem_clear(container: str, dev: str = "eth0") -> None:
     netns(container, f"tc qdisc del dev {dev} root 2>/dev/null; true", check=False)
 
