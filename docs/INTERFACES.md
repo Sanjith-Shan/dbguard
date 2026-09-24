@@ -184,8 +184,15 @@ Agent additions to the shapes above. Extra keys only, nothing removed.
 - `/promote` enables semi-sync on the source side BEFORE it clears `super_read_only`, so no
   write is ever accepted on the new primary without the ack requirement. The executed order is
   `STOP REPLICA`, `RESET REPLICA ALL`, `SET GLOBAL rpl_semi_sync_replica_enabled=0`,
-  `SET GLOBAL rpl_semi_sync_source_enabled=1`, `SET GLOBAL super_read_only=0`,
-  `SET GLOBAL read_only=0`, then the fence flag is cleared.
+  `SET GLOBAL rpl_semi_sync_source_enabled=1`, `SET GLOBAL super_read_only=0, read_only=0`
+  (one statement, always the last SQL), then the fence flag is cleared.
+- Role change deadline. `/promote`, `/repoint` and `/configure` (when it runs SQL) each get
+  one overall deadline of 30 s, lock wait and restart-hold wait included. On expiry the agent
+  answers 504 `{"error":"deadline","step":"<statement or step it was on>"}`, logs
+  `role_change_deadline`, and leaves the node where it got to. A cut-short promote is either
+  still read-only, or writable with semi-sync source already on, and in both cases the fence
+  flag is still set, so `/primary` stays 503. `/rebuild` is not bounded this way because a
+  clone takes as long as the data does.
 - `/fence` answers 500 with `"method":"failed"` when the SET missed its deadline and the agent
   has no mysqld pid to kill (only possible with `--no-supervise`). The flag is still set.
 - `/configure` takes any of `{"semisync":bool,"self_fence":bool,"wake_guard":bool}` and

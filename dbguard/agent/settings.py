@@ -35,6 +35,7 @@ class AgentSettings:
     status_deadline_s: float = 2.0
     fence_deadline_s: float = 2.0
     role_change_timeout_s: float = 30.0
+    role_change_deadline_s: float = 30.0
     heartbeat_interval_s: float = 0.5
     wake_gap_s: float = 3.0
     manager_timeout_s: float = 1.0

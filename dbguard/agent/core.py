@@ -142,6 +142,7 @@ class Agent:
         self._hb_session: Session | None = None
         self._role = "unknown"
         self.rebuilding = False
+        self._step: str | None = None
         self.self_fence_on = True
         self.wake_guard_on = settings.wake_guard
         self._mgr_unreachable_since: float | None = None
@@ -171,6 +172,7 @@ class Agent:
 
     async def _role_sql(self, sess: Session, sql: str, args: Any = None,
                         timeout: float | None = None) -> int:
+        self._step = sql
         return await sess.execute(sql, args, timeout=timeout or self.s.role_change_timeout_s,
                                   log_sql=True)
 
@@ -460,6 +462,7 @@ class Agent:
         """A role change needs mysqld. End a kill-fence hold and wait for it to be up."""
         if not self.sup.held:
             return
+        self._step = "wait mysqld restart after hold"
         gen = self.sup.generation
         self.sup.release_hold()
         log.info("mysqld_restart_hold_released", by=why)
@@ -468,7 +471,24 @@ class Agent:
         if not await self.wait_responsive(self.s.restart_wait_s):
             raise AgentError("mysqld not responsive after the hold", status=503)
 
+    async def _deadlined(self, op: str, fn: Callable[[], Awaitable[Any]]) -> Any:
+        """One overall deadline for a whole role-change request (the manager waits 35 s).
+        On expiry the node stays in whatever state it reached and the caller gets 504."""
+        self._step = "wait role lock"
+        t0 = time.monotonic()
+        try:
+            async with asyncio.timeout(self.s.role_change_deadline_s):
+                return await fn()
+        except TimeoutError as e:
+            dur = round((time.monotonic() - t0) * 1000, 2)
+            log.error("role_change_deadline", op=op, step=self._step, duration_ms=dur,
+                      deadline_s=self.s.role_change_deadline_s, fenced=self.fenced)
+            raise AgentError("deadline", status=504, step=self._step) from e
+
     async def promote(self) -> dict[str, Any]:
+        return await self._deadlined("promote", self._promote)
+
+    async def _promote(self) -> dict[str, Any]:
         async with self._role_lock:
             t0 = time.monotonic()
             await self._end_restart_hold("promote")
@@ -480,12 +500,16 @@ class Agent:
                 await self._role_sql(s, "SET GLOBAL rpl_semi_sync_replica_enabled=0")
                 await self._role_sql(s, "SET GLOBAL rpl_semi_sync_source_enabled="
                                      + ("1" if self.semisync else "0"))
-                await self._role_sql(s, "SET GLOBAL super_read_only=0")
-                await self._role_sql(s, "SET GLOBAL read_only=0")
+                # Writable is the LAST statement, in one SET. A promote cut short by the
+                # deadline leaves the node read-only, or writable with semi-sync source
+                # already on, and the fence flag (cleared below) still set.
+                await self._role_sql(s, "SET GLOBAL super_read_only=0, read_only=0")
+                self._step = "clear fence flag"
+                async with self._fence_lock:
+                    self._set_fenced(False)
+                self._step = "SELECT @@GLOBAL.gtid_executed"
                 rows = await s.query("SELECT @@GLOBAL.gtid_executed AS g",
                                      timeout=self.s.role_change_timeout_s)
-            async with self._fence_lock:
-                self._set_fenced(False)
             self._set_role("primary")
             self.m.promotions.inc()
             dur = round((time.monotonic() - t0) * 1000, 2)
@@ -496,6 +520,9 @@ class Agent:
     async def repoint(self, source: str) -> dict[str, Any]:
         if not source or source == self.s.node:
             raise AgentError(f"bad source {source!r}", status=400)
+        return await self._deadlined("repoint", lambda: self._repoint(source))
+
+    async def _repoint(self, source: str) -> dict[str, Any]:
         async with self._role_lock:
             t0 = time.monotonic()
             await self._end_restart_hold("repoint")
@@ -540,6 +567,9 @@ class Agent:
                 return {"ok": True, "semisync": self.semisync, **self.guard_toggles()}
         if semisync is not None:
             self.semisync = bool(semisync)
+        return await self._deadlined("configure", lambda: self._configure(reason))
+
+    async def _configure(self, reason: str) -> dict[str, Any]:
         async with self._role_lock:
             async with self.db.session(self.s.sql_timeout_s) as s:
                 r = (await s.query("SELECT @@GLOBAL.super_read_only AS sro",

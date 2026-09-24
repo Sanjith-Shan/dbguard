@@ -95,7 +95,7 @@ class FakeDB:
             self.sro, self.ro = 1, 1
         elif s == "SET GLOBAL super_read_only=0":
             self.sro = 0
-        elif s == "SET GLOBAL read_only=0":
+        elif s in ("SET GLOBAL read_only=0", "SET GLOBAL super_read_only=0, read_only=0"):
             self.sro, self.ro = 0, 0
         elif s.startswith("SET GLOBAL rpl_semi_sync_source_enabled="):
             self.src_enabled = int(s[-1])
@@ -344,8 +344,7 @@ async def test_promote_sql_sequence(settings):
         "RESET REPLICA ALL",
         "SET GLOBAL rpl_semi_sync_replica_enabled=0",
         "SET GLOBAL rpl_semi_sync_source_enabled=1",
-        "SET GLOBAL super_read_only=0",
-        "SET GLOBAL read_only=0",
+        "SET GLOBAL super_read_only=0, read_only=0",
     ]
     assert set(body) == {"gtid_executed", "duration_ms"}
     assert not agent.fenced and not os.path.exists(settings.fence_file)
@@ -857,3 +856,55 @@ async def test_default_manager_get_maps_503_to_unknown():
             await default_manager_get(str(srv.make_url("/v1/sets/rs1/primary")), 1.0)
         got = await default_manager_get(str(srv.make_url("/v1/sets/rs2/primary")), 1.0)
         assert got["primary"] == "mysql-a1"
+
+
+
+# --------------------------------------------------------------------------- role deadline
+
+@pytest.mark.parametrize("hang_on,writable", [
+    ("RESET REPLICA ALL", False),
+    ("SET GLOBAL rpl_semi_sync_source_enabled", False),
+    ("SET GLOBAL super_read_only=0", False),
+])
+async def test_promote_deadline_leaves_node_safe(settings, client_factory, hang_on, writable):
+    """One overall deadline per role change. A promote cut short answers 504 with the
+    step it was on, and never leaves the node writable without semi-sync source on or
+    with the fence flag cleared."""
+    settings.role_change_deadline_s = 0.3
+    db = FakeDB()
+    db.hang.add(hang_on)
+    agent = make_agent(settings, db)
+    await agent.fence()
+    c = await client_factory(agent)
+    r = await c.post("/promote")
+    assert r.status == 504
+    body = await r.json()
+    assert body["error"] == "deadline" and hang_on in body["step"]
+    assert agent.fenced and os.path.exists(settings.fence_file)
+    assert (db.sro == 0) is writable
+    assert db.sro == 1 or db.src_enabled == 1
+
+
+async def test_promote_writable_is_the_last_statement_after_semisync(settings):
+    db = FakeDB()
+    await make_agent(settings, db).promote()
+    ex = db.executed()
+    assert ex[-1] == "SET GLOBAL super_read_only=0, read_only=0"
+    assert ex.index("SET GLOBAL rpl_semi_sync_source_enabled=1") < len(ex) - 1
+
+
+@pytest.mark.parametrize("op", ["repoint", "configure"])
+async def test_repoint_and_configure_have_one_deadline(settings, client_factory, op):
+    settings.role_change_deadline_s = 0.3
+    settings.sql_timeout_s = 5.0  # per statement would allow far more
+    db = FakeDB()
+    db.hang.add("STOP REPLICA" if op == "repoint" else "SHOW GLOBAL VARIABLES")
+    c = await client_factory(make_agent(settings, db))
+    t0 = time.monotonic()
+    if op == "repoint":
+        r = await c.post("/repoint", json={"source": "mysql-a2"})
+    else:
+        r = await c.post("/configure", json={"semisync": True})
+    assert time.monotonic() - t0 < 1.0
+    assert r.status == 504
+    assert (await r.json())["error"] == "deadline"
