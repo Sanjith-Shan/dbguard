@@ -501,3 +501,15 @@ heredocs and cache mounts already).
   whose set grows by 8 transactions 2 s after it becomes reachable takes the rebuild branch
   with phantom_gtids 8, and with the waiters made invisible the watcher catches the errant
   GTIDs after the repoint and rebuilds.
+
+### The errant-GTID check raced replication
+
+- Symptom. 2 of 30 partition-replicas rows reported one errant GTID on a replica, but heal
+  found the set clean seconds later.
+- How found. The flagged GTID carried the new primary's own server_uuid, so the replica
+  could not have produced it. It was the primary's newest transaction.
+- Cause. `errant_now` read the primary's `gtid_executed` first and the replicas after. A
+  replica that applied a transaction committed between the two reads looked like it held a
+  GTID the primary lacked.
+- Fix. Read the replicas first and the primary last, so the primary's set can only be
+  larger. The two rows keep the raw value in `errant_gtids_false_positive` with a note.
