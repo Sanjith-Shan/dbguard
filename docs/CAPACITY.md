@@ -19,7 +19,7 @@ The primary also reports its own view of the wait, `Rpl_semi_sync_source_tx_avg_
 
 ### How to read it
 
-With semi-sync off, the added delay should barely move commit latency, because the primary never waits for the replica. Any movement there is the cost of the netem qdisc and of the shared laptop, and it is the noise floor for the rest of the table.
+With semi-sync off, the added delay should barely move commit latency, because the primary never waits for the replica. In this table the delay sat on the replicas' egress, which is the ack path, so the semi-sync-off cells carry no replication delay at all by construction and only show laptop noise. Any movement there is the cost of the netem qdisc and of the shared laptop, and it is the noise floor for the rest of the table.
 
 With semi-sync on, each commit waits for one replica to receive the transaction, write it to the relay log, flush it and send the ack. So the expected cost is roughly one round trip plus one replica fsync on top of the asynchronous latency, and the 2 ms and 20 ms rows should show the added delay appearing once per commit (netem on the primary's egress delays one direction, so check which direction the harness shaped before reading the rows as a full round trip). The 0 ms row is the cost of the fsync and the ack path alone.
 
@@ -78,8 +78,8 @@ The measured distribution follows.
 | primary partitioned from replicas | 11.58 s | 14.23 s | 30 |
 | planned switchover (client stall) | 1.44 s | 6.03 s | 10 |
 | naive, primary killed | 5.45 s | 5.85 s | 30 |
-| naive, primary killed, 2 ms replica delay | pending | | |
-| DBGuard, primary killed, 2 ms replica delay | pending | | |
+| naive, primary killed, 2 ms delay, host death | 5.92 s | 7.50 s | 10 |
+| DBGuard, primary killed, 2 ms delay, host death | pending | | |
 | Orchestrator, primary killed | not yet measured | | |
 
 ## 3. Picking detect_window and probe_timeout
