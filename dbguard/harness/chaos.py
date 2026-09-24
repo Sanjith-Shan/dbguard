@@ -1294,14 +1294,16 @@ def _failover_common(run: Run, inject: Callable[[str], None], *, extra_s: float 
 def sc_kill(run: Run) -> None:
     o, f = run.opts, run.fleet
     run.row["naive_netem_ms"] = 0.0
-    if o.mode == "naive" and o.naive_netem_ms:
+    run.row["netem_ms"] = 0.0
+    if o.naive_netem_ms:
         # Only used when the naive pilot lost nothing: async replication on one host can keep
         # up so closely that a SIGKILL never lands between commit and replication.
         p = f.primary()
         for r in [n for n in f.members() if n != p]:
             docker.netem_delay(r, o.naive_netem_ms)
         run.row["naive_netem_ms"] = float(o.naive_netem_ms)
-        note(run, f"naive run with tc netem delay {o.naive_netem_ms} ms on the replicas")
+        run.row["netem_ms"] = float(o.naive_netem_ms)
+        note(run, f"{o.mode} kill run with tc netem delay {o.naive_netem_ms} ms on the replicas")
     _failover_common(run, lambda p: docker.kill(p, "KILL"))
 
 
@@ -2034,8 +2036,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--stall-hold", type=float, default=10.0)
     ap.add_argument("--heal-timeout", type=float, default=120.0)
     ap.add_argument("--no-heal-before", action="store_true")
-    ap.add_argument("--naive-netem-ms", type=float, default=0.0,
-                    help="naive kill runs only: tc netem delay on the replicas (use only if a "
+    ap.add_argument("--naive-netem-ms", "--replica-netem-ms", dest="naive_netem_ms", type=float,
+                    default=0.0,
+                    help="kill runs: tc netem delay on the replicas in any mode (used when a "
                          "5-run naive pilot lost zero writes, and say so)")
     return ap.parse_args(argv)
 

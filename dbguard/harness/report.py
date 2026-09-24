@@ -222,7 +222,8 @@ def render_markdown(s: dict) -> str:
                      ", ".join(f"{k} {v}" for k, v in s["failed_runs"].items()) + ".")
         parts.append("")
 
-    fo = [x for x in s["failover"] if x["scenario"] != "partition-manager"]
+    fo = [x for x in s["failover"] if x["scenario"] != "partition-manager" and "netem" not in x["mode"]]
+    fo_netem = [x for x in s["failover"] if "netem" in x["mode"]]
     if fo:
         parts += ["## Failover under injected faults", "", md_table(
             ["scenario", "mode", "runs", "failover p50 s", "failover p99 s", "lost acked writes",
@@ -236,6 +237,18 @@ def render_markdown(s: dict) -> str:
               x["stall_p50_s"], x["stall_p99_s"], x["reconnect_gap_p50_s"],
               x["runs_with_errant_gtids"],
               x["rs2_state_changes"]] for x in fo]), ""]
+    if fo_netem:
+        parts += ["## Primary killed with a replica delay (tc netem on the replicas)", "",
+                  "Same workload and kill as above, with a fixed egress delay on both replicas so a "
+                  "crash can land between commit and replication. Both modes under the same delay.",
+                  "", md_table(
+            ["scenario", "mode", "runs", "failover p50 s", "failover p99 s", "lost acked writes",
+             "runs with loss", "phantom writes", "single-writer violations", "converged",
+             "runs with errant GTIDs"],
+            [[x["scenario"], x["mode"], x["runs"], x["failover_p50_s"], x["failover_p99_s"],
+              x["lost_acked_writes"], x["runs_with_loss"], x["phantom_writes"],
+              x["single_writer_violations"], f"{x['converged_runs']}/{x['runs']}",
+              x["runs_with_errant_gtids"]] for x in fo_netem]), ""]
     pm = [x for x in s["failover"] if x["scenario"] == "partition-manager"]
     if pm:
         parts += ["## Manager partitioned from the primary (correct action is none)", "", md_table(
