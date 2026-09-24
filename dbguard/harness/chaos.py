@@ -155,6 +155,27 @@ def gtid_subset(a: str | None, b: str | None) -> bool:
     return True
 
 
+def gtid_minus(a: str | None, b: str | None) -> str:
+    """GTIDs in a that are not in b, as a GTID set string ('' when none)."""
+    pb = parse_gtid(b)
+    parts = []
+    for u, ivs in sorted(parse_gtid(a).items()):
+        missing: list[tuple[int, int]] = []
+        for lo, hi in ivs:
+            cur = lo
+            for blo, bhi in pb.get(u, []):
+                if bhi < cur or blo > hi:
+                    continue
+                if blo > cur:
+                    missing.append((cur, blo - 1))
+                cur = max(cur, bhi + 1)
+            if cur <= hi:
+                missing.append((cur, hi))
+        if missing:
+            parts.append(u + ":" + ":".join(f"{x}-{y}" if x != y else f"{x}" for x, y in missing))
+    return ",".join(parts)
+
+
 def caught_up(before: str | None, replica: str | None, after: str | None) -> bool:
     """A replica read between two reads of a primary that keeps writing (the agent's
     heartbeat commits every 500 ms) has caught up and holds nothing errant when
@@ -636,6 +657,23 @@ class Fleet:
                 return False, f"{n} not caught up with {p}"
         return True, "ok"
 
+    def errant_now(self) -> dict[str, str]:
+        """Every running node's GTIDs that the current primary lacks (review: a rejoin that
+        repointed a node with an unacked tail left it silently diverged). Empty when clean."""
+        prims = self.agent_primaries()
+        if len(prims) != 1:
+            return {}
+        p = prims[0]
+        pg = (agent(p).status() or {}).get("gtid_executed")
+        out = {}
+        for n, s in self.statuses().items():
+            if n == p or not s or not s.get("gtid_executed"):
+                continue
+            d = gtid_minus(s.get("gtid_executed"), pg)
+            if d:
+                out[n] = d
+        return out
+
     def clear_faults(self, extra_containers: list[str] = ()) -> None:
         for c in self.nodes + [spare_node(self.rs)] + list(extra_containers):
             st = docker.container_status(c)
@@ -679,11 +717,13 @@ class Fleet:
             if ok:
                 log(f"heal: {self.rs} clean in {time.time() - t0:.1f}s, primary {self.primary()}")
                 return {"hard_reset": False, "heal_s": time.time() - t0,
-                        "spare_dropped": spare_dropped}
+                        "spare_dropped": spare_dropped, "errant_gtids": self.errant_now()}
             time.sleep(1.0)
-        log(f"heal: {self.rs} not clean after {time.time() - t0:.0f}s ({why}), hard reset")
+        errant = self.errant_now()
+        log(f"heal: {self.rs} not clean after {time.time() - t0:.0f}s ({why}), errant {errant}, hard reset")
         self.hard_reset()
-        return {"hard_reset": True, "heal_s": time.time() - t0, "heal_reason": why}
+        return {"hard_reset": True, "heal_s": time.time() - t0, "heal_reason": why,
+                "errant_gtids": errant}
 
     def drop_spare(self, timeout: float = 60.0) -> bool:
         """Remove the spare container and its volumes, and make the manager forget it.
@@ -1868,7 +1908,14 @@ def run_once(opts: Opts, env: dict, i: int) -> dict:
             extra.append(ORCH_CONTAINER)
         for c in list(_frozen):
             thaw(c)
+        # errant GTIDs right after the scenario (before heal can hard-reset them away), and
+        # whatever heal found; a node that silently diverged can never hide again
+        run.row["errant_gtids"] = f.errant_now()
         run.row["heal"] = f.heal(opts.heal_timeout, extra_fault_containers=extra)
+        if run.row["heal"].get("errant_gtids"):
+            run.row["errant_gtids"] = {**run.row["heal"]["errant_gtids"], **run.row["errant_gtids"]}
+        if run.row["errant_gtids"]:
+            note(run, f"errant GTIDs after the scenario: {run.row['errant_gtids']}")
         run.row["duration_s"] = time.time() - t0
         run.row["commands"] = run.commands
         docker.set_command_log(None)
@@ -1920,8 +1967,13 @@ def run_scenario(opts: Opts) -> int:
     f = Fleet(opts.rs, opts.mode)
     if not opts.skip_heal_before:
         f.heal(opts.heal_timeout)
+    stop_file = RESULTS / "chaos.stop"
     for v in variants:
         for i in range(v.runs):
+            if stop_file.exists():
+                log(f"{stop_file} exists, stopping {v.scenario} at the run boundary")
+                infra_log(f"{v.scenario}/{v.mode} stopped at a run boundary by results/chaos.stop")
+                return 5
             try:
                 row = run_once(v, env, i)
             except Exception as e:  # noqa: BLE001

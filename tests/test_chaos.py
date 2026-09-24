@@ -381,3 +381,11 @@ def test_caught_up_between_two_primary_reads():
     assert caught_up(f"{U1}:1-100", f"{U1}:1-101", f"{U1}:1-102")
     assert not caught_up(f"{U1}:1-100", f"{U1}:1-99", f"{U1}:1-102")          # behind
     assert not caught_up(f"{U1}:1-100", f"{U1}:1-101,{U2}:1", f"{U1}:1-102")  # errant
+
+
+def test_gtid_minus():
+    from dbguard.harness.chaos import gtid_minus
+    assert gtid_minus(f"{U1}:1-10", f"{U1}:1-10") == ""
+    assert gtid_minus(f"{U1}:1-12", f"{U1}:1-10") == f"{U1}:11-12"
+    assert gtid_minus(f"{U1}:1-10,{U2}:5", f"{U1}:1-3:6-10") == f"{U1}:4-5,{U2}:5"
+    assert gtid_minus("", f"{U1}:1") == ""

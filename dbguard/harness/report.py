@@ -106,6 +106,7 @@ def failover_summary(rows: list[dict]) -> list[dict]:
             "reconnect_gap_p50_s": percentile([r.get("reconnect_gap_p50_s") for r in rs], 50),
             "rs2_state_changes": _sum(rs, "rs2_state_changes"),
             "rs2_role_changes": _sum(rs, "rs2_role_changes"),
+            "runs_with_errant_gtids": sum(1 for r in rs if r.get("errant_gtids")),
         })
     return out
 
@@ -215,12 +216,13 @@ def render_markdown(s: dict) -> str:
             ["scenario", "mode", "runs", "failover p50 s", "failover p99 s", "lost acked writes",
              "runs with loss", "phantom writes", "single-writer violations", "false failovers",
              "converged", "writes on woken primary", "stall p50 s", "stall p99 s",
-             "client reconnect gap p50 s", "rs2 changes"],
+             "client reconnect gap p50 s", "runs with errant GTIDs", "rs2 changes"],
             [[x["scenario"], x["mode"], x["runs"], x["failover_p50_s"], x["failover_p99_s"],
               x["lost_acked_writes"], x["runs_with_loss"], x["phantom_writes"],
               x["single_writer_violations"], x["false_failovers"],
               f"{x['converged_runs']}/{x['runs']}", x["writes_on_woken_primary"],
               x["stall_p50_s"], x["stall_p99_s"], x["reconnect_gap_p50_s"],
+              x["runs_with_errant_gtids"],
               x["rs2_state_changes"]] for x in fo]), ""]
     pm = [x for x in s["failover"] if x["scenario"] == "partition-manager"]
     if pm:
