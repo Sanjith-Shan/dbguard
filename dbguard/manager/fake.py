@@ -352,6 +352,7 @@ class FakeFleet:
             phantom = (node.executed - donor.executed).count()
             node.active_ops += 1
             node.max_active_ops = max(node.max_active_ops, node.active_ops)
+            fleet.log.append((time.time(), node.name, f"rebuild_from:{donor.name}"))
             node.source = None                    # replication is gone while cloning
             try:
                 await asyncio.sleep(node.rebuild_delay)
@@ -364,6 +365,13 @@ class FakeFleet:
             node.sql_error = None
             return web.json_response({"ok": True, "phantom_gtids": phantom, "duration_ms": 50,
                                       "bytes": 1_000_000, "gtid_executed": str(node.executed)})
+
+        async def unstick(request):
+            """Kill the sessions waiting for a semi-sync ACK. In the simulation a stalled
+            primary has at most one such session per step, so report 1 while stalled."""
+            killed = 1 if fleet.stalled.get(node.name) else 0
+            fleet.log.append((time.time(), node.name, "unstick"))
+            return web.json_response({"killed": killed, "gtid_executed": str(node.executed)})
 
         async def health(request):
             return web.json_response({"ok": True})
@@ -379,7 +387,7 @@ class FakeFleet:
             web.get("/health", health),
             web.post("/fence", fence), web.post("/unfence", unfence),
             web.post("/promote", promote), web.post("/repoint", repoint),
-            web.post("/rebuild", rebuild),
+            web.post("/rebuild", rebuild), web.post("/unstick", unstick),
         ])
         return app
 

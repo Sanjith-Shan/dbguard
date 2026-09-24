@@ -375,6 +375,11 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
   20 s, else it is rebuilt). The primary is read after the node. After a repoint a watcher
   compares the node with the primary every second for 10 s, and a GTID the primary lacks on
   two consecutive reads triggers a rebuild recorded with branch `rebuild_after_errant`.
+- Clone donor. Always a replica streaming from the primary, except when none exists and the
+  primary is stalled with zero semi-sync clients (kill-two). Then the primary is the donor of
+  last resort, and the manager calls the agent's `POST /unstick` on it (kills only sessions
+  waiting for a semi-sync ACK, answers `{"killed":n,"gtid_executed":"..."}`) right before
+  `/rebuild` and every 5 s while the clone runs.
 - `type` may also be `split_brain` (naive mode only: a node other than the primary is
   writable. Naive mode has no fence, so it records the two writable nodes once and leaves
   them alone. dbguard mode fences the second writer instead and records a `rejoin` event with

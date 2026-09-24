@@ -1000,6 +1000,7 @@ async def test_kill_two_stall_heals_with_the_primary_as_donor_of_last_resort(sim
     assert "no replica is reachable" in stall_ev.note or "rejoining" in stall_ev.note
     s.fleet.start("mysql-a1")
     s.fleet.start("mysql-a2")
+    a1.rebuild_delay = a2.rebuild_delay = 0.8     # long enough for repeated /unstick calls
     await s.until(lambda: any(e.type == "stall" and "resumed" in (e.note or "")
                               for e in s.events("rs1")), timeout=20, what="writes resume")
     await s.until(lambda: len([e for e in s.events("rs1", "rejoin")
@@ -1008,6 +1009,14 @@ async def test_kill_two_stall_heals_with_the_primary_as_donor_of_last_resort(sim
     rebuilds = [e for e in s.events("rs1", "rejoin") if e.rejoin and e.rejoin.branch == "rebuild"]
     first, second = rebuilds
     assert first.clone.donor == "mysql-a3" and "donor of last resort: primary" in first.note
+    assert "/unstick on mysql-a3" in first.note
+    log = [(n, what) for _, n, what in s.fleet.log]
+    clone_i = log.index((first.rejoin.node, "rebuild_from:mysql-a3"))
+    assert ("mysql-a3", "unstick") in log[:clone_i], "/unstick before the last-resort clone"
+    import re
+    calls = int(re.search(r"/unstick on mysql-a3 (\d+) times", first.note).group(1))
+    assert calls >= 3, "repeated every 5 intervals while the 0.8 s clone runs"
+    assert "/unstick" not in s.fleet.nodes[second.clone.donor].calls
     assert second.clone.donor == first.rejoin.node, "second is cloned from the new replica"
     await s.healthy("rs1", "mysql-a3")
     await s.until(lambda: s.fleet.acked["rs1"].is_subset(a3.executed), what="lossless")

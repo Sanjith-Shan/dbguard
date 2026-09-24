@@ -298,12 +298,42 @@ async def _wait_maintenance_slot(ctl: SetController) -> None:
         await asyncio.sleep(0.5)
 
 
+UNSTICK_EVERY = 5          # quiesce intervals between /unstick calls (5 s in production)
+
+
+async def _unstick(ctl: SetController, donor: str, acc: dict) -> None:
+    try:
+        resp = await ctl.agents.post(donor, "/unstick", timeout=ctl.cfg.fence_deadline_s)
+        acc["calls"] += 1
+        acc["killed"] += int((resp or {}).get("killed") or 0)
+    except AgentError as e:
+        log.warning("unstick failed", rs=ctl.rs, node=donor, error=str(e))
+
+
+async def _keep_unstuck(ctl: SetController, donor: str, acc: dict) -> None:
+    while True:
+        await asyncio.sleep(UNSTICK_EVERY * ctl.quiesce_interval_s)
+        await _unstick(ctl, donor, acc)
+
+
 async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom_count: int,
                            phantom: str | None, why: str, event_type: str,
                            branch: str = "rebuild") -> Event | None:
     """Clone ``node`` from ``donor``, wait for mysqld, repoint to the current primary."""
     t0 = time.monotonic()
     log.warning("rebuild", rs=ctl.rs, node=node, donor=donor, phantom=phantom_count)
+    unstuck = {"calls": 0, "killed": 0}
+    keeper: asyncio.Task | None = None
+    if donor == ctl.primary:
+        # Donor of last resort: a clone from a primary whose sessions wait for a semi-sync
+        # ACK hung on the real fleet (docs/BUGS.md). POST /unstick kills only those waiting
+        # sessions; their transactions are already binlogged and commit unacknowledged, the
+        # clients get an error, and nothing acknowledged is single-copy. New client writes
+        # stall again during the clone, so it is repeated every UNSTICK_EVERY intervals
+        # while the clone runs. The call is idempotent.
+        await _unstick(ctl, donor, unstuck)
+        keeper = asyncio.create_task(_keep_unstuck(ctl, donor, unstuck),
+                                     name=f"unstick-{donor}")
     try:
         resp = await ctl.agents.post(node, "/rebuild", {"donor": donor},
                                      timeout=REBUILD_TIMEOUT_S)
@@ -311,6 +341,13 @@ async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom
         ctl.event(type="rebuild", old_primary=node, new_primary=ctl.primary,
                   note=f"clone of {node} from {donor} failed: {e}")
         return None
+    finally:
+        if keeper is not None:
+            keeper.cancel()
+            await asyncio.gather(keeper, return_exceptions=True)
+    if unstuck["calls"]:
+        why = (f"{why}; /unstick on {donor} {unstuck['calls']} times, "
+               f"{unstuck['killed']} stalled sessions killed (unacknowledged)")
     clone_s = time.monotonic() - t0
     end = time.monotonic() + RESTART_WAIT_S
     while time.monotonic() < end:

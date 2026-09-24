@@ -533,9 +533,13 @@ heredocs and cache mounts already).
   the maintenance slot is free. The stall event now says what the manager is doing about it.
   A simulation test runs the whole sequence with no acknowledged write lost and no operator
   action.
-- Open risk. The agent section of this file records that a clone from a primary stalled on
-  semi-sync hung for five minutes (the donor's clone threads stayed in `starting`). If that
-  holds on 8.4.11, the last-resort donor will not work on the real fleet and the rebuild will
-  wait out the agent's clone timeout. Only a real kill-two run can say. If it hangs, the
-  alternatives are an agent step that frees the stalled sessions without releasing their
-  acks, or a HALT with a clear reason.
+- Open risk and its fix. The agent section of this file records that a clone from a primary
+  stalled on semi-sync hung for five minutes (the donor's clone threads stayed in
+  `starting`). So before a rebuild whose donor is the stalled primary, the manager calls the
+  agent's `POST /unstick` on it, which kills only the sessions waiting for a semi-sync ACK.
+  Their transactions are already binlogged and commit unacknowledged, the clients get an
+  error, and nothing acknowledged is single-copy. New client writes stall again while the
+  clone runs, so the manager repeats `/unstick` every 5 s until the clone returns. The call
+  is idempotent. The rebuild event's note records how many times it was called and how many
+  sessions it killed. The simulation checks that `/unstick` precedes the last-resort clone
+  and repeats during it. Whether this lets a real clone finish awaits a real kill-two run.
