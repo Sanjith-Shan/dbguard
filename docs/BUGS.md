@@ -75,3 +75,49 @@ Every real bug found while building DBGuard. Symptom, how it was found, fix.
   which speaks the 8.4 statements and ships a native arm64 image. The config keeps
   Orchestrator's own detection and recovery and only adds the hooks that tell our agents
   about a fence and a promotion.
+
+## Manager
+
+### Retrieved_Gtid_Set is not cumulative, so "largest retrieved set" can pick the wrong winner
+
+- Symptom. In the fake fleet a replica that had been repointed once showed a Retrieved_Gtid_Set
+  of 3 transactions while its partner, never repointed, showed 50. Picking the largest
+  retrieved set would promote the second although the first held one more transaction.
+- How found. Writing the fake agent's `/repoint` the way MySQL behaves. `CHANGE REPLICATION
+  SOURCE TO` purges the relay logs, and so does `relay_log_recovery` at restart, and
+  Retrieved_Gtid_Set restarts from empty with them. A unit test in tests/test_selection.py
+  pins the case.
+- Fix. Selection ranks candidates by everything they hold, `gtid_executed` union
+  Retrieved_Gtid_Set, and the subset check uses the same union. The catch-up step waits until
+  the retrieved set is a subset of the executed set rather than comparing the two for
+  equality.
+
+### The fenced old primary voted the new primary dead
+
+- Symptom. Right after a failover in the partition scenario the manager logged "replicas
+  cannot see primary but manager can" about the brand new primary.
+- How found. The fake fleet end-to-end test for Experiment 3. The vote counter looked at
+  every member except the primary, and the old primary, fenced and replicating from nobody,
+  had a heartbeat row seconds old, which counted as "heartbeat stale".
+- Fix. Only a replica configured to replicate from the believed primary votes. A node
+  replicating from elsewhere, or from nothing, knows nothing about the primary. The same
+  rule is what orchestrator applies when it looks only at the master's own replicas.
+
+### A write stall during SUSPECT was never recorded
+
+- Symptom. In the partition scenario the event log showed the failover but no `stall` event,
+  although the manager's heartbeat write had been blocked for the whole detection window.
+- How found. The Experiment 3 simulation asserted a stall event and failed.
+- Fix. The stall check ran only in the reconcile pass, which a SUSPECT set skips. It now runs
+  on every tick where a primary is known, before the verdict is acted on.
+
+### The empty set is a subset of everything
+
+- Symptom. A node whose replication was never configured has an empty retrieved and executed
+  set. As a candidate it passes every subset check vacuously, and as the only reachable node
+  it would be promoted with no data.
+- How found. Named in the spec as a bug to expect, confirmed with a hypothesis fleet
+  generator that includes unconfigured nodes.
+- Fix. A node with no replication configured is not a candidate at all, the reason is kept in
+  the choose step (`excluded`), and with no candidate left the set HALTs with
+  "no promotable replica" instead of promoting.
