@@ -37,3 +37,33 @@ were moved to `results/old-config/<tag>/`. The earlier rows are kept as evidence
 - naive runs only kill and partition-manager, the two experiments the spec asks of the
   baseline. Orchestrator runs kill, hang-container and partition-manager.
 - cost is 6 cells (semi-sync on/off x netem 0/2/20 ms) x 3 runs x 60 s. kill-two is 30.
+
+## rejoin-quiesce (rows in results/old-config/rejoin-quiesce/)
+
+- Scope. The first hang-container/dbguard runs under the d405ec4 node image (12:09 onward).
+- What went wrong. When the frozen primary woke, its clients' in-flight INSERTs (binlogged,
+  waiting for a semi-sync ack no replica would send, never acknowledged) committed locally.
+  The manager's rejoin decided "gtid_executed is a subset of the new primary's" from a view
+  taken before those commits landed, and repointed the node instead of rebuilding it. The
+  node then held GTIDs the new primary lacked (silent divergence). The checker did not see it
+  because the old primary is not in its node list until it rejoins. The harness heal caught
+  it ("errant") and hard-reset the set. No acknowledged write was lost.
+- Change. The manager quiesces the woken node before the subset check and checks for errant
+  GTIDs after a repoint (manager fix, commit named in campaign.log when deployed). Every row
+  now records `errant_gtids` right after the scenario and at heal, so this cannot hide again.
+- Rerun. hang-container, hang-process and orchestrator hang-container moved to the end of the
+  queue, before the three agent-live-primary-check reruns.
+
+## final fleet configuration (fe17789)
+
+- Agent `DBGUARD_PRIMARY_STALE_S=2` (was 0.5) and HAProxy `fall 2` (was `fall 1`), with
+  inter 100ms, downinter 100ms, rise 1 and on-marked-down shutdown-sessions unchanged.
+- Why. Under host memory pressure (macOS swap 10 to 11 GB) the agents' event loop stalled for
+  0.5 to 3 s. The /primary sample went stale, the agent answered 503, and with `fall 1`
+  HAProxy marked a healthy primary DOWN and cut every client session. rs2/mysql-b1, which
+  receives no faults, was marked DOWN 6 times in 13 minutes. A hung mysqld is still caught
+  by the 2 s staleness bound, and the manager fences it independently. Worst-case routing
+  detection of a dead primary is now about 200 ms of checks after the agent stops answering.
+- Applied with `docker compose up -d` (only the nodes and HAProxy were recreated, volumes
+  kept). Every entry from partition-replicas onward, and every rerun, runs under this
+  configuration.
