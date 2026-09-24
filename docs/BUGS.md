@@ -413,3 +413,16 @@ heredocs and cache mounts already).
   keeps an ignored disposition. bin/campaign under nohup runs chaos the same way.
 - Fix. bin/chaos installs handlers that turn SIGINT and SIGTERM into KeyboardInterrupt, so
   the finally blocks thaw frozen containers, flush iptables and heal the set.
+
+### Heal hard-reset a healthy set because GTID sets never matched exactly
+
+- Symptom. After the hang-container pilot the manager reported rs1 HEALTHY 70 s after the
+  wake, with mysql-a1 repointed and replicating. The harness heal still said "mysql-a1
+  gtid differs from mysql-a2" for 123 s and then hard-reset the set (new volumes).
+- Cause. Heal required every replica's `gtid_executed` to equal one snapshot of the
+  primary's. The primary's agent commits a heartbeat every 500 ms, so the primary's set
+  moves between two reads, and a replica that runs a fraction of a second behind never
+  equals any single snapshot.
+- Fix. Heal reads the primary, then the replicas, then the primary again, and accepts
+  `before <= replica <= after`. A replica holding GTIDs outside `after` is reported as
+  errant, not as merely behind.
