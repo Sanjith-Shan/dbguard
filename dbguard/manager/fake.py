@@ -53,6 +53,7 @@ class FakeNode:
     pending: GtidSet = field(default_factory=GtidSet)   # binlogged, waiting for an ack
     pending_until: float | None = None  # when the waiting sessions finish committing
     rebuild_delay: float = 0.05  # how long a clone takes
+    unstick_still: list = field(default_factory=list)  # still_waiting per /unstick call
     active_ops: int = 0          # /rebuild and /repoint requests in flight on this node
     max_active_ops: int = 0
     hide_waiting: bool = False  # waiters invisible to /status and SQL (belt-and-braces test)
@@ -371,7 +372,9 @@ class FakeFleet:
             primary has at most one such session per step, so report 1 while stalled."""
             killed = 1 if fleet.stalled.get(node.name) else 0
             fleet.log.append((time.time(), node.name, "unstick"))
-            return web.json_response({"killed": killed, "gtid_executed": str(node.executed)})
+            still = node.unstick_still.pop(0) if node.unstick_still else 0
+            return web.json_response({"killed": killed, "still_waiting": still,
+                                      "gtid_executed": str(node.executed)})
 
         async def health(request):
             return web.json_response({"ok": True})

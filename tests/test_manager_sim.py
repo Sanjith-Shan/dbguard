@@ -1022,3 +1022,58 @@ async def test_kill_two_stall_heals_with_the_primary_as_donor_of_last_resort(sim
     await s.until(lambda: s.fleet.acked["rs1"].is_subset(a3.executed), what="lossless")
     lossless(s)
     assert s.ctl().st.state != State.HALTED
+
+
+
+async def test_kill_two_halts_when_the_stalled_primary_cannot_be_unstuck(sim_factory):
+    """/unstick keeps reporting semi-sync waiters (a KILL on 8.4.11 may not release one at
+    once). After the retries the manager must not start the clone from the stalled primary;
+    it HALTs with the reason and records the retry counts."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    s.fleet.writing = True
+    await asyncio.sleep(0.3)
+    a1, a2, a3 = (s.fleet.nodes[n] for n in A)
+    s.fleet.writing = False
+    await asyncio.sleep(0.1)
+    a1.executed = a1.executed | GtidSet.of(a1.uuid, (a1.next_gno, a1.next_gno + 2))
+    a1.next_gno += 3
+    a2.executed = a2.executed | GtidSet.of(a2.uuid, 1)
+    s.fleet.kill("mysql-a1")
+    s.fleet.kill("mysql-a2")
+    s.fleet.writing = True
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover to a3")
+    a3.unstick_still = [4, 3, 3, 2, 2, 1, 1, 1]     # never reaches 0 within 6 attempts
+    s.fleet.start("mysql-a1")
+    s.fleet.start("mysql-a2")
+    await s.until(lambda: s.ctl().st.state == State.HALTED, timeout=20, what="HALTED")
+    assert s.ctl().st.halt_reason == (
+        "stalled primary cannot be quiesced, 1 sessions still waiting for a semi-sync ack "
+        "after /unstick; restore a replica or fence the primary by hand")
+    assert not any(what.startswith("rebuild_from:mysql-a3") for _, _, what in s.fleet.log)
+    note = [e for e in s.events("rs1", "rebuild") if "not started" in (e.note or "")][0].note
+    assert "/unstick called 6 times (6 attempts)" in note
+    assert "[4, 3, 3, 2, 2, 1]" in note
+    assert s.events("rs1", "halt")
+
+
+async def test_unstick_retry_that_clears_lets_the_clone_start(sim_factory):
+    """Waiters that clear on the third attempt: the clone proceeds, the note shows it."""
+    s = await sim_factory(sets={"rs1": A})
+    await s.healthy("rs1", "mysql-a1")
+    a1, a2, a3 = (s.fleet.nodes[n] for n in A)
+    a1.executed = a1.executed | GtidSet.of(a1.uuid, (a1.next_gno, a1.next_gno + 2))
+    a1.next_gno += 3
+    a2.executed = a2.executed | GtidSet.of(a2.uuid, 1)
+    s.fleet.kill("mysql-a1")
+    s.fleet.kill("mysql-a2")
+    s.fleet.writing = True
+    await s.until(lambda: s.events("rs1", "failover"), timeout=8, what="failover to a3")
+    a3.unstick_still = [2, 1, 0]
+    s.fleet.start("mysql-a1")
+    s.fleet.start("mysql-a2")
+    await s.until(lambda: any(e.rejoin and e.rejoin.branch == "rebuild"
+                              for e in s.events("rs1", "rejoin")), timeout=20, what="rebuild")
+    first = [e for e in s.events("rs1", "rejoin") if e.rejoin and e.rejoin.branch == "rebuild"][0]
+    assert "still_waiting [2, 1, 0]" in first.note
+    assert s.ctl().st.state != State.HALTED

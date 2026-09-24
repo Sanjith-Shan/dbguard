@@ -301,13 +301,37 @@ async def _wait_maintenance_slot(ctl: SetController) -> None:
 UNSTICK_EVERY = 5          # quiesce intervals between /unstick calls (5 s in production)
 
 
-async def _unstick(ctl: SetController, donor: str, acc: dict) -> None:
+UNSTICK_RETRIES = 5         # extra /unstick attempts, one quiesce interval (1 s) apart
+
+
+async def _unstick(ctl: SetController, donor: str, acc: dict) -> int | None:
+    """One POST /unstick. Returns still_waiting (semi-sync waiters the agent re-read 0.2 s
+    after its KILLs), or None when the call failed."""
     try:
         resp = await ctl.agents.post(donor, "/unstick", timeout=ctl.cfg.fence_deadline_s)
-        acc["calls"] += 1
-        acc["killed"] += int((resp or {}).get("killed") or 0)
     except AgentError as e:
         log.warning("unstick failed", rs=ctl.rs, node=donor, error=str(e))
+        return None
+    acc["calls"] += 1
+    acc["killed"] += int((resp or {}).get("killed") or 0)
+    return int((resp or {}).get("still_waiting") or 0)
+
+
+async def unstick_until_clear(ctl: SetController, donor: str, acc: dict) -> int | None:
+    """/unstick, then retry up to UNSTICK_RETRIES times while waiters remain. On 8.4.11 a
+    KILL may not release a semi-sync waiter at once (command Killed, state unchanged for at
+    least half a second). Returns 0 when clear, else the last still_waiting (None if every
+    call failed)."""
+    last: int | None = None
+    for attempt in range(UNSTICK_RETRIES + 1):
+        if attempt:
+            await asyncio.sleep(ctl.quiesce_interval_s)
+        still = await _unstick(ctl, donor, acc)
+        acc.setdefault("still", []).append(still)
+        if still == 0:
+            return 0
+        last = still if still is not None else last
+    return last
 
 
 async def _keep_unstuck(ctl: SetController, donor: str, acc: dict) -> None:
@@ -331,7 +355,19 @@ async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom
         # clients get an error, and nothing acknowledged is single-copy. New client writes
         # stall again during the clone, so it is repeated every UNSTICK_EVERY intervals
         # while the clone runs. The call is idempotent.
-        await _unstick(ctl, donor, unstuck)
+        still = await unstick_until_clear(ctl, donor, unstuck)
+        if still != 0:
+            n = "an unknown number of" if still is None else str(still)
+            reason = (f"stalled primary cannot be quiesced, {n} sessions still waiting for a "
+                      f"semi-sync ack after /unstick; restore a replica or fence the primary "
+                      f"by hand")
+            ctl.event(type="rebuild", old_primary=node, new_primary=ctl.primary,
+                      note=f"clone of {node} from the stalled primary {donor} not started: "
+                           f"/unstick called {unstuck['calls']} times ({len(unstuck['still'])} "
+                           f"attempts), killed {unstuck['killed']}, still_waiting per attempt "
+                           f"{unstuck['still']}")
+            ctl.st.halt(reason)
+            return None
         keeper = asyncio.create_task(_keep_unstuck(ctl, donor, unstuck),
                                      name=f"unstick-{donor}")
     try:
@@ -346,7 +382,9 @@ async def rebuild_and_join(ctl: SetController, node: str, donor: str, *, phantom
             keeper.cancel()
             await asyncio.gather(keeper, return_exceptions=True)
     if unstuck["calls"]:
-        why = (f"{why}; /unstick on {donor} {unstuck['calls']} times, "
+        first = unstuck.get("still", [])
+        why = (f"{why}; /unstick on {donor} {unstuck['calls']} times "
+               f"({len(first)} attempts before the clone, still_waiting {first}), "
                f"{unstuck['killed']} stalled sessions killed (unacknowledged)")
     clone_s = time.monotonic() - t0
     end = time.monotonic() + RESTART_WAIT_S

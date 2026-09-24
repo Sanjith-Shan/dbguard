@@ -541,5 +541,11 @@ heredocs and cache mounts already).
   error, and nothing acknowledged is single-copy. New client writes stall again while the
   clone runs, so the manager repeats `/unstick` every 5 s until the clone returns. The call
   is idempotent. The rebuild event's note records how many times it was called and how many
-  sessions it killed. The simulation checks that `/unstick` precedes the last-resort clone
-  and repeats during it. Whether this lets a real clone finish awaits a real kill-two run.
+  sessions it killed. On 8.4.11 a KILL may not release a semi-sync waiter at once (command
+  Killed, state unchanged for at least half a second), so the agent re-reads the waiters
+  0.2 s after its KILLs and answers `still_waiting`. The manager retries `/unstick` up to 5
+  times 1 s apart and starts the clone only once no waiter remains. Otherwise it HALTs the set
+  ("stalled primary cannot be quiesced, N sessions still waiting for a semi-sync ack after
+  /unstick; restore a replica or fence the primary by hand") and records the per-attempt
+  counts. The simulation checks the order, the repeats, a retry that clears, and the HALT.
+  Whether this lets a real clone finish awaits a real kill-two run.

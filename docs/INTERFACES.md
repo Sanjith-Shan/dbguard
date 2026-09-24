@@ -378,8 +378,12 @@ Manager additions to the event row. Extra keys and values only, nothing removed.
 - Clone donor. Always a replica streaming from the primary, except when none exists and the
   primary is stalled with zero semi-sync clients (kill-two). Then the primary is the donor of
   last resort, and the manager calls the agent's `POST /unstick` on it (kills only sessions
-  waiting for a semi-sync ACK, answers `{"killed":n,"gtid_executed":"..."}`) right before
-  `/rebuild` and every 5 s while the clone runs.
+  waiting for a semi-sync ACK, answers `{"killed":n,"still_waiting":n,"gtid_executed":"..."}`)
+  right before `/rebuild`, retrying up to 5 times 1 s apart while `still_waiting > 0`. If
+  waiters remain, the clone is not started and the set HALTs with "stalled primary cannot be
+  quiesced, N sessions still waiting for a semi-sync ack after /unstick; restore a replica or
+  fence the primary by hand". Once clear, it repeats `/unstick` every 5 s while the clone
+  runs.
 - `type` may also be `split_brain` (naive mode only: a node other than the primary is
   writable. Naive mode has no fence, so it records the two writable nodes once and leaves
   them alone. dbguard mode fences the second writer instead and records a `rejoin` event with
