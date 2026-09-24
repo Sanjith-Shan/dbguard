@@ -157,6 +157,26 @@ def expand(entry: dict) -> list[dict]:
                  ["--semisync", ss, "--netem", str(n)]) for ss, n in cells]
 
 
+def rebuild_marker(e: dict) -> Path:
+    return RESULTS / f".fleet-rebuilt-{e.get('archive') or e['scenario']}"
+
+
+def rebuild_fleet(e: dict) -> None:
+    """Entry boundary with new images: make build, make down, make up at the current HEAD.
+    Runs once per entry (marker file), so a restarted campaign does not rebuild again."""
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, capture_output=True,
+                          text=True).stdout.strip()
+    log(f"FLEET rebuild for {e['scenario']}/{e['mode']}: make build at {head}, make down, make up")
+    with (RESULTS / "campaign.chaos.log").open("a") as fh:
+        for target in (["make", "build"], ["make", "down"], ["make", "up"]):
+            r = subprocess.run(target, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT)
+            if r.returncode != 0 and target != ["make", "down"]:
+                raise SystemExit(f"{' '.join(target)} failed rc={r.returncode}, fleet rebuild aborted")
+    rebuild_marker(e).write_text(head + "\n")
+    log(f"CONFIG node and manager images rebuilt at {head} and the fleet recreated on fresh volumes "
+        f"for {e['scenario']}/{e['mode']} ({e.get('note', '')})")
+
+
 def archive_old_rows(e: dict) -> None:
     """A rerun entry ({"archive": "<tag>"}) moves the rows written under the previous
     configuration to results/old-config/<tag>/ the first time it starts, so its table is
@@ -349,6 +369,8 @@ def main() -> int:
             eta = f"{remaining * rate / 3600:.1f} h" if rate else "?"
             log(f"ENTRY start {label}: {need} runs (attempt {attempt + 1}), campaign left "
                 f"{remaining} runs, ETA {eta}, free {free:.1f} GiB")
+            if e.get("fleet_rebuild") and not rebuild_marker(e).exists():
+                rebuild_fleet(e)
             archive_old_rows(e)
             before = done_count(e)
             t0 = time.time()
