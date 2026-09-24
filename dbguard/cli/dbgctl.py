@@ -1,4 +1,10 @@
-"""dbgctl, the operator CLI. Talks only to the Manager HTTP API (docs/INTERFACES.md)."""
+"""``dbgctl``, the operator CLI, with status, doctor, failover, halt, resume, rejoin and events.
+
+It talks only to the manager's HTTP API (docs/INTERFACES.md), never to MySQL, so an operator
+can only ask the manager to act and every action lands in the event log. ``dbgctl failover``
+is the planned switchover, the only way to move a healthy primary. The exception is
+``dbgctl osc`` (dbguard/cli/osc.py), which changes schemas on the primary directly.
+"""
 
 from __future__ import annotations
 
@@ -14,12 +20,14 @@ from dbguard.cli.osc import osc
 
 
 def _fmt_ts(ts: float | None) -> str:
+    """Local HH:MM:SS, - when unknown."""
     if not ts:
         return "-"
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
 def _fmt_s(v) -> str:
+    """Seconds with two decimals, - when unknown."""
     return "-" if v is None else f"{float(v):.2f}s"
 
 
@@ -48,6 +56,7 @@ def event_line(ev: dict | None) -> str:
 
 
 def status_rows(status: dict) -> list[list[str]]:
+    """Rows of the status table, one per set."""
     rows = []
     for rs, st in sorted((status.get("sets") or {}).items()):
         replicas = []
@@ -70,6 +79,7 @@ def status_rows(status: dict) -> list[list[str]]:
 
 
 def render_table(header: list[str], rows: list[list[str]]) -> str:
+    """A plain left-aligned text table."""
     widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
     out = ["  ".join(str(h).ljust(w) for h, w in zip(header, widths))]
     out.append("  ".join("-" * w for w in widths))
@@ -79,6 +89,7 @@ def render_table(header: list[str], rows: list[list[str]]) -> str:
 
 
 def _die(e: ApiError) -> None:
+    """Print the error, exit 2 when the manager is unreachable, else 1."""
     click.echo(f"dbgctl: {e}", err=True)
     sys.exit(2 if e.status is None else 1)
 
@@ -152,6 +163,7 @@ def failover(mc: ManagerClient, rs: str, to: str | None, as_json: bool) -> None:
 
 
 def _simple(name: str, doc: str):
+    """Register a command that POSTs to /v1/sets/{rs}/<name> and prints the state."""
     @click.argument("rs")
     @click.pass_obj
     def cmd(mc: ManagerClient, rs: str) -> None:
@@ -218,6 +230,7 @@ def events(mc: ManagerClient, rs: str | None, since: str | None, follow: bool, a
 
 
 def parse_since(s: str | None) -> float | None:
+    """A unix time from ``123.5`` or a relative ``30s``, ``10m``, ``2h``, ``1d``."""
     if s is None:
         return None
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -230,6 +243,7 @@ cli.add_command(osc)
 
 
 def main() -> None:
+    """Console entry point."""
     cli(prog_name="dbgctl")
 
 

@@ -1,6 +1,8 @@
-"""Dependency-free JSON-over-HTTP client for the Manager and Agent APIs (docs/INTERFACES.md).
+"""Dependency-free JSON-over-HTTP clients for the manager and agent APIs (docs/INTERFACES.md).
 
-stdlib urllib only, so dbgctl works on a host that has nothing but Python.
+stdlib urllib only, so dbgctl works on a host that has nothing but Python. The chaos harness
+uses the same clients to drive and observe the fleet, so an operator and the measurements see
+the API the same way. HTTP error statuses are returned or raised as ``ApiError`` with the body.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ DEFAULT_MANAGER_URL = "http://127.0.0.1:19090"
 
 
 class ApiError(RuntimeError):
+    """A call failed. ``status`` is None when the server could not be reached at all."""
+
     def __init__(self, status: int | None, message: str, body: Any = None):
         super().__init__(message)
         self.status = status
@@ -49,11 +53,15 @@ def request(method: str, url: str, body: Any = None, timeout: float = 5.0) -> tu
 
 
 class ManagerClient:
+    """The manager's /v1 API. Base URL from the argument, DBGUARD_MANAGER_URL, or localhost."""
+
     def __init__(self, base_url: str | None = None, timeout: float = 5.0):
-        self.base = (base_url or os.environ.get("DBGUARD_MANAGER_URL") or DEFAULT_MANAGER_URL).rstrip("/")
+        base = base_url or os.environ.get("DBGUARD_MANAGER_URL") or DEFAULT_MANAGER_URL
+        self.base = base.rstrip("/")
         self.timeout = timeout
 
     def _call(self, method: str, path: str, body: Any = None, ok=(200,)) -> Any:
+        """One request, raising ApiError unless the status is in ``ok``."""
         status, payload = request(method, self.base + path, body, self.timeout)
         if status not in ok:
             msg = payload.get("error") if isinstance(payload, dict) else payload
@@ -61,18 +69,23 @@ class ManagerClient:
         return payload
 
     def status(self) -> dict:
+        """GET /v1/status."""
         return self._call("GET", "/v1/status")
 
     def set(self, rs: str) -> dict:
+        """GET /v1/sets/{rs}."""
         return self._call("GET", f"/v1/sets/{rs}")
 
     def primary(self, rs: str) -> dict:
+        """GET /v1/sets/{rs}/primary."""
         return self._call("GET", f"/v1/sets/{rs}/primary")
 
     def doctor(self, rs: str) -> dict:
+        """GET /v1/sets/{rs}/doctor."""
         return self._call("GET", f"/v1/sets/{rs}/doctor")
 
     def failover(self, rs: str, to: str | None = None, timeout: float = 60.0) -> dict:
+        """POST /v1/sets/{rs}/failover, a planned switchover, with a longer timeout."""
         status, payload = request("POST", f"{self.base}/v1/sets/{rs}/failover", {"to": to}, timeout)
         if status != 200:
             msg = payload.get("error") if isinstance(payload, dict) else payload
@@ -80,15 +93,19 @@ class ManagerClient:
         return payload
 
     def halt(self, rs: str) -> dict:
+        """POST /v1/sets/{rs}/halt."""
         return self._call("POST", f"/v1/sets/{rs}/halt", {})
 
     def resume(self, rs: str) -> dict:
+        """POST /v1/sets/{rs}/resume."""
         return self._call("POST", f"/v1/sets/{rs}/resume", {})
 
     def rejoin(self, rs: str, node: str) -> dict:
+        """POST /v1/sets/{rs}/rejoin for ``node``."""
         return self._call("POST", f"/v1/sets/{rs}/rejoin", {"node": node})
 
     def events(self, rs: str | None = None, since: float | None = None) -> list[dict]:
+        """GET /v1/events, oldest first."""
         q = {}
         if rs:
             q["rs"] = rs
@@ -100,18 +117,23 @@ class ManagerClient:
 
 
 class AgentClient:
+    """One agent's API, for the harness and for poking a node by hand."""
+
     def __init__(self, base_url: str, timeout: float = 3.0):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
 
     def get(self, path: str) -> tuple[int, Any]:
+        """GET ``path``, returning (status, body)."""
         return request("GET", self.base + path, None, self.timeout)
 
     def post(self, path: str, body: Any = None, timeout: float | None = None) -> tuple[int, Any]:
+        """POST ``path``, returning (status, body)."""
         return request("POST", self.base + path, body if body is not None else {},
                        timeout or self.timeout)
 
     def status(self) -> dict | None:
+        """GET /status, None when the agent does not answer 200."""
         try:
             code, body = self.get("/status")
         except ApiError:
@@ -119,6 +141,7 @@ class AgentClient:
         return body if code == 200 and isinstance(body, dict) else None
 
     def primary_code(self) -> int | None:
+        """The status code of GET /primary (what HAProxy sees), None when unreachable."""
         try:
             return self.get("/primary")[0]
         except ApiError:

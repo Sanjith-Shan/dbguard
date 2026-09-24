@@ -13,6 +13,7 @@ import click
 
 
 def conn_options(f):
+    """Add the connection options every osc subcommand takes."""
     for opt in reversed([
         click.option("--host", default="127.0.0.1", show_default=True,
                      help="the PRIMARY (dbgctl status shows which node it is)"),
@@ -150,8 +151,9 @@ def status(host, port, user, password, tls, db, as_json) -> None:
         stale = (r["phase"] not in ("done", "failed") and age > 10)
         est = max(int(r["rows_est"] or 0), 1)
         pct = min(100.0, 100.0 * int(r["rows_copied"] or 0) / est)
-        click.echo(f"{r['db']}.{r['tbl']}: {r['phase']}"
-                   f"{' (STALE, no update for %.0fs, process gone? run osc cleanup)' % age if stale else ''}"
+        stale_note = (" (STALE, no update for %.0fs, process gone? run osc cleanup)" % age
+                      if stale else "")
+        click.echo(f"{r['db']}.{r['tbl']}: {r['phase']}{stale_note}"
                    f" method={r['method'] or '-'} copied {r['rows_copied']}/~{r['rows_est']} "
                    f"(~{pct:.0f}%) chunks={r['chunks']} chunk_size={r['chunk_size']} "
                    f"throttled={float(r['throttled_s'] or 0):.1f}s started={r['started']} "
