@@ -31,7 +31,10 @@ class SetState:
         self.events = events
         self.clock = clock
         self.on_change = on_change
-        self.state = State.HEALTHY
+        # Every set starts DISCOVERING and leaves it only through discovery, bootstrap or
+        # cold start. HEALTHY with no primary once fooled `make wait-healthy` on a fleet
+        # whose mysqld were still initialising.
+        self.state = State.DISCOVERING
         self.since = clock()
         self.halt_reason: str | None = None
         self.primary: str | None = None
@@ -52,6 +55,9 @@ class SetState:
             return False
         if self.state == State.HALTED:
             log.warning("ignored transition out of HALTED", rs=self.rs, to=new.value)
+            return False
+        if new == State.HEALTHY and self.primary is None:
+            log.warning("refused HEALTHY without a primary", rs=self.rs, frm=self.state.value)
             return False
         old = self.state
         self.state = new
@@ -75,7 +81,8 @@ class SetState:
         if self.state != State.HALTED:
             return False
         old = self.state
-        self.state = State.HEALTHY
+        new = State.HEALTHY if self.primary is not None else State.DISCOVERING
+        self.state = new
         self.since = self.clock()
         reason = self.halt_reason
         self.halt_reason = None
@@ -84,7 +91,7 @@ class SetState:
                                  old_primary=self.primary, new_primary=self.primary,
                                  note=note or f"resumed by operator (was: {reason})"))
         if self.on_change:
-            self.on_change(self.rs, old, State.HEALTHY)
+            self.on_change(self.rs, old, new)
         return True
 
     def in_cooldown(self, now: float | None = None) -> bool:

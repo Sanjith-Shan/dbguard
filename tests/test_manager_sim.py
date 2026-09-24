@@ -677,3 +677,37 @@ async def test_slow_fence_still_precedes_promote(sim_factory):
     assert order.index("fenced") < order.index("promoted")
     assert ev.steps.fence.outcome == "sql" and ev.steps.fence.duration_s >= 0.8
     lossless(s)
+
+
+async def test_discovering_until_a_primary_is_found(sim_factory):
+    """Fresh fleet, mysqld still initialising: every node down. The set must say
+    DISCOVERING with primary null, never HEALTHY, until discovery finds a primary."""
+    s = await sim_factory(sets={"rs1": A}, start=False)
+    for n in A:
+        s.fleet.nodes[n].mysqld_up = False
+    await s.mgr.start()
+    await asyncio.sleep(0.6)
+    st = s.ctl().status()
+    assert st["state"] == "DISCOVERING" and st["primary"] is None
+    assert all(v["role"] == "down" for v in st["nodes"].values())
+    from dbguard.manager.doctor import doctor
+    d = doctor(s.ctl())
+    assert d["lines"][0] == "rs1: no primary found yet, 0 of 3 nodes reachable, state DISCOVERING."
+    assert d["verdict"] == "DISCOVERING"
+    assert not s.events("rs1", "healthy")
+    for n in A:
+        s.fleet.nodes[n].mysqld_up = True
+    await s.healthy("rs1", "mysql-a1")
+    assert s.ctl().status()["primary"] == "mysql-a1"
+
+
+async def test_healthy_requires_streaming_replicas(sim_factory):
+    """Primary found but no replica streams: DEGRADED, not HEALTHY. (Naive mode, so the
+    primary keeps accepting writes without replicas and the probe stays green.)"""
+    s = await sim_factory(mode="naive", sets={"rs1": A}, start=False)
+    for n in ("mysql-a2", "mysql-a3"):
+        s.fleet.nodes[n].frozen = True
+    await s.mgr.start()
+    await s.until(lambda: s.ctl().primary == "mysql-a1", what="discovered")
+    await s.until(lambda: s.ctl().st.state == State.DEGRADED, what="DEGRADED")
+    assert not s.events("rs1", "healthy")

@@ -208,7 +208,9 @@ class SetController:
                    ob.nodes[n].replicating_from(self.primary)]
         now = ob.ts
         maint_running = self.maint is not None and not self.maint.done()
-        if len(healthy) >= self.configured_replicas:
+        pv = ob.nodes.get(self.primary)
+        primary_ok = pv is not None and pv.writable
+        if primary_ok and healthy and len(healthy) >= self.configured_replicas:
             self.unhealthy_since = None
             if not maint_running:
                 self.st.to(State.HEALTHY, note=f"primary {self.primary}, replicas "
@@ -221,6 +223,8 @@ class SetController:
             elif now - self.unhealthy_since >= DEGRADED_GRACE_S or \
                     self.st.state == State.FAILING_OVER:
                 missing = [n for n in self.members if n != self.primary and n not in healthy]
+                if not primary_ok:
+                    missing.insert(0, f"primary {self.primary} not writable")
                 self.st.to(State.DEGRADED, note=(
                     f"{len(healthy)} of {self.configured_replicas} replicas healthy, "
                     f"missing {', '.join(missing) or 'none'}"))

@@ -11,6 +11,7 @@ from dbguard.gtid import GtidSet
 
 
 class State(str, enum.Enum):
+    DISCOVERING = "DISCOVERING"   # initial: no primary found yet (fleet starting, manager just started)
     HEALTHY = "HEALTHY"
     SUSPECT = "SUSPECT"
     FAILING_OVER = "FAILING_OVER"

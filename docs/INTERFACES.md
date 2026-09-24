@@ -268,13 +268,21 @@ Env for the agent container: `DBGUARD_NODE`, `DBGUARD_RS`, `DBGUARD_SERVER_ID`,
 
 `SetStatus`:
 ```
-{"rs":"rs1","state":"HEALTHY|SUSPECT|FAILING_OVER|DEGRADED|REBUILDING|HALTED",
+{"rs":"rs1","state":"DISCOVERING|HEALTHY|SUSPECT|FAILING_OVER|DEGRADED|REBUILDING|HALTED",
  "halt_reason":str|null,"primary":"mysql-a1"|null,"since":<unix>,
  "nodes":{"mysql-a1":{"role":"primary|replica|down|fenced|spare","reachable":bool,
           "gtid_executed":..,"lag_s":float|null,"heartbeat_age_s":float|null,
           "semisync":"source|replica|off","io_running":..,"sql_running":..}},
  "last_event":<Event>|null,"failovers_total":n,"cooldown_until":<unix>|null}
 ```
+
+Every set starts in `DISCOVERING` (primary null) and leaves it only when discovery finds the
+primary, or through bootstrap or cold start. `HEALTHY` means a reachable primary with
+`super_read_only=0` and at least `len(nodes)-1` replicas streaming from it (IO and SQL threads
+Yes). A set is never `HEALTHY` with primary null. A reachable primary with too few streaming
+replicas is `DEGRADED`. Doctor's first line while discovering is
+"rs1: no primary found yet, n of m nodes reachable, state DISCOVERING." Resume of a HALTED set
+with no known primary returns to `DISCOVERING`.
 
 ## Event row (dbguard/events.py), one JSON object per line in `/var/lib/dbguard/events.jsonl`
 and in the API

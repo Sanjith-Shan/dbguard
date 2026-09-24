@@ -25,7 +25,7 @@ import structlog
 
 from dbguard.manager.client import AgentError
 from dbguard.manager.failover import ROLE_CHANGE_TIMEOUT_S
-from dbguard.manager.model import NodeView, Observation, State
+from dbguard.manager.model import NodeView, Observation
 
 if TYPE_CHECKING:
     from dbguard.manager.controller import SetController
@@ -115,7 +115,7 @@ async def cold_start(ctl: SetController, src: str, views: dict[str, NodeView]) -
               watermark_gtid=resp.get("gtid_executed") if isinstance(resp, dict) else None,
               note=f"every node booted read-only, {', '.join(reps) or 'no replica'} "
                    f"replicate from {src} and hold nothing it lacks, promoted it in place")
-    ctl.st.to(State.HEALTHY, emit=False)
+    # HEALTHY or DEGRADED is decided by the next reconcile, on fresh views
 
 
 async def bootstrap(ctl: SetController) -> None:
@@ -133,4 +133,4 @@ async def bootstrap(ctl: SetController) -> None:
     ctl.event(type="bootstrap", new_primary=first, total_s=round(time.monotonic() - t0, 3),
               watermark_gtid=resp.get("gtid_executed") if isinstance(resp, dict) else None,
               note=f"new set, promoted {first}, repointed {', '.join(step.nodes)}")
-    ctl.st.to(State.HEALTHY, emit=False)
+    # HEALTHY or DEGRADED is decided by the next reconcile, on fresh views

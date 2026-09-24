@@ -53,13 +53,15 @@ def doctor(ctl: SetController, now: float | None = None) -> dict:
     p = ctl.primary
     pv = ob.nodes.get(p) if p else None
     v = evaluate(list(ctl.history), ctl.members, ctl.params, now=ob.ts) if p else None
-    verdict = VERDICT_WORD.get(v.kind, v.kind) if v else "NO PRIMARY"
+    verdict = VERDICT_WORD.get(v.kind, v.kind) if v else ctl.st.state.value
     if ctl.st.state == State.HALTED:
         verdict = "HALTED"
 
     # 1. the verdict sentence ------------------------------------------------------
     if p is None:
-        lines.append(f"{rs}: no primary known, {ctl.st.note or 'waiting for the fleet'}.")
+        reach = sum(1 for n in ctl.members if (nv := ob.nodes.get(n)) and nv.usable)
+        lines.append(f"{rs}: no primary found yet, {reach} of {len(ctl.members)} nodes "
+                     f"reachable, state {ctl.st.state.value}.")
     else:
         parts = []
         if v.probe_failed:
