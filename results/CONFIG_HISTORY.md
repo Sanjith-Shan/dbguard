@@ -67,3 +67,19 @@ were moved to `results/old-config/<tag>/`. The earlier rows are kept as evidence
 - Applied with `docker compose up -d` (only the nodes and HAProxy were recreated, volumes
   kept). Every entry from partition-replicas onward, and every rerun, runs under this
   configuration.
+
+## kill-two reduced to 10 runs (11 recorded)
+
+- Why each run took about 7 minutes. After the primary and the most advanced replica are
+  killed together, the manager promotes the last survivor. That node has no semi-sync replica,
+  so every commit stalls (the one-hour timeout, by design). The manager's own heartbeat write
+  then blocks too, so it sits in SUSPECT, and it never rejoins the two restarted nodes: both
+  hold transactions the survivor lacks, so they need a clone rebuild, and a rebuild needs a
+  replica donor, which does not exist. Nothing moves until a human (here the harness heal, 120
+  s, then a hard reset) intervenes. Per run: about 30 s of workload, a 240 s wait for a rejoin
+  event that never comes, 120 s of heal, 20 s of hard reset. No spare was provisioned (the set
+  never reached DEGRADED long enough), so replica-loss and disk-full do not share this cost.
+- Result. 11 runs, 0 lost acknowledged writes. Clients saw an unbounded write stall instead
+  of a failover time, so `failover_s` is null in every row. The table reports it as a stall
+  that needs an operator, which is the honest boundary of `wait_for_replica_count=1`.
+- orchestrator hang-container reduced to 15 runs.
