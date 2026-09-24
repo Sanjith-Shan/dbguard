@@ -468,10 +468,13 @@ async def test_wake_gap_triggers_guard_before_primary_answers(settings):
     manager = FakeManager("mysql-a2")
     agent = make_agent(settings, db, manager=manager)
     agent.startup_done.set()
+    await agent.refresh_primary_sample()
     agent.last_tick -= 10  # the container was frozen for 10 s
     code, body = await agent.primary_check()
-    assert (code, body) == (503, {"role": "fenced"})
-    assert manager.urls
+    assert code == 503  # never 200 before the guard ran
+    await agent._guard_task
+    assert manager.urls and agent.fenced
+    assert await agent.primary_check() == (503, {"role": "fenced"})
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -507,9 +510,13 @@ async def test_primary_truth_table(settings, client_factory, sro, fenced, hung, 
     if fenced:
         await agent.fence()
         db.sro = sro
-    if hung:
+    await agent.refresh_primary_sample()
+    if hung or down:
+        # The sampler stops getting answers, so the last sample ages past stale.
         db.hang.add("super_read_only")
-    db.down = down
+        db.down = down
+        assert not await agent.refresh_primary_sample()
+        agent._primary_sample = (agent._primary_sample[0] - 1.0,) + agent._primary_sample[1:]
     c = await client_factory(agent)
     r = await c.get("/primary")
     assert r.status == code
@@ -908,3 +915,77 @@ async def test_repoint_and_configure_have_one_deadline(settings, client_factory,
     assert time.monotonic() - t0 < 1.0
     assert r.status == 504
     assert (await r.json())["error"] == "deadline"
+
+
+
+# --------------------------------------------------------------------------- /primary in memory
+
+async def _primed(settings, sro=0):
+    db = FakeDB()
+    db.sro = sro
+    agent = make_agent(settings, db)
+    agent.startup_done.set()
+    assert await agent.refresh_primary_sample()
+    return agent, db
+
+
+async def test_primary_200_on_fresh_sample(settings):
+    agent, _ = await _primed(settings)
+    assert await agent.primary_check() == (200, {"role": "primary"})
+
+
+async def test_primary_503_on_stale_sample(settings):
+    settings.primary_stale_s = 0.5
+    agent, _ = await _primed(settings)
+    ts, sro, ro = agent._primary_sample
+    agent._primary_sample = (ts - 0.6, sro, ro)
+    assert await agent.primary_check() == (503, {"role": "unknown"})
+
+
+async def test_primary_503_fenced_even_with_fresh_writable_sample(settings):
+    agent, _ = await _primed(settings)
+    agent._set_fenced(True)  # the flag alone, sample still says writable and fresh
+    assert agent._primary_sample[1] is False
+    assert await agent.primary_check() == (503, {"role": "fenced"})
+
+
+async def test_promote_forces_a_refresh(settings):
+    agent, db = await _primed(settings, sro=1)
+    assert (await agent.primary_check())[0] == 503
+    before = agent._primary_sample[0]
+    await agent.promote()
+    assert agent._primary_sample[0] > before and agent._primary_sample[1] is False
+    assert await agent.primary_check() == (200, {"role": "primary"})
+
+
+@pytest.mark.parametrize("op", ["fence", "repoint"])
+async def test_fence_and_repoint_force_a_refresh(settings, op):
+    agent, db = await _primed(settings, sro=0)
+    await agent.unfence()
+    if op == "fence":
+        await agent.fence()
+    else:
+        await agent.repoint("mysql-a2")
+    assert agent._primary_sample[1] is True
+    assert (await agent.primary_check())[0] == 503
+
+
+async def test_primary_handler_never_awaits_sql(settings, client_factory):
+    """Every SQL statement now hangs. /primary still answers at once from memory."""
+    agent, db = await _primed(settings)
+    db.hang.add("")  # matches every statement
+    db.hang.add("CONNECT")
+    c = await client_factory(agent)
+    t0 = time.monotonic()
+    r = await c.get("/primary")
+    assert time.monotonic() - t0 < 0.05
+    assert r.status == 200
+    text = await (await c.get("/metrics")).text()
+    assert "dbguard_agent_primary_check_seconds_count 1.0" in text
+
+
+async def test_kill_fence_invalidates_sample(settings):
+    agent, db = await _primed(settings)
+    db.hang.add("SET GLOBAL super_read_only=1")
+    await agent.fence()
+    assert agent._primary_sample is None

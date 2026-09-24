@@ -172,6 +172,24 @@ heredocs and cache mounts already).
   manager does. For both rejoin and replacement the donor is a replica that is streaming from
   the current primary, never the primary itself. Worth a line in the runbook.
 
+### HAProxy cut every client session on a slow /primary
+
+- Symptom. In 9 of 30 partition-manager runs the workload saw 8 client errors at once with
+  no failover. HAProxy's log showed the primary marked DOWN with "Layer7 timeout, check
+  duration 1005ms", then UP again on the next check. With `inter 100ms`, `fall 1` and
+  `on-marked-down shutdown-sessions`, one slow check closes every session on the primary.
+- How found. Matching the error bursts in the ack logs to HAProxy's server state changes in
+  its log. The agent's `/primary` did a live `SELECT @@super_read_only` per check, and under
+  load that round trip sometimes took over a second.
+- Fix. `/primary` answers from memory and never awaits SQL. A background refresher samples
+  `@@super_read_only` and `@@read_only` every 100 ms on its own connection (300 ms statement
+  timeout) and stores the result with a monotonic timestamp. `/primary` checks the fence flag
+  first, then answers 200 only when the sample is fresher than `DBGUARD_PRIMARY_STALE_S`
+  (0.5 s) and says writable. A hung mysqld fails the check within 0.5 s through staleness.
+  `/promote`, `/fence` and `/repoint` force a sample right after their last SET, and a kill
+  fence or mysqld restart drops the sample. Handler latency is in `/metrics` as
+  `dbguard_agent_primary_check_seconds`.
+
 ## Harness
 
 ### docker kill -s STOP froze nothing but tini

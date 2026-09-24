@@ -45,6 +45,9 @@ class AgentSettings:
     restart_wait_s: float = 600.0
     restart_hold_s: float = 20.0
     wake_guard: bool = True
+    primary_stale_s: float = 0.5
+    primary_sample_interval_s: float = 0.1
+    primary_sample_timeout_s: float = 0.3
 
     @property
     def fence_file(self) -> str:
@@ -68,6 +71,7 @@ class AgentSettings:
             repl_user=e.get("DBGUARD_REPL_USER", "repl"),
             repl_password=e.get("DBGUARD_REPL_PASSWORD", "repl"),
             source_port=int(e.get("DBGUARD_SOURCE_PORT", "3306")),
+            primary_stale_s=float(e.get("DBGUARD_PRIMARY_STALE_S", "0.5")),
             wake_guard=_bool(e.get("DBGUARD_WAKE_GUARD"), True),
             restart_hold_s=float(e.get("DBGUARD_RESTART_HOLD_S", "20")),
             self_fence_after_s=float(e.get("DBGUARD_SELF_FENCE_AFTER_S", "10")),

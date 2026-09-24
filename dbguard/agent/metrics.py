@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
 ROLES = ("primary", "replica", "fenced", "unknown")
 
@@ -27,6 +27,9 @@ class AgentMetrics:
         self.self_fences = Counter("dbguard_agent_self_fences_total",
                                    "Self-fences by the lease (manager and replicas gone)",
                                    registry=r)
+        self.primary_check = Histogram(
+            "dbguard_agent_primary_check_seconds", "GET /primary handler latency",
+            buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0), registry=r)
         self.mysqld_restarts = Counter("dbguard_agent_mysqld_restarts_total",
                                        "mysqld restarts by the supervisor", registry=r)
         self.heartbeat_age = Gauge("dbguard_agent_heartbeat_age_seconds",

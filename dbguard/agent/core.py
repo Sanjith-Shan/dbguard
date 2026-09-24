@@ -143,6 +143,9 @@ class Agent:
         self._role = "unknown"
         self.rebuilding = False
         self._step: str | None = None
+        self._primary_sample: tuple[float, bool | None, bool | None] | None = None
+        self._sample_session: Session | None = None
+        self._sample_lock = asyncio.Lock()
         self.self_fence_on = True
         self.wake_guard_on = settings.wake_guard
         self._mgr_unreachable_since: float | None = None
@@ -223,25 +226,66 @@ class Agent:
     # ------------------------------------------------------------------ /primary
 
     async def primary_check(self) -> tuple[int, dict[str, str]]:
-        await self.ensure_awake()
+        """HAProxy's check. Answers from memory only, never awaits SQL: the fence flag,
+        then the refresher's sample of @@super_read_only (fresh within
+        DBGUARD_PRIMARY_STALE_S). A hung mysqld fails it by staleness, a fence by the flag."""
+        t0 = time.perf_counter()
+        try:
+            return self._primary_answer()
+        finally:
+            self.m.primary_check.observe(time.perf_counter() - t0)
+
+    def _primary_answer(self) -> tuple[int, dict[str, str]]:
         if self.fenced:
             return 503, {"role": "fenced"}
         if not self.startup_done.is_set() or self.rebuilding:
             return 503, {"role": "unknown"}
-        try:
-            rows = await self._sql(lambda s: s.query(
-                "SELECT @@GLOBAL.super_read_only AS sro", timeout=self.s.sql_timeout_s))
-            sro = _b(rows[0]["sro"])
-        except DbError:
+        now = time.monotonic()
+        if now - self.last_tick > self.s.wake_gap_s:
+            # Woken from a freeze. Start the guard and say "unknown" until it has run.
+            log.warning("wake_gap", gap_s=round(now - self.last_tick, 3), where="primary")
+            self.last_tick = now
+            self._trigger_guard("wake")
+        if self._guard_task is not None and not self._guard_task.done():
+            return 503, {"role": "unknown"}
+        sample = self._primary_sample
+        if sample is None or now - sample[0] > self.s.primary_stale_s:
             self._set_role("unknown")
             return 503, {"role": "unknown"}
-        if self.fenced:  # a fence may have landed while we waited on mysqld
-            return 503, {"role": "fenced"}
-        if sro is False:
+        if sample[1] is False:
             self._set_role("primary")
             return 200, {"role": "primary"}
         self._set_role("replica")
         return 503, {"role": "replica"}
+
+    # ------------------------------------------------------------------ /primary sampler
+
+    def invalidate_primary_sample(self) -> None:
+        self._primary_sample = None
+
+    async def refresh_primary_sample(self) -> bool:
+        """One sample on the refresher's own connection. Callers that just changed
+        super_read_only call this so HAProxy's next check sees the change."""
+        async with self._sample_lock:
+            try:
+                if self._sample_session is None or self._sample_session.closed:
+                    self._sample_session = await self.db.connect(self.s.primary_sample_timeout_s)
+                rows = await self._sample_session.query(
+                    "SELECT @@GLOBAL.super_read_only AS sro, @@GLOBAL.read_only AS ro",
+                    timeout=self.s.primary_sample_timeout_s)
+                self._primary_sample = (time.monotonic(), _b(rows[0]["sro"]),
+                                        _b(rows[0]["ro"]))
+                return True
+            except DbError:
+                if self._sample_session is not None:
+                    self._sample_session.close()
+                self._sample_session = None
+                return False
+
+    async def _primary_refresher(self) -> None:
+        while not self._stopping:
+            await self.refresh_primary_sample()
+            await asyncio.sleep(self.s.primary_sample_interval_s)
 
     # ------------------------------------------------------------------ /status
 
@@ -396,6 +440,7 @@ class Agent:
                 sess = None
             if method == "sql":
                 assert sess is not None
+                await self.refresh_primary_sample()
                 try:
                     killed = await self._kill_clients(sess)
                     rows = await sess.query("SELECT @@GLOBAL.gtid_executed AS g",
@@ -409,6 +454,7 @@ class Agent:
                 # Hold the restart so the dead primary does not come back and serve its
                 # unacked binlog tail to replicas that are not repointed yet (review #4).
                 self.sup.hold(self.s.restart_hold_s)
+                self.invalidate_primary_sample()
                 pid = self.sup.kill(signal.SIGKILL)
                 if pid is None:
                     # Nothing to kill: either mysqld is already gone, or we do not own it.
@@ -507,6 +553,8 @@ class Agent:
                 self._step = "clear fence flag"
                 async with self._fence_lock:
                     self._set_fenced(False)
+                self._step = "refresh /primary sample"
+                await self.refresh_primary_sample()
                 self._step = "SELECT @@GLOBAL.gtid_executed"
                 rows = await s.query("SELECT @@GLOBAL.gtid_executed AS g",
                                      timeout=self.s.role_change_timeout_s)
@@ -529,6 +577,8 @@ class Agent:
             async with self.db.session(self.s.sql_timeout_s) as s:
                 await self._role_sql(s, "STOP REPLICA")
                 await self._role_sql(s, "SET GLOBAL super_read_only=1")
+                self._step = "refresh /primary sample"
+                await self.refresh_primary_sample()
                 await self._role_sql(s, "SET GLOBAL rpl_semi_sync_source_enabled=0")
                 await self._role_sql(s, "SET GLOBAL rpl_semi_sync_replica_enabled="
                                      + ("1" if self.semisync else "0"))
@@ -983,6 +1033,7 @@ class Agent:
         """Supervisor callback: a new mysqld was spawned (not the first one)."""
         self.m.mysqld_restarts.inc()
         self.db_drop_idle()
+        self.invalidate_primary_sample()
 
         async def after() -> None:
             if await self.wait_responsive(self.s.restart_wait_s):
@@ -995,7 +1046,8 @@ class Agent:
         self._tasks += [asyncio.create_task(self._startup(), name="startup"),
                         asyncio.create_task(self._ticker(), name="ticker"),
                         asyncio.create_task(self._heartbeat(), name="heartbeat"),
-                        asyncio.create_task(self._self_fence_loop(), name="self-fence")]
+                        asyncio.create_task(self._self_fence_loop(), name="self-fence"),
+                        asyncio.create_task(self._primary_refresher(), name="primary-sampler")]
 
     async def stop(self) -> None:
         self._stopping = True
@@ -1006,5 +1058,7 @@ class Agent:
                 await t
         if self._hb_session is not None:
             self._hb_session.close()
+        if self._sample_session is not None:
+            self._sample_session.close()
         await self.sup.stop()
         await self.db.close()

@@ -214,8 +214,15 @@ Agent additions to the shapes above. Extra keys only, nothing removed.
   (the crash test hook) never holds.
 - `/rebuild` also returns `gtid_executed` after the clone. `/kill-mysqld` and `/hang-mysqld`
   answer `{"ok":true,"pid":n}` (plus `seconds`) and 409 without a supervised mysqld.
+- `/primary` never awaits SQL. It answers from the fence flag (checked first) and a sample of
+  `@@super_read_only` and `@@read_only` that a background task takes every 100 ms on its own
+  connection (300 ms timeout). It answers 200 only when not fenced, the sample is fresher than
+  `DBGUARD_PRIMARY_STALE_S` (default 0.5 s), and `super_read_only=0`. A stale sample answers
+  503 `unknown`. `/promote`, `/fence` and `/repoint` refresh the sample right after their last
+  SET. Latency is the histogram `dbguard_agent_primary_check_seconds`.
 - `/primary` answers 503 `unknown` until the startup guard has run, and a request that
-  arrives after a monotonic gap over 3 s waits (up to 2.5 s) for the wake guard first.
+  arrives after a monotonic gap over 3 s starts the wake guard and answers 503 `unknown` at
+  once, as does every check while the guard is still running.
 - The agent passes `MYSQLD_PARENT_PID=<agent pid>` to mysqld, which makes mysqld treat the
   agent as its monitoring process. `RESTART` and the restart after `CLONE INSTANCE` then exit
   with code 16 and the agent restarts mysqld at once.
