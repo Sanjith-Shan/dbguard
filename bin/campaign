@@ -281,6 +281,18 @@ def prune_tmp() -> None:
             pass
 
 
+def commit_results(label: str) -> None:
+    """git add only the top-level result rows and SUMMARY.md, and commit (after every entry)."""
+    files = [str(p.relative_to(REPO)) for p in sorted(RESULTS.glob("*.jsonl"))] + ["results/SUMMARY.md"]
+    subprocess.run(["git", "add", "--", *files], cwd=REPO, capture_output=True)
+    msg = (f"results: {label} rows and SUMMARY.md\n\n"
+           "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n"
+           "Claude-Session: https://claude.ai/code/session_01TuWJfToiZLLt7qbWdJSftd")
+    r = subprocess.run(["git", "commit", "-q", "-m", msg, "--", *files], cwd=REPO, capture_output=True,
+                       text=True)
+    log(f"COMMIT results after {label}: rc={r.returncode} {r.stderr.strip()[:120]}")
+
+
 def summary_line(e: dict) -> str:
     try:
         s = json.loads((RESULTS / "summary.json").read_text())
@@ -389,6 +401,7 @@ def main() -> int:
             per = (time.time() - t0) / got if got else float("nan")
             log(f"ENTRY done {label}: +{got} rows (have {done_count(e)}/{e['runs']}), rc={rc}, "
                 f"{per:.0f} s/run | {summary_line(e)}")
+            commit_results(label)
     log(f"CAMPAIGN done in {(time.time() - t_camp) / 3600:.1f} h")
     return 0
 
