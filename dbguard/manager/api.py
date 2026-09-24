@@ -46,6 +46,11 @@ async def set_primary(request):
     ctl = _ctl(request)
     # Mid-failover the old primary is still ctl.primary until the promote step. A woken
     # node asking now must not be told it is the primary, so answer null.
+    if ctl.primary is None:
+        # Discovering (just started) or no primary known. "unknown" means the agent must
+        # leave its state alone, never read it as "someone else is primary" (REVIEW #16).
+        return web.json_response({"primary": "unknown", "state": ctl.st.state.value},
+                                 status=503)
     primary = None if ctl.st.state == State.FAILING_OVER else ctl.primary
     return web.json_response({"primary": primary, "state": ctl.st.state.value})
 
