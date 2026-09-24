@@ -10,6 +10,7 @@ from datetime import datetime
 import click
 
 from dbguard.cli.client import ApiError, ManagerClient
+from dbguard.cli.osc import osc
 
 
 def _fmt_ts(ts: float | None) -> str:
@@ -223,6 +224,9 @@ def parse_since(s: str | None) -> float | None:
     if s[-1:] in units and s[:-1].replace(".", "").isdigit():
         return time.time() - float(s[:-1]) * units[s[-1]]
     return float(s)
+
+
+cli.add_command(osc)
 
 
 def main() -> None:
