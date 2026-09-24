@@ -55,6 +55,20 @@ heredocs and cache mounts already).
   The init SQL runs with `sql_log_bin=0` and ends with `RESET BINARY LOGS AND GTIDS`, so
   every node starts with an empty and identical `gtid_executed`.
 
+### Replicas fell 44 s behind in five minutes
+
+- Symptom. The first clean five-minute run (8 clients, about 720 writes/s, semi-sync on)
+  passed the checker, but convergence took 43.9 s. Sampling `Seconds_Behind_Source` every
+  5 s during a 40 s run showed the lag growing by about 1.4 s per 5 s on both replicas.
+  Semi-sync did not hide it because AFTER_SYNC waits for the relay log write, not the apply.
+  With the manager's `catchup_deadline_s: 30`, a failover after a few minutes of load would
+  have timed out waiting for the winner to apply its relay log.
+- How found. The checker's `converge_s` on the acceptance run, then the lag sampling.
+- Fix. The 8.4 default of `replica_parallel_workers=4` was the limit. Setting it to 16 on
+  one replica during the same load brought that replica to 0 to 1 s of lag while the other
+  kept growing. my.cnf now sets `replica_parallel_workers=16` and
+  `replica_preserve_commit_order=ON`.
+
 ### The init wrapper died on an unset variable
 
 - Symptom. First boot stopped at `dbguard-initdb.sh: line 17: DATABASE_ALREADY_EXISTS:
