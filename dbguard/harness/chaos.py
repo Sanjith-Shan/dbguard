@@ -49,7 +49,7 @@ MODES = ["dbguard", "naive", "orchestrator"]
 MANAGER_CONTAINER = "dbguard"
 ORCH_CONTAINER = "orchestrator"
 ORCH_URL = os.environ.get("DBGUARD_ORCH_URL", "http://127.0.0.1:13000")
-HOOKS_FILE = "/var/lib/orchestrator-hooks/events.jsonl"
+HOOKS_FILE = "/var/lib/orchestrator/hooks/events.jsonl"
 STATE_EVENT_TYPES = {"failover", "switchover", "rejoin", "rebuild", "replace", "halt", "resume",
                      "suspect", "degraded", "healthy", "stall"}
 

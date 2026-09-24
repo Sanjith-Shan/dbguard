@@ -1,0 +1,66 @@
+{
+  "Debug": false,
+  "EnableSyslog": false,
+  "ListenAddress": ":3000",
+  "BackendDB": "sqlite",
+  "SQLite3DataFile": "/var/lib/orchestrator/orc.db",
+  "MySQLTopologyUser": "dbguard",
+  "MySQLTopologyPassword": "dbguard",
+  "MySQLTopologyUseMixedTLS": true,
+  "MySQLTopologySSLSkipVerify": true,
+  "MySQLConnectTimeoutSeconds": 1,
+  "MySQLTopologyReadTimeoutSeconds": 3,
+  "DefaultInstancePort": 3306,
+  "DiscoverByShowSlaveHosts": true,
+  "InstancePollSeconds": 1,
+  "UnseenInstanceForgetHours": 240,
+  "HostnameResolveMethod": "none",
+  "MySQLHostnameResolveMethod": "none",
+  "SkipBinlogServerUnresolveCheck": true,
+  "RaftEnabled": false,
+  "DetectClusterAliasQuery": "SELECT rs FROM dbguard.heartbeat ORDER BY ts DESC LIMIT 1",
+  "DetectInstanceAliasQuery": "SELECT @@report_host",
+  "ReasonableReplicationLagSeconds": 10,
+  "ReasonableMaintenanceReplicationLagSeconds": 20,
+  "ReadOnly": false,
+  "AuthenticationMethod": "",
+  "PowerAuthUsers": [
+    "*"
+  ],
+  "StatusEndpoint": "/api/status",
+  "RecoveryPeriodBlockSeconds": 5,
+  "FailureDetectionPeriodBlockMinutes": 1,
+  "RecoveryIgnoreHostnameFilters": [],
+  "RecoverMasterClusterFilters": [
+    "*"
+  ],
+  "RecoverIntermediateMasterClusterFilters": [],
+  "ApplyMySQLPromotionAfterMasterFailover": true,
+  "PreventCrossDataCenterMasterFailover": false,
+  "PreventCrossRegionMasterFailover": false,
+  "DelayMasterPromotionIfSQLThreadNotUpToDate": true,
+  "FailMasterPromotionOnLagMinutes": 0,
+  "DetachLostReplicasAfterMasterFailover": true,
+  "MasterFailoverLostInstancesDowntimeMinutes": 0,
+  "CoMasterRecoveryMustPromoteOtherCoMaster": true,
+  "OnFailureDetectionProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh detect '{failureClusterAlias}' '{failedHost}' '' '{failureType}'"
+  ],
+  "PreFailoverProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh pre-failover '{failureClusterAlias}' '{failedHost}' '' '{failureType}'"
+  ],
+  "PostMasterFailoverProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh post-master-failover '{failureClusterAlias}' '{failedHost}' '{successorHost}' '{failureType}'"
+  ],
+  "PostUnsuccessfulFailoverProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh unsuccessful '{failureClusterAlias}' '{failedHost}' '' '{failureType}'"
+  ],
+  "PreGracefulTakeoverProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh pre-graceful '{failureClusterAlias}' '{failedHost}' '{successorHost}' 'graceful'"
+  ],
+  "PostGracefulTakeoverProcesses": [
+    "/usr/local/orchestrator/hooks/hook.sh post-graceful '{failureClusterAlias}' '{failedHost}' '{successorHost}' 'graceful'"
+  ],
+  "UseSuperReadOnly": true,
+  "ProcessesShellCommand": "sh"
+}
