@@ -83,7 +83,13 @@ def replica_vote(nv: NodeView, primary: str, window_s: float) -> list[str]:
     if nv.source_reachable is False:
         out.append("cannot reach primary")
     if nv.heartbeat_age_s is not None and nv.heartbeat_age_s > window_s:
-        out.append(f"heartbeat stale for {nv.heartbeat_age_s:.1f} s")
+        # The heartbeat row is read after the SQL thread applied it, so a replica that is
+        # merely behind shows an old heartbeat while its IO thread receives fine. Only
+        # staleness not explained by apply lag is a vote (orchestrator calls the other
+        # case UnreachableMasterWithLaggingReplicas and does not fail over).
+        lag = r.seconds_behind_source or 0
+        if nv.heartbeat_age_s - lag > window_s:
+            out.append(f"heartbeat stale for {nv.heartbeat_age_s:.1f} s")
     return out
 
 

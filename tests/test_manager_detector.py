@@ -11,13 +11,13 @@ P = DetectParams(mode="dbguard", detect_window_s=W, probe_failures=3, configured
 NAIVE = DetectParams(mode="naive", detect_window_s=W, probe_failures=3, configured_replicas=2)
 
 
-def replica(name, io="Yes", hb=0.3, reach=True, src="p", up=True):
+def replica(name, io="Yes", hb=0.3, reach=True, src="p", up=True, sbs=0):
     if not up:
         return NodeView.unreachable(name, "down")
     return NodeView(name=name, ts=0, reachable=True, mysqld_alive=True,
                     mysqld_responsive=True, super_read_only=True,
                     replica=ReplicaView(configured=True, source_host=src, io_running=io,
-                                        sql_running="Yes"),
+                                        sql_running="Yes", seconds_behind_source=sbs),
                     source_reachable=reach, heartbeat_age_s=hb)
 
 
@@ -180,3 +180,13 @@ def test_three_replica_majority():
             "p": primary(reachable=False), "r1": replica("r1", io="Connecting"),
             "r2": replica("r2", io="Connecting"), "r3": replica("r3")}))
     assert evaluate(obs, members, p3).dead
+
+
+def test_lagging_replicas_do_not_vote_with_the_heartbeat():
+    """Found on the real fleet: under the chaos workload both replicas ran ~95 s behind,
+    so the applied heartbeat row was 95 s old while their IO threads were fine. With the
+    manager partitioned (Experiment 4) that would have been a false failover."""
+    h = history(30, bad_probe, lambda t: replica("r1", hb=95 + t, sbs=95 + t),
+                lambda t: replica("r2", hb=98 + t, sbs=97 + t))
+    v = evaluate(h, MEMBERS, P)
+    assert v.kind == "SUSPECT" and v.replica_votes == 0
